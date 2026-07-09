@@ -62,7 +62,7 @@
 > Para la explicación pública más larga detrás de esta filosofía, mira [aquí](https://x.com/realsigridjin/status/2039472968624185713).
 
 <p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
+  <a href="https://github.com/charcsllc/claw-code">charcsllc/claw-code</a>
   ·
   <a href="./USAGE.md">Uso</a>
   ·
@@ -80,11 +80,11 @@
 </p>
 
 <p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
+  <a href="https://star-history.com/#charcsllc/claw-code&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Historial de estrellas de ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=charcsllc/claw-code&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=charcsllc/claw-code&type=Date" />
+      <img alt="Historial de estrellas de charcsllc/claw-code" src="https://api.star-history.com/svg?repos=charcsllc/claw-code&type=Date" width="600" />
     </picture>
   </a>
 </p>
@@ -94,7 +94,7 @@
 </p>
 
 Claw Code es la implementación pública en Rust del harness de agente CLI `claw`.
-La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad actual de este repositorio es **ultraworkers/claw-code**.
+La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad actual de este repositorio es **charcsllc/claw-code**.
 
 > [!IMPORTANT]
 > Empieza por [`USAGE.md`](./USAGE.md) para los flujos de build, autenticación, CLI, sesiones y el harness de parity. Para dudas sobre envío/navegación de archivos, consulta [Navegación y contexto de archivos](./docs/navigation-file-context.md). Para modelos locales compatibles con OpenAI e instalación de skills sin conexión, mira [Proveedores locales compatibles con OpenAI y setup de skills](./docs/local-openai-compatible-providers.md). Los usuarios de Windows pueden saltar directamente al [quickstart de instalación y releases en Windows](./docs/windows-install-release.md), centrado en PowerShell. Haz de `claw doctor` tu primer chequeo de salud después de compilar, usa [`rust/README.md`](./rust/README.md) para el detalle por crate, lee [`PARITY.md`](./PARITY.md) para el checkpoint actual del port a Rust, y mira [`docs/container.md`](./docs/container.md) para el flujo container-first.
@@ -124,11 +124,11 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 > ```bash
 > cargo install agent-code   # binario upstream — instala 'agent.exe' (Windows) / 'agent' (Unix), NO 'agent-code'
 > ```
-> Este repo (`ultraworkers/claw-code`) es **solo build desde código fuente** — sigue los pasos de abajo.
+> Este repo (`charcsllc/claw-code`) es **solo build desde código fuente** — sigue los pasos de abajo.
 
 ```bash
 # 1. Clona y compila
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/charcsllc/claw-code
 cd claw-code/rust
 cargo build --workspace
 
@@ -160,7 +160,7 @@ export ANTHROPIC_API_KEY="sk-ant-..."
    Si falla, reabre la terminal o ejecuta el setup de PATH que indica la salida del instalador de Rust, y reintenta.
 3. **Clona y compila** (funciona en PowerShell, Git Bash o WSL):
    ```powershell
-   git clone https://github.com/ultraworkers/claw-code
+   git clone https://github.com/charcsllc/claw-code
    cd claw-code/rust
    cargo build --workspace
    ```

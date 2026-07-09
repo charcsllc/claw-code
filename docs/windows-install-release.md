@@ -9,7 +9,7 @@ This page is the PowerShell-first path for installing, verifying, and safely swi
 Use this when you are developing Claw Code or testing a local checkout.
 
 ```powershell
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/charcsllc/claw-code
 Set-Location .\claw-code\rust
 cargo build --workspace
 .\target\debug\claw.exe --help
@@ -68,7 +68,7 @@ wsl
 Then inside WSL:
 
 ```bash
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/charcsllc/claw-code
 cd claw-code
 ./install.sh
 ```

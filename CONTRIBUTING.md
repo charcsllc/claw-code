@@ -18,7 +18,7 @@ workspace with supporting docs and compatibility fixtures.
 ## Local setup
 
 ```bash
-git clone https://github.com/ultraworkers/claw-code
+git clone https://github.com/charcsllc/claw-code
 cd claw-code/rust
 cargo build --workspace
 cargo test --workspace

@@ -16,12 +16,18 @@ FILES = [
 ]
 FILES.extend(sorted((ROOT / 'docs').rglob('*.md')) if (ROOT / 'docs').exists() else [])
 
+# Canonical home of this repository. Every doc link must point here.
+CANONICAL = 'charcsllc/claw-code'
+
 FORBIDDEN = {
-    r'github\.com/Yeachan-Heo/claw-code(?!-parity)': 'replace old claw-code GitHub links with ultraworkers/claw-code',
-    r'github\.com/code-yeongyu/claw-code': 'replace stale alternate claw-code GitHub links with ultraworkers/claw-code',
+    r'github\.com/Yeachan-Heo/claw-code(?!-parity)': f'replace old claw-code GitHub links with {CANONICAL}',
+    r'github\.com/code-yeongyu/claw-code': f'replace stale alternate claw-code GitHub links with {CANONICAL}',
+    r'github\.com/ultraworkers/claw-code': f'replace former upstream claw-code GitHub links with {CANONICAL}',
     r'discord\.gg/6ztZB9jvWq': 'replace the stale UltraWorkers Discord invite with the current invite',
-    r'api\.star-history\.com/svg\?repos=Yeachan-Heo/claw-code': 'update star-history embeds to ultraworkers/claw-code',
-    r'star-history\.com/#Yeachan-Heo/claw-code': 'update star-history links to ultraworkers/claw-code',
+    r'api\.star-history\.com/svg\?repos=Yeachan-Heo/claw-code': f'update star-history embeds to {CANONICAL}',
+    r'api\.star-history\.com/svg\?repos=ultraworkers/claw-code': f'update star-history embeds to {CANONICAL}',
+    r'star-history\.com/#Yeachan-Heo/claw-code': f'update star-history links to {CANONICAL}',
+    r'star-history\.com/#ultraworkers/claw-code': f'update star-history links to {CANONICAL}',
     r'assets/clawd-hero\.jpeg': 'rename stale hero asset references to assets/claw-hero.jpeg',
     r'assets/instructkr\.png': 'remove stale instructkr image references',
 }

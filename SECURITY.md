@@ -9,7 +9,7 @@ unless a maintainer explicitly marks them as supported.
 ## Reporting a vulnerability
 
 Please do **not** open a public issue for a suspected vulnerability. Use GitHub
-private vulnerability reporting for `ultraworkers/claw-code` when available, or
+private vulnerability reporting for `charcsllc/claw-code` when available, or
 contact a maintainer through the repository's published support channel with a
 minimal, non-destructive reproduction.
 
