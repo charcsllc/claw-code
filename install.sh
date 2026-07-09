@@ -384,11 +384,13 @@ Try it out:
   ${CLAW_BIN}
   /doctor
 
-Authentication:
+Authentication (an API key is required; subscription login is not supported):
 
   export ANTHROPIC_API_KEY="sk-ant-..."
-  ${COLOR_DIM}# or use OAuth:${COLOR_RESET}
-  ${CLAW_BIN} login
+  ${COLOR_DIM}# or a bearer token / other providers:${COLOR_RESET}
+  export ANTHROPIC_AUTH_TOKEN="..."      ${COLOR_DIM}# proxy/bearer auth${COLOR_RESET}
+  export OPENAI_API_KEY="sk-..."         ${COLOR_DIM}# OpenAI-compatible models${COLOR_RESET}
+  export OLLAMA_HOST="http://127.0.0.1:11434"  ${COLOR_DIM}# local models${COLOR_RESET}
 
 For deeper docs, see USAGE.md and rust/README.md.
 EOF

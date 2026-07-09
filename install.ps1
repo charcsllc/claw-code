@@ -214,11 +214,12 @@ Try it out:
   $clawBin
   /doctor
 
-Authentication:
+Authentication (an API key is required; subscription login is not supported):
 
   `$env:ANTHROPIC_API_KEY = "sk-ant-..."
-  # or use OAuth:
-  $clawBin login
+  # or a bearer token / other providers:
+  `$env:ANTHROPIC_AUTH_TOKEN = "..."
+  `$env:OPENAI_API_KEY = "sk-..."
 
 For deeper docs, see USAGE.md and rust\README.md.
 "@ | Write-Host
