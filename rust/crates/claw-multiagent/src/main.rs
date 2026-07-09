@@ -85,6 +85,16 @@ struct CommonArgs {
     /// package.json/Cargo.toml when omitted; pass "off" to disable).
     #[arg(long)]
     build_cmd: Option<String>,
+
+    /// Skip the deterministic project scaffold (create-vite / cargo init)
+    /// and let the agents generate every file, like before.
+    #[arg(long)]
+    no_scaffold: bool,
+
+    /// Pause after planning: show the plan summary and ask for
+    /// confirmation before spending developer runs.
+    #[arg(long)]
+    approve: bool,
 }
 
 const DASHBOARD_PORT: u16 = 4110;
@@ -232,6 +242,8 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
         resume: common.resume,
         max_cost_usd: common.max_cost_usd,
         build_command: common.build_cmd,
+        scaffold: !common.no_scaffold,
+        approve: common.approve,
     })?;
 
     println!("\n[multiagent] === resumen ===");

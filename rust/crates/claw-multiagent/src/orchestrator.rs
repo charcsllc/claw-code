@@ -10,11 +10,13 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use telemetry::{AnalyticsEvent, JsonlTelemetrySink, SessionTracer};
 
-use crate::agents::{extract_json, spawn_agent, wait_all, AgentResult};
+use crate::agents::{
+    extract_json, poll_result, spawn_agent, timeout_result, wait_all, AgentHandle, AgentResult,
+};
 use crate::catalog::ModelCatalog;
 use crate::contracts::{
     schedule_waves, Complexity, Plan, ProjectKind, SupervisionVerdict, TaskSpec,
@@ -78,6 +80,12 @@ pub struct RunOptions {
     pub max_cost_usd: Option<f64>,
     /// Build-gate command; auto-detected from the project when `None`.
     pub build_command: Option<String>,
+    /// Deterministic project scaffold (create-vite / cargo init) before the
+    /// first developer runs, so the build gate passes from minute zero.
+    pub scaffold: bool,
+    /// Pause after planning and ask for confirmation on stdin before
+    /// spending developer runs.
+    pub approve: bool,
 }
 
 pub struct RunSummary {
@@ -299,6 +307,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             "backlog.json",
             &serde_json::to_string_pretty(&tasks).unwrap_or_default(),
         )?;
+
         (plan, tasks)
     };
 
@@ -325,6 +334,63 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         });
     }
 
+    // ---- Plan checkpoint (--approve): the costliest mistake is a full
+    //      build over a misread prompt — ten seconds of review prevent it.
+    if options.approve && !plan_checkpoint_confirmed(&plan, tasks.len(), waves.len(), options) {
+        workflow.phase("Plan no aprobado: construcción cancelada (los docs quedan guardados)");
+        return Ok(RunSummary {
+            plan,
+            tasks: tasks.len(),
+            waves: waves.len(),
+            completed: 0,
+            failed: 0,
+            supervision_issues: 0,
+            resumed_tasks: 0,
+            budget_aborted: false,
+            user_aborted: true,
+        });
+    }
+
+    // ---- Deterministic scaffold: generated boilerplate is the most
+    //      failure-prone and most token-expensive part of a build, and the
+    //      part an LLM adds no value to. ----
+    if options.scaffold {
+        scaffold_project(options, &plan, &workflow);
+    }
+
+    // ---- Contracts as CODE (after the scaffold, so they land inside the
+    //      real project structure). Cross-module consistency is then
+    //      enforced by the typechecker at the build gate instead of by
+    //      every developer correctly reading a truncated prose digest. ----
+    if !docs.join("contracts.md").exists() {
+        workflow.phase("Contratos: generando interfaces compartidas como código");
+        match run_single(
+            Role::SoftwareArchitect,
+            &options.catalog.director,
+            options,
+            "Read docs/plan.json, docs/decisions.md (if present), every architect \
+             design document under docs/, and docs/backlog.json. Then CREATE the \
+             shared contract files in the repository NOW: type/interface \
+             definitions, API route constants and data models that the backlog \
+             tasks will import (e.g. `src/types.ts` or `src/contracts/` for \
+             TypeScript, a shared module for Rust — follow the scaffolded project \
+             structure). Keep them minimal but complete: every interface, endpoint \
+             and data model named in the backlog must exist and typecheck. Finally \
+             write `docs/contracts.md` listing each file you created and what it \
+             defines.",
+        ) {
+            Ok(contracts) => {
+                save_doc(&docs, "contracts-report.md", &contracts.report)?;
+                let _ = git_commit(&options.project_dir, "contracts: shared interfaces");
+            }
+            Err(error) => {
+                // Contracts improve coordination but are not load-bearing:
+                // developers still get designs via their TaskSpecs.
+                workflow.phase(&format!("  aviso: fase de contratos falló ({error})"));
+            }
+        }
+    }
+
     // ---- Developer waves + Supervisor per delivery ----
     let mut state = BuildState::load(&options.project_dir);
     let resumed_tasks = if options.resume {
@@ -345,125 +411,207 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let mut supervision_issues = 0_usize;
     let mut budget_aborted = false;
     let mut user_aborted = false;
-    // Inter-wave context: what earlier waves already built.
+    // Context for later tasks: what has already been built.
     let mut built_context: Vec<String> = tasks
         .iter()
         .filter(|task| state.completed.contains(&task.id))
         .map(context_line)
         .collect();
 
-    'waves: for (wave_index, wave) in waves.iter().enumerate() {
+    // ---- Graph scheduler: no wave barriers. A task starts the moment its
+    //      dependencies are done and no in-flight task holds its files; its
+    //      Supervisor reviews in parallel while other tasks keep building.
+    //      A task's files stay locked from spawn until its supervision (and
+    //      any fixes) conclude, so nothing races a pending review. ----
+    workflow.phase(&format!(
+        "Scheduler: {} tareas, paralelo {}, sin barreras de ola",
+        tasks.len(),
+        options.parallel.max(1)
+    ));
+    let mut failed_tasks: BTreeSet<usize> = BTreeSet::new();
+    let mut retried: BTreeSet<usize> = BTreeSet::new();
+    // Tasks whose files are locked (developer running or supervision pending).
+    let mut busy: BTreeSet<usize> = BTreeSet::new();
+    let mut devs: Vec<DevSlot> = Vec::new();
+    let mut sups: Vec<SupSlot> = Vec::new();
+
+    'scheduler: loop {
         if aborted.load(Ordering::Relaxed) {
             workflow.phase("Construcción abortada por usuario (Ctrl+C)");
             save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
             user_aborted = true;
-            break 'waves;
+            break 'scheduler;
         }
         if let Some(spent) = budget.exceeded() {
             workflow.phase(&format!(
-                "Presupuesto superado ({spent:.2} USD): abortando limpiamente antes de la ola {}",
-                wave_index + 1
+                "Presupuesto superado ({spent:.2} USD): abortando limpiamente"
             ));
             budget_aborted = true;
-            break 'waves;
+            break 'scheduler;
         }
-        let pending: Vec<usize> = wave
-            .iter()
-            .copied()
-            .filter(|&index| !state.completed.contains(&tasks[index].id))
-            .collect();
-        if pending.is_empty() {
-            continue;
-        }
-        workflow.phase(&format!(
-            "Ola {}/{}: {} tareas en paralelo",
-            wave_index + 1,
-            waves.len(),
-            pending.len()
-        ));
-        let wave_context = render_wave_context(&built_context);
 
-        for chunk in pending.chunks(options.parallel.max(1)) {
-            if aborted.load(Ordering::Relaxed) {
-                workflow.phase("Construcción abortada por usuario (Ctrl+C)");
-                save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
-                user_aborted = true;
-                break 'waves;
-            }
-            let mut handles = Vec::new();
-            for &task_index in chunk {
-                let task = &tasks[task_index];
-                let model = options.catalog.model_for(task.complexity);
-                let handle = spawn_developer(options, task, model, &wave_context)?;
-                workflow.phase(&format!(
-                    "  {} → modelo {} (complejidad {:?})",
-                    task.id, model, task.complexity
-                ));
-                handles.push((task_index, handle));
-            }
-            let handle_list: Vec<_> = handles.iter().map(|(_, h)| h.clone()).collect();
-            let mut results = wait_all(handle_list, options.agent_timeout, |result| {
-                workflow.phase(&format!("  entrega {} → {}", result.name, result.status));
+        // Fill free developer slots with ready tasks.
+        while devs.len() < options.parallel.max(1) {
+            let Some(task_index) = next_ready_task(&tasks, &state.completed, &failed_tasks, &busy)
+            else {
+                break;
+            };
+            let task = &tasks[task_index];
+            let model = options.catalog.model_for(task.complexity);
+            let context = render_wave_context(&built_context);
+            let handle = spawn_developer(options, task, model, &context, None)?;
+            workflow.phase(&format!(
+                "  {} → modelo {} (complejidad {:?})",
+                task.id, model, task.complexity
+            ));
+            busy.insert(task_index);
+            devs.push(DevSlot {
+                task_index,
+                handle,
+                started: Instant::now(),
             });
+        }
 
-            // Retry failures once, escalating to the next model tier.
-            for result in &mut results {
-                if result.succeeded() {
-                    continue;
-                }
-                let Some((task_index, _)) = handles.iter().find(|(_, h)| h.name == result.name)
-                else {
-                    continue;
-                };
-                let task = &tasks[*task_index];
-                let Some(escalated) = escalate(task.complexity) else {
-                    continue;
-                };
-                let retry_model = options.catalog.model_for(escalated);
-                workflow.phase(&format!(
-                    "  {} falló → reintento con modelo superior {retry_model}",
-                    task.id
-                ));
-                let retry_handle = spawn_developer(options, task, retry_model, &wave_context)?;
-                let mut retry_results = wait_all(vec![retry_handle], options.agent_timeout, |_| {});
-                if let Some(retry) = retry_results.pop() {
-                    workflow.phase(&format!("  reintento {} → {}", task.id, retry.status));
-                    *result = retry;
-                }
-            }
+        if devs.is_empty() && sups.is_empty() {
+            break; // graph drained: nothing running, nothing ready
+        }
 
-            // Supervisor reviews each delivery as it lands, one by one.
-            for result in &results {
-                let task = handles
-                    .iter()
-                    .find(|(_, h)| h.name == result.name)
-                    .map(|(index, _)| &tasks[*index]);
-                if result.succeeded() {
-                    completed += 1;
-                } else {
-                    failed += 1;
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Poll developers.
+        let mut still_running: Vec<DevSlot> = Vec::new();
+        for slot in devs {
+            let mut result = match poll_result(&slot.handle) {
+                Some(result) => result,
+                None if slot.started.elapsed() >= options.agent_timeout => {
+                    timeout_result(&slot.handle, options.agent_timeout)
                 }
-                if let Some(task) = task {
-                    supervision_issues +=
-                        supervise_delivery(options, &workflow, &supervision_md, task, result)?;
-                    if result.succeeded() {
-                        state.completed.insert(task.id.clone());
-                        state.save(&options.project_dir);
-                        built_context.push(context_line(task));
-                        let commit_msg = format!(
-                            "{} ({}): {}",
-                            task.id,
-                            task.module,
-                            truncate_chars(&task.functional_objective, 60)
-                        );
-                        let _ = git_commit(&options.project_dir, &commit_msg);
+                None => {
+                    still_running.push(slot);
+                    continue;
+                }
+            };
+            let task = &tasks[slot.task_index];
+            workflow.phase(&format!("  entrega {} → {}", result.name, result.status));
+
+            // Per-delivery quick check (#4): a broken module is caught the
+            // moment it lands, not at the end of the whole build. Failures
+            // are attributed only when the output names this task's files —
+            // parallel tasks may be mid-write and their errors are not ours.
+            let mut check_failure: Option<String> = None;
+            if result.succeeded() {
+                if let Err(output) = run_quick_check(&options.project_dir) {
+                    if task
+                        .touched_files()
+                        .iter()
+                        .any(|file| output.contains(file))
+                    {
+                        workflow.phase(&format!("  {}: verificación rápida falló", task.id));
+                        check_failure = Some(output);
                     }
                 }
             }
-        }
 
-        // Build gate: the project must still build after every wave.
-        run_build_gate(options, &workflow, &supervision_md, wave_index + 1)?;
+            let delivery_failed = !result.succeeded() || check_failure.is_some();
+            if delivery_failed && !retried.contains(&slot.task_index) {
+                if let Some(escalated) = escalate(task.complexity) {
+                    let retry_model = options.catalog.model_for(escalated);
+                    workflow.phase(&format!(
+                        "  {} falló → reintento con modelo superior {retry_model}",
+                        task.id
+                    ));
+                    retried.insert(slot.task_index);
+                    let context = render_wave_context(&built_context);
+                    let handle = spawn_developer(
+                        options,
+                        task,
+                        retry_model,
+                        &context,
+                        check_failure.as_deref(),
+                    )?;
+                    still_running.push(DevSlot {
+                        task_index: slot.task_index,
+                        handle,
+                        started: Instant::now(),
+                    });
+                    continue;
+                }
+            }
+            if let Some(check) = check_failure {
+                // Terminal quick-check failure: the delivery does not count
+                // as completed even though the agent reported success.
+                result.status = "failed".to_string();
+                result.error = Some(truncate_chars(&check, 2_000));
+            }
+            if result.succeeded() {
+                completed += 1;
+            } else {
+                failed += 1;
+                failed_tasks.insert(slot.task_index);
+            }
+
+            // Supervisor reviews in parallel; the files stay locked.
+            match spawn_supervisor(options, task, &result) {
+                Ok(handle) => sups.push(SupSlot {
+                    task_index: slot.task_index,
+                    handle,
+                    started: Instant::now(),
+                    delivery: result,
+                }),
+                Err(error) => {
+                    workflow.phase(&format!(
+                        "  supervisor de {} no pudo lanzarse ({error}) — issue registrado",
+                        task.id
+                    ));
+                    supervision_issues += 1;
+                    if result.succeeded() {
+                        finalize_completed_task(
+                            task,
+                            &mut state,
+                            &mut built_context,
+                            &options.project_dir,
+                        );
+                    }
+                    busy.remove(&slot.task_index);
+                }
+            }
+        }
+        devs = still_running;
+
+        // Poll supervisors; process each verdict as it lands.
+        let mut still_supervising: Vec<SupSlot> = Vec::new();
+        for sup in sups {
+            let supervisor_result = match poll_result(&sup.handle) {
+                Some(result) => result,
+                None if sup.started.elapsed() >= options.agent_timeout => {
+                    timeout_result(&sup.handle, options.agent_timeout)
+                }
+                None => {
+                    still_supervising.push(sup);
+                    continue;
+                }
+            };
+            let task = &tasks[sup.task_index];
+            supervision_issues += process_supervision(
+                options,
+                &workflow,
+                &supervision_md,
+                task,
+                &sup.delivery,
+                &supervisor_result,
+            )?;
+            if sup.delivery.succeeded() {
+                finalize_completed_task(task, &mut state, &mut built_context, &options.project_dir);
+            }
+            busy.remove(&sup.task_index);
+        }
+        sups = still_supervising;
+    }
+
+    // Full build gate at the end: per-delivery quick checks ran throughout,
+    // this is the cross-module confirmation (with Fixer retry on failure).
+    if !budget_aborted && !user_aborted {
+        run_build_gate(options, &workflow, &supervision_md, waves.len())?;
     }
 
     if !budget_aborted && !user_aborted {
@@ -542,6 +690,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
         }
 
+        // ---- Smoke test: does the product actually start and answer? ----
+        run_smoke_test(&options.project_dir, &docs, &workflow);
+
         // ---- Documentation ----
         workflow.phase("Agente de Documentación: README, ADRs y changelog");
         let docs_agent = run_single(
@@ -578,15 +729,123 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     })
 }
 
-/// Spawns one developer agent with module-scoped writes and inter-wave
-/// context appended to its TaskSpec prompt.
+/// A developer (or escalated retry) in flight.
+struct DevSlot {
+    task_index: usize,
+    handle: AgentHandle,
+    started: Instant,
+}
+
+/// A supervisor reviewing a landed delivery, in parallel with other work.
+struct SupSlot {
+    task_index: usize,
+    handle: AgentHandle,
+    started: Instant,
+    delivery: AgentResult,
+}
+
+/// Picks the next runnable task: not done/failed/in-flight, every known
+/// dependency settled (completed — or failed, matching the old wave
+/// semantics where later waves ran regardless), and no file shared with an
+/// in-flight task. Deterministic: lowest priority value first, then backlog
+/// order.
+#[must_use]
+pub fn next_ready_task(
+    tasks: &[TaskSpec],
+    completed_ids: &BTreeSet<String>,
+    failed: &BTreeSet<usize>,
+    busy: &BTreeSet<usize>,
+) -> Option<usize> {
+    let failed_ids: BTreeSet<&str> = failed
+        .iter()
+        .map(|&index| tasks[index].id.as_str())
+        .collect();
+    let busy_files: BTreeSet<&str> = busy
+        .iter()
+        .flat_map(|&index| tasks[index].touched_files())
+        .collect();
+    let mut best: Option<usize> = None;
+    for (index, task) in tasks.iter().enumerate() {
+        if completed_ids.contains(&task.id) || failed.contains(&index) || busy.contains(&index) {
+            continue;
+        }
+        let deps_settled = task.depends_on.iter().all(|dep| {
+            dep == &task.id
+                || completed_ids.contains(dep)
+                || failed_ids.contains(dep.as_str())
+                || !tasks.iter().any(|t| &t.id == dep)
+        });
+        if !deps_settled {
+            continue;
+        }
+        if task
+            .touched_files()
+            .iter()
+            .any(|file| busy_files.contains(file))
+        {
+            continue;
+        }
+        best = match best {
+            Some(current) if (tasks[current].priority, current) <= (task.priority, index) => {
+                Some(current)
+            }
+            _ => Some(index),
+        };
+    }
+    best
+}
+
+/// Bookkeeping for a task that finished and passed supervision: resume
+/// state, context for later tasks, and a git commit per delivery.
+fn finalize_completed_task(
+    task: &TaskSpec,
+    state: &mut BuildState,
+    built_context: &mut Vec<String>,
+    project_dir: &Path,
+) {
+    state.completed.insert(task.id.clone());
+    state.save(project_dir);
+    built_context.push(context_line(task));
+    let commit_msg = format!(
+        "{} ({}): {}",
+        task.id,
+        task.module,
+        truncate_chars(&task.functional_objective, 60)
+    );
+    let _ = git_commit(project_dir, &commit_msg);
+}
+
+/// Spawns one developer agent with module-scoped writes, built-so-far
+/// context, the contracts pointer, and (on retries) the verification
+/// failure to fix.
 fn spawn_developer(
     options: &RunOptions,
     task: &TaskSpec,
     model: &str,
     wave_context: &str,
-) -> Result<crate::agents::AgentHandle, String> {
-    let prompt = format!("{}{}", task.render_prompt(), wave_context);
+    verification_failure: Option<&str>,
+) -> Result<AgentHandle, String> {
+    let mut prompt = format!("{}{}", task.render_prompt(), wave_context);
+    if options
+        .project_dir
+        .join("docs")
+        .join("contracts.md")
+        .exists()
+    {
+        prompt.push_str(
+            "\n\n## Shared contracts\nRead docs/contracts.md and IMPORT the existing \
+             contract files; never redefine shared types, API routes or data models.",
+        );
+    }
+    if let Some(failure) = verification_failure {
+        let _ = write!(
+            prompt,
+            "\n\n## Previous attempt failed verification\nThe project no longer \
+             compiles after the previous attempt at this task. Compiler output:\n\
+             ```\n{}\n```\nFix the root cause and make the project build again.",
+            truncate_chars(failure, 8_000)
+        );
+    }
     spawn_agent(
         &format!("dev-{}", task.id),
         &task.functional_objective,
@@ -596,6 +855,354 @@ fn spawn_developer(
         &prompt,
         &write_scope_for(task),
     )
+}
+
+/// Cheap per-delivery verification. Full builds stay at the final gate;
+/// this catches type/compile breaks the moment a module lands.
+fn run_quick_check(project_dir: &Path) -> Result<(), String> {
+    let command = if project_dir.join("Cargo.toml").exists() {
+        "cargo check --all-targets"
+    } else if project_dir.join("tsconfig.json").exists() {
+        "npx --yes tsc --noEmit"
+    } else {
+        return Ok(());
+    };
+    shell_output(command, project_dir)
+}
+
+// ---------- Deterministic scaffold ----------
+
+/// Stack-appropriate non-interactive generator.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScaffoldKind {
+    /// `npm create vite` with this template.
+    Vite(&'static str),
+    /// `cargo init` for Rust apps/services.
+    CargoInit,
+    /// Bare `npm init -y` for plain Node backends.
+    NpmInit,
+}
+
+/// Maps the Director's stack to a generator. Conservative: only stacks with
+/// a well-known non-interactive CLI get one; meta-frameworks with
+/// interactive installers (Next/Nuxt/Remix/Astro) are left to the agents.
+#[must_use]
+pub fn scaffold_kind_for(plan: &Plan) -> Option<ScaffoldKind> {
+    let stack = format!(
+        "{} {} {} {}",
+        plan.stack.kind,
+        plan.stack.frontend.join(" "),
+        plan.stack.framework.join(" "),
+        plan.stack.backend.join(" ")
+    )
+    .to_lowercase();
+    if ["next", "nuxt", "remix", "astro"]
+        .iter()
+        .any(|framework| stack.contains(framework))
+    {
+        return None;
+    }
+    if ["tauri", "rust", "axum", "actix"]
+        .iter()
+        .any(|marker| stack.contains(marker))
+    {
+        return Some(ScaffoldKind::CargoInit);
+    }
+    for (marker, template) in [
+        ("react", "react-ts"),
+        ("vue", "vue-ts"),
+        ("svelte", "svelte-ts"),
+        ("solid", "solid-ts"),
+        ("preact", "preact-ts"),
+    ] {
+        if stack.contains(marker) {
+            return Some(ScaffoldKind::Vite(template));
+        }
+    }
+    if stack.contains("node") || stack.contains("express") || stack.contains("fastify") {
+        return Some(ScaffoldKind::NpmInit);
+    }
+    None
+}
+
+/// Runs the deterministic scaffold so the project builds from minute zero
+/// and developers only write product code. Generators run into a staging
+/// dir and only files that don't already exist are merged, so docs/ and
+/// .multiagent/ are never clobbered. Every failure degrades to a warning —
+/// agents can still build from scratch exactly as before.
+fn scaffold_project(options: &RunOptions, plan: &Plan, workflow: &WorkflowLog) {
+    let dir = &options.project_dir;
+    if dir.join("package.json").exists() || dir.join("Cargo.toml").exists() {
+        return; // already scaffolded (resume or re-run)
+    }
+    let Some(kind) = scaffold_kind_for(plan) else {
+        workflow.phase("Scaffold: stack sin plantilla determinista; lo generan los agentes");
+        return;
+    };
+    let warn = |error: &str| {
+        workflow.phase(&format!(
+            "  aviso: scaffold falló ({}); se continúa sin plantilla",
+            truncate_chars(error, 300)
+        ));
+    };
+    match kind {
+        ScaffoldKind::Vite(template) => {
+            workflow.phase(&format!("Scaffold: create-vite ({template})"));
+            let staging = dir.join(".scaffold");
+            let _ = std::fs::remove_dir_all(&staging);
+            let command = format!("npm create vite@latest .scaffold -- --template {template}");
+            if let Err(error) = shell_output(&command, dir) {
+                warn(&error);
+                let _ = std::fs::remove_dir_all(&staging);
+                return;
+            }
+            merge_missing(&staging, dir);
+            let _ = std::fs::remove_dir_all(&staging);
+            workflow.phase("Scaffold: npm install");
+            if let Err(error) = shell_output("npm install --no-audit --no-fund", dir) {
+                warn(&error);
+            }
+        }
+        ScaffoldKind::CargoInit => {
+            workflow.phase("Scaffold: cargo init");
+            if let Err(error) = shell_output("cargo init --vcs none .", dir) {
+                warn(&error);
+                return;
+            }
+        }
+        ScaffoldKind::NpmInit => {
+            workflow.phase("Scaffold: npm init");
+            if let Err(error) = shell_output("npm init -y", dir) {
+                warn(&error);
+                return;
+            }
+        }
+    }
+    let _ = git_commit(dir, "scaffold: deterministic project template");
+}
+
+/// Recursively copies entries from `from` into `to`, skipping any file that
+/// already exists at the destination (descending into shared directories).
+fn merge_missing(from: &Path, to: &Path) {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if target.exists() {
+            if source.is_dir() && target.is_dir() {
+                merge_missing(&source, &target);
+            }
+            continue;
+        }
+        if source.is_dir() {
+            copy_dir_recursive(&source, &target);
+        } else {
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) {
+    if std::fs::create_dir_all(to).is_err() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        if source.is_dir() {
+            copy_dir_recursive(&source, &target);
+        } else {
+            let _ = std::fs::copy(&source, &target);
+        }
+    }
+}
+
+// ---------- Plan checkpoint (--approve) ----------
+
+/// Prints the plan summary and waits for explicit confirmation on stdin.
+fn plan_checkpoint_confirmed(
+    plan: &Plan,
+    tasks: usize,
+    waves: usize,
+    options: &RunOptions,
+) -> bool {
+    use std::io::Write as _;
+    println!("\n[multiagent] === plan listo — revisión (--approve) ===");
+    println!("  visión:  {}", plan.vision);
+    println!(
+        "  stack:   {} (front: {} · back: {})",
+        plan.stack.kind,
+        plan.stack.frontend.join(", "),
+        plan.stack.backend.join(", ")
+    );
+    println!(
+        "  tareas:  {tasks} en ~{waves} olas · paralelo {}",
+        options.parallel
+    );
+    println!(
+        "  modelos: {} / {} / {}",
+        options.catalog.simple, options.catalog.medium, options.catalog.complex
+    );
+    println!("  docs:    plan.json, backlog.json y diseños guardados en docs/");
+    print!("  ¿Continuar con la construcción? [s/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(
+        answer.trim().to_lowercase().as_str(),
+        "s" | "si" | "sí" | "y" | "yes"
+    )
+}
+
+// ---------- Smoke test ----------
+
+/// Start command for the smoke test, from package.json scripts.
+#[must_use]
+pub fn smoke_command(project_dir: &Path) -> Option<String> {
+    let package = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&package).ok()?;
+    let scripts = json.get("scripts")?;
+    for (script, command) in [
+        ("dev", "npm run dev"),
+        ("start", "npm start"),
+        ("preview", "npm run preview"),
+    ] {
+        if scripts.get(script).is_some() {
+            return Some(command.to_string());
+        }
+    }
+    None
+}
+
+/// "Compiles" and "works" are different claims: start the dev server, hit
+/// the root route, and record what actually came back in docs/smoke-test.md.
+/// Unix-only (needs process groups to reap npm's children); degrades to a
+/// warning everywhere else and on every failure.
+#[cfg(unix)]
+fn run_smoke_test(project_dir: &Path, docs: &Path, workflow: &WorkflowLog) {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::process::CommandExt as _;
+
+    let Some(command) = smoke_command(project_dir) else {
+        workflow.phase("Smoke test: sin script dev/start en package.json, omitido");
+        return;
+    };
+    workflow.phase(&format!("Smoke test: arrancando `{command}`"));
+    let log_path = project_dir.join(".multiagent").join("smoke.log");
+    let log = std::fs::File::create(&log_path).ok();
+    let mut builder = std::process::Command::new("sh");
+    builder.arg("-c").arg(&command).current_dir(project_dir);
+    builder.process_group(0);
+    match (log.as_ref().and_then(|f| f.try_clone().ok()), log) {
+        (Some(stderr), Some(stdout)) => {
+            builder.stdout(stdout).stderr(stderr);
+        }
+        _ => {
+            builder
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    let Ok(mut child) = builder.spawn() else {
+        workflow.phase("⚠ Smoke test: no se pudo arrancar el servidor");
+        return;
+    };
+
+    let ports: [u16; 6] = [5173, 3000, 8080, 4321, 4173, 8000];
+    let mut hit: Option<(u16, String)> = None;
+    'wait: for _ in 0..45 {
+        std::thread::sleep(Duration::from_secs(1));
+        for port in ports {
+            let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let Ok(mut stream) =
+                std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300))
+            else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let request =
+                format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+            if stream.write_all(request.as_bytes()).is_err() {
+                continue;
+            }
+            let mut buffer = Vec::new();
+            let mut limited = stream.take(4096);
+            let _ = limited.read_to_end(&mut buffer);
+            if buffer.is_empty() {
+                continue;
+            }
+            hit = Some((port, String::from_utf8_lossy(&buffer).to_string()));
+            break 'wait;
+        }
+    }
+
+    // Kill the whole process group: npm's children outlive a plain kill.
+    let pid = child.id();
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &format!("-{pid}")])
+        .status();
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &format!("-{pid}")])
+        .status();
+    let _ = child.wait();
+
+    match hit {
+        Some((port, response)) => {
+            let status_line = response.lines().next().unwrap_or("").trim().to_string();
+            let ok = status_line.contains("200");
+            workflow.phase(&format!(
+                "{} Smoke test: puerto {port} → {status_line}",
+                if ok { "✓" } else { "⚠" }
+            ));
+            workflow.event(
+                "smoke_test",
+                &[
+                    ("ok", ok.to_string()),
+                    ("port", port.to_string()),
+                    ("status", status_line.clone()),
+                ],
+            );
+            let _ = save_doc(
+                docs,
+                "smoke-test.md",
+                &format!(
+                    "# Smoke test\n\n- command: `{command}`\n- port: {port}\n\
+                     - status: {status_line}\n- ok: {ok}\n\n## First bytes\n\n\
+                     ```\n{}\n```\n",
+                    truncate_chars(&response, 1_500)
+                ),
+            );
+        }
+        None => {
+            workflow.phase("⚠ Smoke test: el servidor no respondió en ningún puerto conocido");
+            workflow.event(
+                "smoke_test",
+                &[
+                    ("ok", "false".to_string()),
+                    ("error", "server never answered on a known port".to_string()),
+                ],
+            );
+            let _ = save_doc(
+                docs,
+                "smoke-test.md",
+                "# Smoke test\n\nFAILED: the dev server never answered on a known \
+                 port within 45s (see .multiagent/smoke.log).\n",
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_smoke_test(_project_dir: &Path, _docs: &Path, workflow: &WorkflowLog) {
+    workflow.phase("Smoke test: omitido (solo unix)");
 }
 
 /// Directories a developer agent may write to, derived from its TaskSpec.
@@ -929,20 +1536,19 @@ fn truncate_chars(text: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-/// Spawns the Supervisor for one delivery; on issues, records them in
-/// SUPERVISION.md, triggers the reindex hook, and dispatches the Fixer
-/// (superior model) with the exact issue list.
-fn supervise_delivery(
+/// Spawns the Supervisor for one delivery WITHOUT waiting: verdicts are
+/// polled by the scheduler so reviews overlap ongoing development.
+fn spawn_supervisor(
     options: &RunOptions,
-    workflow: &WorkflowLog,
-    supervision_md: &Path,
     task: &TaskSpec,
     delivery: &AgentResult,
-) -> Result<usize, String> {
-    let supervisor = run_single(
-        Role::Supervisor,
+) -> Result<AgentHandle, String> {
+    spawn_agent(
+        &format!("sup-{}", task.id),
+        Role::Supervisor.title(),
         &options.catalog.supervisor,
-        options,
+        Role::Supervisor.subagent_type(),
+        &system_prompt(Role::Supervisor, options.kind),
         &format!(
             "Task delivered:\n```json\n{}\n```\n\nDeveloper report:\n{}\n\nDelivery \
              status: {}. Inspect the repository files this task touched. Evaluate \
@@ -954,8 +1560,24 @@ fn supervise_delivery(
             delivery.report,
             delivery.status,
         ),
-    )?;
-    let Some(verdict) = extract_json(&supervisor.report)
+        &[],
+    )
+}
+
+/// Processes a finished Supervisor: records the verdict in SUPERVISION.md,
+/// triggers the reindex hook, and dispatches the Fixer (superior model)
+/// with the exact issue list when the review found problems.
+fn process_supervision(
+    options: &RunOptions,
+    workflow: &WorkflowLog,
+    supervision_md: &Path,
+    task: &TaskSpec,
+    delivery: &AgentResult,
+    supervisor: &AgentResult,
+) -> Result<usize, String> {
+    let Some(verdict) = Some(supervisor)
+        .filter(|result| result.succeeded())
+        .and_then(|result| extract_json(&result.report))
         .and_then(|value| serde_json::from_value::<SupervisionVerdict>(value).ok())
     else {
         // An unreadable verdict must not pass as "no issues": that would
@@ -1539,6 +2161,132 @@ mod tests {
             ..TaskSpec::default()
         };
         assert!(validate_backlog(std::slice::from_ref(&ok)).is_ok());
+    }
+
+    fn spec(id: &str, file: &str, deps: &[&str], priority: u32) -> TaskSpec {
+        TaskSpec {
+            id: id.to_string(),
+            functional_objective: format!("build {id}"),
+            files_to_create: vec![file.to_string()],
+            depends_on: deps.iter().map(ToString::to_string).collect(),
+            priority,
+            ..TaskSpec::default()
+        }
+    }
+
+    #[test]
+    fn scheduler_respects_dependencies_and_file_locks() {
+        let tasks = vec![
+            spec("T1", "src/a.ts", &[], 1),
+            spec("T2", "src/b.ts", &["T1"], 1),
+            spec("T3", "src/a.ts", &[], 2),
+        ];
+        let mut completed = BTreeSet::new();
+        let failed = BTreeSet::new();
+        let mut busy = BTreeSet::new();
+
+        // T2 blocked by dependency; T3 shares a file with T1 → T1 first.
+        assert_eq!(next_ready_task(&tasks, &completed, &failed, &busy), Some(0));
+        busy.insert(0);
+        // T1 running: T3 conflicts on src/a.ts, T2 dependency pending → none.
+        assert_eq!(next_ready_task(&tasks, &completed, &failed, &busy), None);
+        // T1 delivered and supervised: both unblock; priority 1 (T2) wins.
+        busy.remove(&0);
+        completed.insert("T1".to_string());
+        assert_eq!(next_ready_task(&tasks, &completed, &failed, &busy), Some(1));
+        busy.insert(1);
+        assert_eq!(next_ready_task(&tasks, &completed, &failed, &busy), Some(2));
+    }
+
+    #[test]
+    fn scheduler_lets_dependents_of_failed_tasks_run() {
+        let tasks = vec![
+            spec("T1", "src/a.ts", &[], 1),
+            spec("T2", "src/b.ts", &["T1"], 1),
+        ];
+        let completed = BTreeSet::new();
+        let mut failed = BTreeSet::new();
+        failed.insert(0);
+        // Old wave semantics: a failed dependency settles the constraint.
+        assert_eq!(
+            next_ready_task(&tasks, &completed, &failed, &BTreeSet::new()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn scaffold_kind_matches_stack() {
+        let mut plan = Plan::default();
+        plan.stack.frontend = vec!["React".to_string()];
+        assert_eq!(
+            scaffold_kind_for(&plan),
+            Some(ScaffoldKind::Vite("react-ts"))
+        );
+
+        // Meta-frameworks with interactive CLIs are left to the agents.
+        plan.stack.framework = vec!["Next.js".to_string()];
+        assert_eq!(scaffold_kind_for(&plan), None);
+
+        let mut rust_plan = Plan::default();
+        rust_plan.stack.backend = vec!["Rust (axum)".to_string()];
+        assert_eq!(scaffold_kind_for(&rust_plan), Some(ScaffoldKind::CargoInit));
+
+        let mut node_plan = Plan::default();
+        node_plan.stack.backend = vec!["Express".to_string()];
+        assert_eq!(scaffold_kind_for(&node_plan), Some(ScaffoldKind::NpmInit));
+
+        assert_eq!(scaffold_kind_for(&Plan::default()), None);
+    }
+
+    #[test]
+    fn smoke_command_prefers_dev_script() {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        assert_eq!(smoke_command(&dir), None);
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"scripts": {"start": "node .", "dev": "vite"}}"#,
+        )
+        .expect("pkg");
+        assert_eq!(smoke_command(&dir), Some("npm run dev".to_string()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn merge_missing_never_overwrites_existing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "multiagent-merge-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let staging = root.join(".scaffold");
+        let target = root.join("project");
+        std::fs::create_dir_all(staging.join("src")).expect("staging");
+        std::fs::create_dir_all(target.join("src")).expect("target");
+        std::fs::write(staging.join("index.html"), "from template").expect("w");
+        std::fs::write(staging.join("src/main.ts"), "template main").expect("w");
+        std::fs::write(target.join("index.html"), "user content").expect("w");
+
+        merge_missing(&staging, &target);
+
+        // Existing file untouched; missing file (inside shared dir) copied.
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.html")).expect("r"),
+            "user content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("src/main.ts")).expect("r"),
+            "template main"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

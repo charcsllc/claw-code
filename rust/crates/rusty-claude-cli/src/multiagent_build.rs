@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
 
-const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--parallel N] [--output <dir>] \
-[--resume] [--max-cost-usd X] [--build-cmd <cmd|off>]\n\
+const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N] \
+[--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold]\n\
                             /app <prompt> [same options]\n\
-                     Tip: start with --dry-run to review the plan before building.\n\
+                     Tips: --approve pauses after planning for a go/no-go;\n\
+                     --dry-run stops after planning entirely.\n\
                      --max-cost-usd is OFF by default (subscription accounts).";
 
 /// Parses the slash-command arguments and runs the build. The working
@@ -29,6 +30,8 @@ pub(crate) fn run_multiagent_build(
     let mut prompt_words: Vec<&str> = Vec::new();
     let mut dry_run = false;
     let mut resume = false;
+    let mut scaffold = true;
+    let mut approve = false;
     let mut parallel = 4_usize;
     let mut output = PathBuf::from("./multiagent-project");
     let mut max_cost_usd: Option<f64> = None;
@@ -39,6 +42,8 @@ pub(crate) fn run_multiagent_build(
         match tokens[index] {
             "--dry-run" => dry_run = true,
             "--resume" => resume = true,
+            "--no-scaffold" => scaffold = false,
+            "--approve" => approve = true,
             "--parallel" => {
                 index += 1;
                 parallel = tokens
@@ -105,6 +110,8 @@ pub(crate) fn run_multiagent_build(
         resume,
         max_cost_usd,
         build_command: build_cmd,
+        scaffold,
+        approve,
     });
 
     // Restore REPL environment regardless of the outcome.

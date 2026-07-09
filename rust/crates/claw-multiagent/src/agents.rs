@@ -115,6 +115,29 @@ fn collect_result(handle: &AgentHandle) -> AgentResult {
     }
 }
 
+/// Non-blocking poll: `Some(result)` once the agent reached a terminal
+/// state, `None` while it is still running. Lets a scheduler multiplex many
+/// agents without the barrier semantics of [`wait_all`].
+#[must_use]
+pub fn poll_result(handle: &AgentHandle) -> Option<AgentResult> {
+    let (status, _) = read_status(handle);
+    if status == "running" {
+        return None;
+    }
+    Some(collect_result(handle))
+}
+
+/// The result reported when an agent exceeds its deadline.
+#[must_use]
+pub fn timeout_result(handle: &AgentHandle, timeout: Duration) -> AgentResult {
+    AgentResult {
+        name: handle.name.clone(),
+        status: "timeout".to_string(),
+        report: read_report(handle),
+        error: Some(format!("agent timed out after {}s", timeout.as_secs())),
+    }
+}
+
 /// Waits for all handles, invoking `on_complete` for each agent **as soon as
 /// it finishes** (the spec's Supervisor reviews deliveries one by one, not in
 /// batch). Agents still running past `timeout` are reported as timed out.
