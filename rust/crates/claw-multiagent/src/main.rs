@@ -99,6 +99,29 @@ struct CommonArgs {
 
 const DASHBOARD_PORT: u16 = 4110;
 
+/// True when the port answers `GET /api/state` like a claw-dashboard (an
+/// unrelated listener must not be reported as "dashboard ya activo").
+fn dashboard_alive(port: u16) -> bool {
+    use std::io::{Read as _, Write as _};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(400))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let request =
+        format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buffer = Vec::new();
+    let mut limited = stream.take(4096);
+    let _ = limited.read_to_end(&mut buffer);
+    let response = String::from_utf8_lossy(&buffer);
+    response.starts_with("HTTP/1.1 200") && response.contains("generated_ms")
+}
+
 /// Points `CLAW_DASHBOARD_EVENTS` at this build, spawns the sibling
 /// `claw-dashboard` binary unless one is already listening, and opens the
 /// browser. Failures degrade to a warning; the build proceeds either way.
@@ -119,13 +142,33 @@ fn launch_dashboard(project_dir: &std::path::Path) {
     }
     std::env::set_var("CLAW_DASHBOARD_EVENTS", &events);
 
-    let url = format!("http://127.0.0.1:{DASHBOARD_PORT}");
-    let already_running =
-        std::net::TcpListener::bind(("127.0.0.1", DASHBOARD_PORT)).map_or(true, |probe| {
-            drop(probe);
-            false
-        });
-    if already_running {
+    // An occupied port is not necessarily OUR dashboard: probe /api/state
+    // and only reuse a listener that answers like one; otherwise walk up
+    // the port range for a free slot.
+    let mut chosen: Option<(u16, bool)> = None;
+    for port in DASHBOARD_PORT..DASHBOARD_PORT + 10 {
+        if dashboard_alive(port) {
+            chosen = Some((port, true));
+            break;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            chosen = Some((port, false));
+            break;
+        }
+        eprintln!(
+            "[multiagent] aviso: el puerto {port} lo usa otro proceso (no dashboard); probando {}",
+            port + 1
+        );
+    }
+    let Some((port, reuse)) = chosen else {
+        eprintln!(
+            "[multiagent] aviso: sin puerto libre en {DASHBOARD_PORT}..{} para el dashboard",
+            DASHBOARD_PORT + 9
+        );
+        return;
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    if reuse {
         println!("[multiagent] dashboard ya activo en {url}");
     } else {
         let binary_name = if cfg!(windows) {
@@ -141,7 +184,7 @@ fn launch_dashboard(project_dir: &std::path::Path) {
             Some(binary) => {
                 match std::process::Command::new(binary)
                     .args(["--events", &events])
-                    .args(["--port", &DASHBOARD_PORT.to_string()])
+                    .args(["--port", &port.to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn()

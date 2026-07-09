@@ -5047,6 +5047,10 @@ struct McpAddOutcome {
     scope: &'static str,
     path: PathBuf,
     replaced: bool,
+    /// The same name already exists in ANOTHER settings scope: this add
+    /// silently wins/loses depending on merge order (User → Project →
+    /// Local), so the user must be told.
+    shadows_other_scope: bool,
     summary: String,
 }
 
@@ -5236,20 +5240,24 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
-    // Snapshot which names are already invalid before we touch anything:
-    // `invalid_servers()` spans every settings file, so a pre-existing
-    // invalid entry with this name (e.g. in the project file) must not be
-    // blamed on — and roll back — a perfectly valid add in another scope.
-    let invalid_before: bool = ConfigLoader::default_for(cwd)
+    // Snapshot the merged view before we touch anything:
+    // - `invalid_servers()` spans every settings file, so a pre-existing
+    //   invalid entry with this name (e.g. in the project file) must not be
+    //   blamed on — and roll back — a perfectly valid add in another scope.
+    // - A VALID server with this name in another scope means this add will
+    //   shadow (or be shadowed by) it via merge order; warn, don't block.
+    let (invalid_before, existed_in_merged) = ConfigLoader::default_for(cwd)
         .load()
         .map(|runtime_config| {
-            runtime_config
-                .mcp()
-                .invalid_servers()
-                .iter()
-                .any(|invalid| invalid.name == name)
+            let mcp = runtime_config.mcp();
+            (
+                mcp.invalid_servers()
+                    .iter()
+                    .any(|invalid| invalid.name == name),
+                mcp.servers().contains_key(name),
+            )
         })
-        .unwrap_or(false);
+        .unwrap_or((false, false));
     let mut root: Value = match &original {
         Some(content) if !content.trim().is_empty() => serde_json::from_str(content)
             .map_err(|error| {
@@ -5330,6 +5338,9 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
         scope,
         path,
         replaced,
+        // Existed in the merged config but not in the file we wrote to →
+        // the definition lives in another scope and merge order decides.
+        shadows_other_scope: existed_in_merged && !replaced,
         summary,
     })
 }
@@ -5409,19 +5420,31 @@ fn apply_mcp_remove(cwd: &Path, rest: &str) -> Result<McpRemoveOutcome, String> 
 
 fn render_mcp_add_text(cwd: &Path, rest: &str) -> String {
     match apply_mcp_add(cwd, rest) {
-        Ok(outcome) => format!(
-            "MCP\n  Action           add\n  Status           ok\n  Server           {}\n  Transport        {}\n  Scope            {} ({})\n  Target           {}\n  Replaced         {}\n  Hint             `claw mcp show {}` inspects it; the next claw session connects automatically",
-            outcome.name,
-            outcome.transport,
-            outcome.scope,
-            display_path(cwd, &outcome.path),
-            outcome.summary,
-            outcome.replaced,
-            outcome.name,
-        ),
-        Err(message) => format!(
-            "MCP\n  Error            {message}\n  Usage            {MCP_ADD_USAGE}"
-        ),
+        Ok(outcome) => {
+            let shadow_note = if outcome.shadows_other_scope {
+                format!(
+                    "\n  Warning          '{}' also exists in another settings scope; \
+                     merge order (user → project → local) decides which definition wins",
+                    outcome.name
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "MCP\n  Action           add\n  Status           ok\n  Server           {}\n  Transport        {}\n  Scope            {} ({})\n  Target           {}\n  Replaced         {}{}\n  Hint             `claw mcp show {}` inspects it; the next claw session connects automatically",
+                outcome.name,
+                outcome.transport,
+                outcome.scope,
+                display_path(cwd, &outcome.path),
+                outcome.summary,
+                outcome.replaced,
+                shadow_note,
+                outcome.name,
+            )
+        }
+        Err(message) => {
+            format!("MCP\n  Error            {message}\n  Usage            {MCP_ADD_USAGE}")
+        }
     }
 }
 
@@ -5438,6 +5461,7 @@ fn render_mcp_add_json(cwd: &Path, rest: &str) -> Value {
             "file": display_path(cwd, &outcome.path),
             "target": outcome.summary,
             "replaced": outcome.replaced,
+            "shadows_other_scope": outcome.shadows_other_scope,
         }),
         Err(message) => json!({
             "kind": "mcp",

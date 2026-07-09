@@ -32,13 +32,34 @@ pub(crate) fn setup_dashboard() {
     // Activate telemetry for this claw process.
     env::set_var("CLAW_DASHBOARD_EVENTS", &events);
 
-    let url = format!("http://127.0.0.1:{DASHBOARD_DEFAULT_PORT}");
-    let already_running =
-        TcpListener::bind(("127.0.0.1", DASHBOARD_DEFAULT_PORT)).map_or(true, |probe| {
-            drop(probe);
-            false
-        });
-    if already_running {
+    // An occupied port is not necessarily OUR dashboard: probe /api/state
+    // and only reuse a listener that actually answers like one; otherwise
+    // walk up the port range to find a free slot.
+    let mut chosen: Option<(u16, bool)> = None;
+    for port in DASHBOARD_DEFAULT_PORT..DASHBOARD_DEFAULT_PORT + 10 {
+        if dashboard_alive(port) {
+            chosen = Some((port, true));
+            break;
+        }
+        let free = TcpListener::bind(("127.0.0.1", port)).is_ok();
+        if free {
+            chosen = Some((port, false));
+            break;
+        }
+        eprintln!(
+            "warning: port {port} is used by another (non-dashboard) process; trying {}",
+            port + 1
+        );
+    }
+    let Some((port, reuse)) = chosen else {
+        eprintln!(
+            "warning: no free port found in {DASHBOARD_DEFAULT_PORT}..{} for claw-dashboard",
+            DASHBOARD_DEFAULT_PORT + 9
+        );
+        return;
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    if reuse {
         eprintln!("claw-dashboard already listening on {url}");
     } else {
         // The dashboard binary is expected next to the claw binary (both
@@ -51,7 +72,7 @@ pub(crate) fn setup_dashboard() {
             Some(binary) => {
                 match Command::new(binary)
                     .args(["--events", &events])
-                    .args(["--port", &DASHBOARD_DEFAULT_PORT.to_string()])
+                    .args(["--port", &port.to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .spawn()
@@ -74,6 +95,30 @@ pub(crate) fn setup_dashboard() {
         }
     }
     open_in_browser(&url);
+}
+
+/// True when the port answers `GET /api/state` like a claw-dashboard (an
+/// unrelated listener on the same port must not be reported as "already
+/// running" while this run's telemetry goes unvisualized).
+pub(crate) fn dashboard_alive(port: u16) -> bool {
+    use std::io::{Read as _, Write as _};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(400))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let request =
+        format!("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buffer = Vec::new();
+    let mut limited = stream.take(4096);
+    let _ = limited.read_to_end(&mut buffer);
+    let response = String::from_utf8_lossy(&buffer);
+    response.starts_with("HTTP/1.1 200") && response.contains("generated_ms")
 }
 
 fn dashboard_binary_name() -> &'static str {

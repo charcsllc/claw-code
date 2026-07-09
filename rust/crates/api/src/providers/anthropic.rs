@@ -902,6 +902,35 @@ impl MessageStream {
     }
 }
 
+impl Drop for MessageStream {
+    fn drop(&mut self) {
+        // A stream dropped mid-response (user abort, network cut) has real
+        // billed usage that MessageStop will never record: the accumulated
+        // MessageStart/MessageDelta counts are the best available figure,
+        // so record them (marked aborted) instead of losing them entirely.
+        if self.usage_recorded {
+            return;
+        }
+        let Some(usage) = self.latest_usage.as_ref() else {
+            return;
+        };
+        if let Some(prompt_cache) = &self.prompt_cache {
+            let record = prompt_cache.record_usage(&self.request, usage);
+            *self
+                .last_prompt_cache_record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+        }
+        if let Some(session_tracer) = &self.session_tracer {
+            session_tracer.record_analytics(
+                message_usage_event(&self.request.model, self.request_id.as_deref(), usage)
+                    .with_property("aborted", serde_json::Value::Bool(true)),
+            );
+        }
+        self.usage_recorded = true;
+    }
+}
+
 async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response, ApiError> {
     let status = response.status();
     if status.is_success() {

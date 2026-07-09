@@ -391,6 +391,39 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
     }
 
+    // ---- Design system: tokens and base components as real files, so
+    //      every developer composes over the same visual foundation
+    //      instead of writing ad-hoc CSS. ----
+    if options.project_dir.join("package.json").exists() && !docs.join("design-system.md").exists()
+    {
+        workflow.phase("Design system: tokens y componentes base");
+        match run_single(
+            Role::UxUiDesigner,
+            &options.catalog.director,
+            options,
+            "Read docs/plan.json and the UX/UI design document under docs/. Build \
+             the visual foundation NOW as real files: (1) if `tailwindcss` and \
+             `@tailwindcss/vite` are in devDependencies, wire the vite plugin and \
+             add `@import \"tailwindcss\";` plus an `@theme` block to the main \
+             stylesheet; (2) define the design tokens — color palette with dark \
+             mode, typography scale, spacing — as Tailwind theme tokens or CSS \
+             variables; (3) create accessible base UI components (Button, Card, \
+             Input, a Layout/Container) under src/components/ui/ (or the \
+             stack-appropriate location); (4) write docs/design-system.md \
+             documenting every token and component. Developers will be REQUIRED \
+             to use these instead of ad-hoc styles. Verify the project still \
+             builds before finishing.",
+        ) {
+            Ok(design) => {
+                save_doc(&docs, "design-system-report.md", &design.report)?;
+                let _ = git_commit(&options.project_dir, "design: tokens and base components");
+            }
+            Err(error) => {
+                workflow.phase(&format!("  aviso: fase de design system falló ({error})"));
+            }
+        }
+    }
+
     // ---- Developer waves + Supervisor per delivery ----
     let mut state = BuildState::load(&options.project_dir);
     let resumed_tasks = if options.resume {
@@ -615,6 +648,37 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     }
 
     if !budget_aborted && !user_aborted {
+        // ---- Security gate: deterministic, zero-token checks first ----
+        run_security_gate(options, &workflow, &supervision_md)?;
+
+        // ---- Performance budget over the built bundle ----
+        run_performance_gate(options, &workflow, &supervision_md)?;
+
+        // ---- Seed data: the first impression must never be an empty
+        //      table and a spinner ----
+        if !docs.join("seed-data.md").exists() {
+            workflow.phase("Seed data: poblando la app con datos de demostración");
+            match run_single(
+                Role::Developer,
+                &options.catalog.medium,
+                options,
+                "The project is built. Create realistic seed/demo data so the FIRST \
+                 RUN shows a fully populated UI — never an empty table and a \
+                 spinner. Use whatever fits this stack: fixtures, a seed script \
+                 wired into the dev flow, or mock API data. Keep it clearly \
+                 demo-labeled and easy to remove. Document what you added in \
+                 docs/seed-data.md and verify the project still builds.",
+            ) {
+                Ok(seed) => {
+                    save_doc(&docs, "seed-data-report.md", &seed.report)?;
+                    let _ = git_commit(&options.project_dir, "seed: demo data for first run");
+                }
+                Err(error) => {
+                    workflow.phase(&format!("  aviso: fase de seed data falló ({error})"));
+                }
+            }
+        }
+
         // ---- QA ----
         workflow.phase("Agente QA: generando y ejecutando pruebas");
         let qa = run_single(
@@ -690,8 +754,61 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
         }
 
-        // ---- Smoke test: does the product actually start and answer? ----
+        // ---- Smoke test: does the product actually start and answer?
+        //      (also captures the rendered DOM + screenshots when a
+        //      headless Chromium is available) ----
         run_smoke_test(&options.project_dir, &docs, &workflow);
+
+        // ---- Visual QA: critique what actually rendered, not the source ----
+        if docs.join("rendered-dom.html").exists() {
+            workflow.phase("QA visual: revisando el DOM renderizado");
+            match run_single(
+                Role::UxUiDesigner,
+                &options.catalog.supervisor,
+                options,
+                "docs/rendered-dom.html is the homepage DOM exactly as rendered \
+                 after JavaScript ran (docs/screenshots/ may hold PNGs for \
+                 humans). Review it together with the UI source code: visual \
+                 hierarchy, empty states (is real content actually showing?), \
+                 accessibility (landmarks, alt text, form labels, contrast per \
+                 the CSS), responsive classes and dead links. FIX every issue \
+                 you find directly in the repository and write docs/visual-qa.md \
+                 with what you found and fixed.",
+            ) {
+                Ok(review) => {
+                    save_doc(&docs, "visual-qa-report.md", &review.report)?;
+                    let _ = git_commit(&options.project_dir, "visual-qa: UI review fixes");
+                }
+                Err(error) => {
+                    workflow.phase(&format!("  aviso: QA visual falló ({error})"));
+                }
+            }
+        }
+
+        // ---- Deploy pack: real files, not prose ----
+        if !options.project_dir.join("Dockerfile").exists() {
+            workflow.phase("Pack de deploy: Dockerfile, CI y config de plataforma");
+            match run_single(
+                Role::DevOpsArchitect,
+                &options.catalog.medium,
+                options,
+                "Write the REAL deployment files for this project as built: a \
+                 multi-stage Dockerfile, .dockerignore, a CI workflow at \
+                 .github/workflows/ci.yml (install, build, tests), and the \
+                 platform config that fits the stack (vercel.json or netlify.toml \
+                 for static/frontend builds). Files must be complete and working, \
+                 not examples. Finish with docs/deploy.md documenting the exact \
+                 commands to build and deploy.",
+            ) {
+                Ok(deploy) => {
+                    save_doc(&docs, "deploy-report.md", &deploy.report)?;
+                    let _ = git_commit(&options.project_dir, "deploy: deployment pack");
+                }
+                Err(error) => {
+                    workflow.phase(&format!("  aviso: pack de deploy falló ({error})"));
+                }
+            }
+        }
 
         // ---- Documentation ----
         workflow.phase("Agente de Documentación: README, ADRs y changelog");
@@ -837,6 +954,25 @@ fn spawn_developer(
              contract files; never redefine shared types, API routes or data models.",
         );
     }
+    if options
+        .project_dir
+        .join("docs")
+        .join("design-system.md")
+        .exists()
+    {
+        prompt.push_str(
+            "\n\n## Design system\nRead docs/design-system.md and USE the existing \
+             tokens and base components (src/components/ui/); never write ad-hoc \
+             styles or duplicate base components.",
+        );
+    }
+    prompt.push_str(
+        "\n\n## Quality bar\n- Security: never hardcode secrets (env vars + \
+         .env.example); sanitize user input; httpOnly cookies; strict CORS.\n\
+         - Performance: route-level code-splitting, lazy-load heavy \
+         components/images, no heavyweight dependencies for trivial work.\n\
+         - Accessibility: semantic landmarks, labeled form controls, alt text.",
+    );
     if let Some(failure) = verification_failure {
         let _ = write!(
             prompt,
@@ -958,8 +1094,15 @@ fn scaffold_project(options: &RunOptions, plan: &Plan, workflow: &WorkflowLog) {
             }
             merge_missing(&staging, dir);
             let _ = std::fs::remove_dir_all(&staging);
-            workflow.phase("Scaffold: npm install");
+            workflow.phase("Scaffold: npm install (+ Tailwind CSS)");
             if let Err(error) = shell_output("npm install --no-audit --no-fund", dir) {
+                warn(&error);
+            } else if let Err(error) = shell_output(
+                // Tailwind v4: the design-system phase wires the vite plugin
+                // and tokens; installing here keeps that phase deterministic.
+                "npm install --no-audit --no-fund -D tailwindcss @tailwindcss/vite",
+                dir,
+            ) {
                 warn(&error);
             }
         }
@@ -1020,6 +1163,259 @@ fn copy_dir_recursive(from: &Path, to: &Path) {
             let _ = std::fs::copy(&source, &target);
         }
     }
+}
+
+// ---------- Security gate ----------
+
+/// Fixed-prefix credential patterns; simple `contains` keeps the scan fast
+/// and dependency-free.
+const SECRET_MARKERS: &[&str] = &[
+    "sk-ant-",
+    "sk-proj-",
+    "AKIA",
+    "ghp_",
+    "xoxb-",
+    "xoxp-",
+    "-----BEGIN RSA PRIVATE KEY",
+    "-----BEGIN OPENSSH PRIVATE KEY",
+    "-----BEGIN EC PRIVATE KEY",
+];
+
+/// Walks the generated sources looking for hardcoded credentials. Skips
+/// vendored/build/docs directories and `.env.example` (placeholders belong
+/// there). Capped so a pathological tree cannot stall the gate.
+#[must_use]
+pub fn scan_for_secrets(project_dir: &Path) -> Vec<String> {
+    const SKIP_DIRS: &[&str] = &[
+        "node_modules",
+        ".git",
+        "target",
+        "dist",
+        "build",
+        ".multiagent",
+        "docs",
+        ".scaffold",
+    ];
+    let mut findings = Vec::new();
+    let mut pending = vec![project_dir.to_path_buf()];
+    let mut visited = 0_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if findings.len() >= 10 || visited >= 4_000 {
+                return findings;
+            }
+            visited += 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if name == ".env.example" {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > 512 * 1024 {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for marker in SECRET_MARKERS {
+                if content.contains(marker) {
+                    findings.push(format!(
+                        "{} contains `{marker}…`",
+                        path.strip_prefix(project_dir).unwrap_or(&path).display()
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// Deterministic security pass (zero tokens until something is found):
+/// dependency audit + hardcoded-secret scan; findings go to the Fixer.
+fn run_security_gate(
+    options: &RunOptions,
+    workflow: &WorkflowLog,
+    supervision_md: &Path,
+) -> Result<(), String> {
+    workflow.phase("Gate de seguridad: auditoría de dependencias y escaneo de secretos");
+    let dir = &options.project_dir;
+    let mut findings: Vec<String> = Vec::new();
+
+    if dir.join("package-lock.json").exists() {
+        if let Err(output) = shell_output("npm audit --audit-level=high", dir) {
+            findings.push(format!(
+                "npm audit found high/critical vulnerabilities:\n{}",
+                truncate_chars(&output, 3_000)
+            ));
+        }
+    }
+    // cargo-audit is optional tooling; only run it when installed.
+    if dir.join("Cargo.lock").exists() && shell_output("cargo audit --version", dir).is_ok() {
+        if let Err(output) = shell_output("cargo audit", dir) {
+            findings.push(format!(
+                "cargo audit found vulnerable dependencies:\n{}",
+                truncate_chars(&output, 3_000)
+            ));
+        }
+    }
+    for hit in scan_for_secrets(dir) {
+        findings.push(format!("possible hardcoded secret: {hit}"));
+    }
+
+    if findings.is_empty() {
+        workflow.phase("  seguridad: OK");
+        return Ok(());
+    }
+    workflow.phase(&format!(
+        "  seguridad: {} hallazgo(s) → despachando Técnico",
+        findings.len()
+    ));
+    append_file(
+        supervision_md,
+        &format!("\n## Security gate findings\n\n{}\n", findings.join("\n\n")),
+    )?;
+    match run_single(
+        Role::Fixer,
+        &options.catalog.supervisor,
+        options,
+        &format!(
+            "Security findings in the repository:\n\n{}\n\nFix them: upgrade or \
+             replace vulnerable dependencies, move every hardcoded secret to \
+             environment variables, add a complete .env.example, and make sure \
+             no secret is ever logged. Report each fix applied.",
+            findings.join("\n\n")
+        ),
+    ) {
+        Ok(fixer) => {
+            append_file(
+                supervision_md,
+                &format!("\n### Security fixes\n\n{}\n", fixer.report),
+            )?;
+        }
+        Err(error) => {
+            workflow.phase(&format!(
+                "  aviso: Fixer de seguridad no disponible ({error})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------- Performance budget ----------
+
+/// Per-chunk JS budget over the built output. 400 KB raw ≈ 120 KB gzipped —
+/// past that, the first paint pays for it.
+const BUNDLE_BUDGET_BYTES: u64 = 400_000;
+
+/// Collects built JS chunks over budget, largest first.
+#[must_use]
+pub fn oversized_bundles(dist: &Path) -> Vec<(PathBuf, u64)> {
+    let mut heavy = Vec::new();
+    let mut pending = vec![dist.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let is_js = path
+                .extension()
+                .is_some_and(|extension| extension == "js" || extension == "mjs");
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if is_js && metadata.len() > BUNDLE_BUDGET_BYTES {
+                heavy.push((path, metadata.len()));
+            }
+        }
+    }
+    heavy.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    heavy
+}
+
+/// Checks the built bundle against the budget; breaches go to the Fixer
+/// with the exact file list.
+fn run_performance_gate(
+    options: &RunOptions,
+    workflow: &WorkflowLog,
+    supervision_md: &Path,
+) -> Result<(), String> {
+    let dist = ["dist", "build", ".output/public"]
+        .iter()
+        .map(|candidate| options.project_dir.join(candidate))
+        .find(|path| path.is_dir());
+    let Some(dist) = dist else {
+        return Ok(()); // nothing built to measure (e.g. pure backend)
+    };
+    let heavy = oversized_bundles(&dist);
+    if heavy.is_empty() {
+        workflow.phase("Performance budget: OK");
+        return Ok(());
+    }
+    let listing = heavy
+        .iter()
+        .map(|(path, size)| {
+            format!(
+                "- {} ({} KB)",
+                path.strip_prefix(&options.project_dir)
+                    .unwrap_or(path)
+                    .display(),
+                size / 1024
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    workflow.phase(&format!(
+        "Performance budget: {} chunk(s) sobre {} KB → despachando Técnico",
+        heavy.len(),
+        BUNDLE_BUDGET_BYTES / 1024
+    ));
+    append_file(
+        supervision_md,
+        &format!("\n## Performance budget exceeded\n\n{listing}\n"),
+    )?;
+    match run_single(
+        Role::Fixer,
+        &options.catalog.supervisor,
+        options,
+        &format!(
+            "These built JS chunks exceed the {} KB performance budget:\n\n\
+             {listing}\n\nReduce them: route-level code-splitting with dynamic \
+             imports, lazy-load heavy components, and replace heavyweight \
+             dependencies used for trivial work. Rebuild to verify, and report \
+             each change.",
+            BUNDLE_BUDGET_BYTES / 1024
+        ),
+    ) {
+        Ok(fixer) => {
+            append_file(
+                supervision_md,
+                &format!("\n### Performance fixes\n\n{}\n", fixer.report),
+            )?;
+        }
+        Err(error) => {
+            workflow.phase(&format!(
+                "  aviso: Fixer de performance no disponible ({error})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------- Plan checkpoint (--approve) ----------
@@ -1143,6 +1539,14 @@ fn run_smoke_test(project_dir: &Path, docs: &Path, workflow: &WorkflowLog) {
         }
     }
 
+    // While the server is still alive: capture what actually rendered
+    // (screenshot for humans, post-JS DOM for the visual-QA agent).
+    if let Some((port, _)) = &hit {
+        if capture_rendered_page(docs, *port) {
+            workflow.phase("  captura: DOM renderizado y screenshot guardados en docs/");
+        }
+    }
+
     // Kill the whole process group: npm's children outlive a plain kill.
     let pid = child.id();
     let _ = std::process::Command::new("kill")
@@ -1203,6 +1607,71 @@ fn run_smoke_test(project_dir: &Path, docs: &Path, workflow: &WorkflowLog) {
 #[cfg(not(unix))]
 fn run_smoke_test(_project_dir: &Path, _docs: &Path, workflow: &WorkflowLog) {
     workflow.phase("Smoke test: omitido (solo unix)");
+}
+
+/// First executable from `candidates` found on PATH.
+#[must_use]
+fn find_in_path(candidates: &[&str]) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for candidate in candidates {
+            if dir.join(candidate).is_file() {
+                return Some((*candidate).to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Captures the running app with a headless Chromium when one is available:
+/// a screenshot under docs/screenshots/ (for humans) and the post-JS DOM at
+/// docs/rendered-dom.html (for the visual-QA agent — it reviews what the
+/// browser actually produced, not what the source promises). Returns whether
+/// anything was captured; no browser just means no visual QA.
+#[cfg(unix)]
+fn capture_rendered_page(docs: &Path, port: u16) -> bool {
+    let Some(browser) = find_in_path(&[
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ]) else {
+        return false;
+    };
+    let url = format!("http://127.0.0.1:{port}/");
+    let shots = docs.join("screenshots");
+    let _ = std::fs::create_dir_all(&shots);
+    let screenshot = shots.join("home.png");
+    let _ = std::process::Command::new(&browser)
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--window-size=1280,800",
+            "--virtual-time-budget=8000",
+            &format!("--screenshot={}", screenshot.display()),
+            &url,
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Ok(output) = std::process::Command::new(&browser)
+        .args([
+            "--headless=new",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--virtual-time-budget=8000",
+            "--dump-dom",
+            &url,
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() && !output.stdout.is_empty() {
+            let _ = std::fs::write(docs.join("rendered-dom.html"), &output.stdout);
+        }
+    }
+    docs.join("rendered-dom.html").exists() || screenshot.exists()
 }
 
 /// Directories a developer agent may write to, derived from its TaskSpec.
@@ -1552,7 +2021,9 @@ fn spawn_supervisor(
         &format!(
             "Task delivered:\n```json\n{}\n```\n\nDeveloper report:\n{}\n\nDelivery \
              status: {}. Inspect the repository files this task touched. Evaluate \
-             quality, architecture, conventions, duplication, security and coverage.\n\
+             quality, architecture, conventions, duplication and coverage. \
+             Mandatory security lens: XSS, injection (SQL/command), authorization \
+             gaps, hardcoded secrets, unsafe CORS/CSP, cookies without httpOnly.\n\
              Respond with ```json {{\"approved\": bool, \"summary\": \"...\", \
              \"issues\": [{{\"severity\": \"low|medium|high\", \"file\": \"...\", \
              \"description\": \"...\", \"suggested_fix\": \"...\"}}]}} ```",

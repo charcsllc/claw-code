@@ -5455,9 +5455,13 @@ impl SubagentToolExecutor {
             return Ok(());
         };
         let cwd = std::env::current_dir().unwrap_or_default();
-        let target = normalize_scope_path(&cwd, Path::new(raw_path));
+        // Lexical normalization first (works for not-yet-created files),
+        // then resolve the deepest EXISTING ancestor through the real
+        // filesystem: a symlink inside the module (src/auth/vendor →
+        // ../cart) must not smuggle writes into another module.
+        let target = resolve_existing_ancestors(&normalize_scope_path(&cwd, Path::new(raw_path)));
         let in_scope = scope.iter().any(|prefix| {
-            let prefix = normalize_scope_path(&cwd, prefix);
+            let prefix = resolve_existing_ancestors(&normalize_scope_path(&cwd, prefix));
             target == prefix || target.starts_with(&prefix)
         });
         if in_scope {
@@ -5469,6 +5473,28 @@ impl SubagentToolExecutor {
             )))
         }
     }
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` (resolving
+/// symlinks), then re-appends the not-yet-existing tail. This keeps scope
+/// checks honest for files about to be created while still following any
+/// symlink that already exists on the way.
+fn resolve_existing_ancestors(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            break;
+        };
+        tail.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    let base = existing.canonicalize().unwrap_or(existing);
+    tail.into_iter()
+        .rev()
+        .fold(base, |acc, component| acc.join(component))
 }
 
 /// Lexically normalizes a path against `cwd` (no filesystem access, so it
@@ -8904,6 +8930,44 @@ mod tests {
             &json!({"path": "src/cart/cart.ts"}).to_string(),
         );
         assert!(read.is_ok(), "reads stay workspace-wide: {read:?}");
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_scope_follows_symlinks_out_of_the_module() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope-symlink");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        std::fs::create_dir_all(workspace.join("src/cart")).expect("dirs");
+        // src/auth/vendor → ../cart: lexically inside the scope, physically outside.
+        std::os::unix::fs::symlink("../cart", workspace.join("src/auth/vendor")).expect("symlink");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from(["write_file".to_string()]))
+            .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        let through_symlink = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/vendor/hijack.ts", "content": "nope"}).to_string(),
+        );
+        let error = through_symlink.expect_err("symlinked write must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "error should mention scope: {error}"
+        );
+
+        // Direct in-scope writes still pass.
+        let inside = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/login.ts", "content": "ok"}).to_string(),
+        );
+        assert!(inside.is_ok(), "in-scope write should pass: {inside:?}");
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
         let _ = std::fs::remove_dir_all(workspace);
