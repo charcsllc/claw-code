@@ -18,7 +18,7 @@
   </a>
 </p>
 
-<h3 align="center">start with the real crab-powered harnesses</h3>
+<h3 align="center">empieza con los harnesses cangrejiles de verdad</h3>
 
 <p align="center">
   <a href="https://github.com/code-yeongyu/lazycodex"><b>github.com/code-yeongyu/lazycodex</b></a>
@@ -28,55 +28,55 @@
 
 <p align="center">
   <a href="https://github.com/code-yeongyu/lazycodex">
-    <img src="https://img.shields.io/badge/Open-LazyCodex-111111?style=flat-square&logo=github&logoColor=white" alt="Open LazyCodex on GitHub" />
+    <img src="https://img.shields.io/badge/Open-LazyCodex-111111?style=flat-square&logo=github&logoColor=white" alt="Abrir LazyCodex en GitHub" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
-    <img src="https://img.shields.io/badge/Open-Gajae--Code-B22222?style=flat-square&logo=github&logoColor=white" alt="Open Gajae-Code on GitHub" />
+    <img src="https://img.shields.io/badge/Open-Gajae--Code-B22222?style=flat-square&logo=github&logoColor=white" alt="Abrir Gajae-Code en GitHub" />
   </a>
 </p>
 
 <p align="center">
   <a href="https://discord.gg/GtjhvgjnV">
-    <img src="https://img.shields.io/badge/Discord-join%20the%20harness%20lab-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the harness lab on Discord" />
+    <img src="https://img.shields.io/badge/Discord-join%20the%20harness%20lab-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Únete al harness lab en Discord" />
   </a>
   <a href="https://discord.gg/4Rt79F7dF">
-    <img src="https://img.shields.io/badge/Discord-join%20the%20crab%20tank-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the crab tank on Discord" />
+    <img src="https://img.shields.io/badge/Discord-join%20the%20crab%20tank-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Únete al crab tank en Discord" />
   </a>
 </p>
 
 <p align="center">
-  Join the Discords:
-  <a href="https://discord.gg/GtjhvgjnV"><b>ultraworkers discord</b></a>
+  Únete a los Discords:
+  <a href="https://discord.gg/GtjhvgjnV"><b>discord de ultraworkers</b></a>
   ·
-  <a href="https://discord.gg/4Rt79F7dF"><b>gajae-code discord</b></a>
+  <a href="https://discord.gg/4Rt79F7dF"><b>discord de gajae-code</b></a>
 </p>
 
 > [!IMPORTANT]
-> **Claw Code is not the serious production project here.**
-> This repository is closer to a museum exhibit than a product pitch, a crustacean-run artifact kept alive by clawed gajaes, swept and labeled by agents, and automatically maintained according to the harnesses above.
+> **Claw Code no es el proyecto serio de producción aquí.**
+> Este repositorio se parece más a una pieza de museo que a un pitch de producto: un artefacto gestionado por crustáceos, mantenido con vida por gajaes con pinzas, barrido y etiquetado por agentes, y mantenido automáticamente según los harnesses de arriba.
 >
-> As already described in the project philosophy, this is not meant to be hand-operated like a normal product repo. It is an **agent-managed exhibit**: the harnesses plan, execute, verify, label, and preserve the artifact while the crabs keep the tank running.
+> Como ya describe la filosofía del proyecto, esto no está pensado para operarse a mano como un repo de producto normal. Es una **exhibición gestionada por agentes**: los harnesses planifican, ejecutan, verifican, etiquetan y preservan el artefacto mientras los cangrejos mantienen el acuario en marcha.
 >
-> If you want to actually run work, start with **[LazyCodex](https://github.com/code-yeongyu/lazycodex)** or **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. If you want to inspect the strange little fossil of the Claw Code moment, continue below.
+> Si quieres trabajar de verdad, empieza con **[LazyCodex](https://github.com/code-yeongyu/lazycodex)** o **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. Si quieres inspeccionar el pequeño y extraño fósil del momento Claw Code, sigue leyendo.
 >
-> For the longer public explanation behind this philosophy, see [here](https://x.com/realsigridjin/status/2039472968624185713).
+> Para la explicación pública más larga detrás de esta filosofía, mira [aquí](https://x.com/realsigridjin/status/2039472968624185713).
 
 <p align="center">
   <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
   ·
-  <a href="./USAGE.md">Usage</a>
+  <a href="./USAGE.md">Uso</a>
   ·
-  <a href="./rust/README.md">Rust workspace</a>
+  <a href="./rust/README.md">Workspace Rust</a>
   ·
   <a href="./PARITY.md">Parity</a>
   ·
   <a href="./ROADMAP.md">Roadmap</a>
   ·
-  <a href="./CONTRIBUTING.md">Contributing</a>
+  <a href="./CONTRIBUTING.md">Contribuir</a>
   ·
-  <a href="./SECURITY.md">Security</a>
+  <a href="./SECURITY.md">Seguridad</a>
   ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
+  <a href="https://discord.gg/5TUQKqFWd">Discord de UltraWorkers</a>
 </p>
 
 <p align="center">
@@ -84,7 +84,7 @@
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
       <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
+      <img alt="Historial de estrellas de ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
     </picture>
   </a>
 </p>
@@ -93,114 +93,120 @@
   <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
 </p>
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+Claw Code es la implementación pública en Rust del harness de agente CLI `claw`.
+La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad actual de este repositorio es **ultraworkers/claw-code**.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Empieza por [`USAGE.md`](./USAGE.md) para los flujos de build, autenticación, CLI, sesiones y el harness de parity. Para dudas sobre envío/navegación de archivos, consulta [Navegación y contexto de archivos](./docs/navigation-file-context.md). Para modelos locales compatibles con OpenAI e instalación de skills sin conexión, mira [Proveedores locales compatibles con OpenAI y setup de skills](./docs/local-openai-compatible-providers.md). Los usuarios de Windows pueden saltar directamente al [quickstart de instalación y releases en Windows](./docs/windows-install-release.md), centrado en PowerShell. Haz de `claw doctor` tu primer chequeo de salud después de compilar, usa [`rust/README.md`](./rust/README.md) para el detalle por crate, lee [`PARITY.md`](./PARITY.md) para el checkpoint actual del port a Rust, y mira [`docs/container.md`](./docs/container.md) para el flujo container-first.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
+> **Estado de ACP / Zed:** `claw-code` todavía no incluye un daemon ACP/Zed ni un entrypoint JSON-RPC. Ejecuta `claw acp` (o `claw --acp`) para ver el estado actual en vez de adivinarlo por la estructura del código; `claw acp serve` es de momento solo un alias de descubrimiento, devuelve el estado con código de salida 0, y el soporte real de ACP se sigue trazando por separado en `ROADMAP.md`. Para el contrato JSON público, consulta [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
 
-## Current repository shape
+## Forma actual del repositorio
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+- **`rust/`** — workspace canónico de Rust y el binario CLI `claw`
+- **`USAGE.md`** — guía de uso orientada a tareas para la superficie actual del producto
+- **`PARITY.md`** — estado de parity del port a Rust y notas de migración
+- **`ROADMAP.md`** — roadmap activo y backlog de limpieza
+- **`PHILOSOPHY.md`** — intención del proyecto y encuadre de diseño del sistema
+- **`src/` + `tests/`** — workspace complementario de Python/referencia y utilidades de auditoría; no es la superficie principal de ejecución
 
-## Quick start
+## Novedades destacadas
+
+- **Plataforma multiagente (`/web` y `/app`)** — a partir de un solo prompt, una jerarquía de agentes (Director → Arquitectos → Subdirector → developers en paralelo → Supervisor → Técnico → QA → Docs) construye un proyecto web o una aplicación completa: scaffold determinista, contratos de tipos compartidos, scheduler por grafo sin barreras, verificación por entrega, build gate, tests reales, smoke test del servidor y un commit de git por tarea. Detalles y flags en [`USAGE.md`](./USAGE.md).
+- **Dashboard local (`claw-dashboard`)** — telemetría en vivo en el navegador: tokens de entrada/salida por sesión, coste estimado, y el workflow multiagente con cada agente en ejecución/terminado en tiempo real. 100 % local (lee un JSONL; nada sale de tu máquina).
+- **`claw mcp add` / `claw mcp remove`** — instalación de servidores MCP en un comando (stdio, HTTP, SSE), con validación y rollback seguro de la configuración.
+
+## Inicio rápido
 
 > [!NOTE]
 > [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
+> **`cargo install claw-code` instala lo que no es.** El crate `claw-code` de crates.io es un stub deprecado que coloca `claw-code-deprecated.exe` — no `claw`. Al ejecutarlo solo imprime `"claw-code has been renamed to agent-code"`. **No uses `cargo install claw-code`.** O compila desde el código fuente (este repo) o instala el binario upstream:
 > ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
+> cargo install agent-code   # binario upstream — instala 'agent.exe' (Windows) / 'agent' (Unix), NO 'agent-code'
 > ```
-> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+> Este repo (`ultraworkers/claw-code`) es **solo build desde código fuente** — sigue los pasos de abajo.
 
 ```bash
-# 1. Clone and build
+# 1. Clona y compila
 git clone https://github.com/ultraworkers/claw-code
 cd claw-code/rust
 cargo build --workspace
 
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
+# 2. Configura tu API key (API key de Anthropic — no una suscripción de Claude)
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# 3. Verify everything is wired correctly
+# 3. Verifica que todo está bien conectado
 ./target/debug/claw doctor
 
-# 4. Run a prompt
+# 4. Ejecuta un prompt
 ./target/debug/claw prompt "say hello"
 
-# 5. Start an interactive session
+# 5. Arranca una sesión interactiva
 ./target/debug/claw
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** el binario es `claw.exe`, no `claw`. Usa `.\target\debug\claw.exe` o ejecuta `cargo run -- prompt "say hello"` para saltarte la búsqueda de la ruta.
 
-### Windows setup
+### Configuración en Windows
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
+**PowerShell es una ruta soportada en Windows.** Usa la shell que mejor te funcione. Los problemas de onboarding más comunes en Windows son:
 
-1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
-2. **Verify Rust is on PATH:**
+1. **Instala Rust primero** — descárgalo de <https://rustup.rs/> y ejecuta el instalador. Cierra y reabre la terminal cuando termine.
+2. **Verifica que Rust está en el PATH:**
    ```powershell
    cargo --version
    ```
-   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
+   Si falla, reabre la terminal o ejecuta el setup de PATH que indica la salida del instalador de Rust, y reintenta.
+3. **Clona y compila** (funciona en PowerShell, Git Bash o WSL):
    ```powershell
    git clone https://github.com/ultraworkers/claw-code
    cd claw-code/rust
    cargo build --workspace
    ```
-4. **Run** (PowerShell — note `.exe` and backslash):
+4. **Ejecuta** (PowerShell — fíjate en el `.exe` y la barra invertida):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
    .\target\debug\claw.exe prompt "say hello"
    ```
 
-For release ZIPs, PATH setup, provider switching, and notification smoke checks, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
+Para ZIPs de release, configuración del PATH, cambio de proveedor y pruebas de notificaciones, consulta [`docs/windows-install-release.md`](./docs/windows-install-release.md).
 
-**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
+**Git Bash / WSL** son alternativas opcionales, no requisitos. Si prefieres rutas estilo bash (`/c/Users/tu/...` en vez de `C:\Users\tu\...`), Git Bash (viene con Git para Windows) funciona bien. En Git Bash, el prompt `MINGW64` es lo esperado y normal — no una instalación rota.
 
-## Post-build: locate the binary and verify
+## Después del build: localiza el binario y verifica
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+Tras ejecutar `cargo build --workspace`, el binario `claw` queda compilado pero **no** se instala automáticamente en tu sistema. Aquí tienes dónde encontrarlo y cómo verificar que el build funcionó.
 
-### Binary location
+### Ubicación del binario
 
-After `cargo build --workspace` in `claw-code/rust/`:
+Después de `cargo build --workspace` en `claw-code/rust/`:
 
-**Debug build (default, faster compile):**
+**Build de debug (por defecto, compila más rápido):**
 - **macOS/Linux:** `rust/target/debug/claw`
 - **Windows:** `rust/target/debug/claw.exe`
 
-**Release build (optimized, slower compile):**
+**Build de release (optimizado, compila más lento):**
 - **macOS/Linux:** `rust/target/release/claw`
 - **Windows:** `rust/target/release/claw.exe`
 
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
+Si ejecutaste `cargo build` sin `--release`, el binario está en la carpeta `debug/`.
 
-### Verify the build succeeded
+### Verifica que el build funcionó
 
-Test the binary directly using its path:
+Prueba el binario directamente usando su ruta:
 
 ```bash
-# macOS/Linux (debug build)
+# macOS/Linux (build de debug)
 ./rust/target/debug/claw --help
 ./rust/target/debug/claw doctor
 
-# Windows PowerShell (debug build)
+# Windows PowerShell (build de debug)
 .\rust\target\debug\claw.exe --help
 .\rust\target\debug\claw.exe doctor
 ```
 
-PowerShell smoke commands that do not require live credentials:
+Comandos de smoke en PowerShell que no requieren credenciales reales:
 
 ```powershell
 $env:CLAW_CONFIG_HOME = Join-Path $env:TEMP "claw config home"
@@ -212,88 +218,88 @@ Remove-Item Env:\ANTHROPIC_API_KEY, Env:\ANTHROPIC_AUTH_TOKEN, Env:\OPENAI_API_K
 .\rust\target\debug\claw.exe doctor
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+Si estos comandos funcionan, el build está bien. `claw doctor` es tu primer chequeo de salud — valida tu API key, el acceso a modelos y la configuración de herramientas.
 
-### Optional: Add to PATH
+### Opcional: añadir al PATH
 
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
+Si quieres ejecutar `claw` desde cualquier directorio sin la ruta completa, elige una de estas opciones:
 
-**Option 1: Symlink (macOS/Linux)**
+**Opción 1: Symlink (macOS/Linux)**
 ```bash
 ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
 ```
-Then reload your shell and test:
+Después recarga la shell y prueba:
 ```bash
 claw --help
 ```
 
-**Option 2: Use `cargo install` (all platforms)**
+**Opción 2: Usa `cargo install` (todas las plataformas)**
 
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
+Compila e instala en la ubicación por defecto de Cargo (`~/.cargo/bin/`, que normalmente está en el PATH):
 ```bash
-# From the claw-code/rust/ directory
+# Desde el directorio claw-code/rust/
 cargo install --path . --force
 
-# Then from anywhere
+# Y luego, desde cualquier sitio
 claw --help
 ```
 
-**Option 3: Update shell profile (bash/zsh)**
+**Opción 3: Actualiza el perfil de la shell (bash/zsh)**
 
-Add this line to `~/.bashrc` or `~/.zshrc`:
+Añade esta línea a `~/.bashrc` o `~/.zshrc`:
 ```bash
 export PATH="$(pwd)/rust/target/debug:$PATH"
 ```
 
-Reload your shell:
+Recarga la shell:
 ```bash
-source ~/.bashrc  # or source ~/.zshrc
+source ~/.bashrc  # o source ~/.zshrc
 claw --help
 ```
 
-### Troubleshooting
+### Solución de problemas
 
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
+- **"command not found: claw"** — El binario está en `rust/target/debug/claw`, pero no está en tu PATH. Usa la ruta completa `./rust/target/debug/claw` o haz symlink/instálalo como arriba.
+- **"permission denied"** — En macOS/Linux puede que necesites `chmod +x rust/target/debug/claw` si el bit de ejecución no está activo (raro).
+- **Debug vs. release** — Si el binario va lento, estás en modo debug (el default). Añade `--release` a `cargo build` para mejor rendimiento en ejecución, aunque el build tardará 5–10 minutos.
 
 > [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
+> **Autenticación:** claw requiere una **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — el login con suscripción de Claude no es una ruta de autenticación soportada.
 
-Run the workspace test suite after verifying the binary works:
+Ejecuta la suite de tests del workspace después de verificar que el binario funciona:
 
 ```bash
 cd rust
 cargo test --workspace
 ```
 
-## Documentation map
+## Mapa de documentación
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
-- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
-- [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`docs/g004-events-reports-contract.md`](./docs/g004-events-reports-contract.md) — Stream 2 lane event/report contract guidance for consumers
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
-- [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md), and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) — contribution, vulnerability-reporting, support, and community policies
-- [`LICENSE`](./LICENSE) — MIT license for this repository
+- [`USAGE.md`](./USAGE.md) — comandos rápidos, autenticación, sesiones, configuración, harness de parity, multiagente y dashboard
+- [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — navegación en terminal, scrollback, contexto de archivos con `@ruta`, adjuntos y pautas de seguridad con secretos
+- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — setup de Ollama/llama.cpp/vLLM, posicionamiento multiproveedor de Claw y comprobaciones de instalación local de skills
+- [`docs/windows-install-release.md`](./docs/windows-install-release.md) — instalación PowerShell-first, artefactos de release, cambio de proveedor y rutas de smoke de notificaciones en Windows/WSL
+- [`rust/README.md`](./rust/README.md) — mapa de crates, superficie del CLI, features y layout del workspace
+- [`PARITY.md`](./PARITY.md) — estado de parity del port a Rust
+- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — detalles del harness determinista con servicio mock
+- [`ROADMAP.md`](./ROADMAP.md) — roadmap activo y trabajo de limpieza pendiente
+- [`docs/g004-events-reports-contract.md`](./docs/g004-events-reports-contract.md) — guía del contrato de eventos/reportes de lanes (Stream 2) para consumidores
+- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — por qué existe el proyecto y cómo se opera
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md) y [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) — políticas de contribución, reporte de vulnerabilidades, soporte y comunidad
+- [`LICENSE`](./LICENSE) — licencia MIT de este repositorio
 
-## Ecosystem
+## Ecosistema
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+Claw Code se construye en abierto junto al resto del toolchain de UltraWorkers:
 
 - [clawhip](https://github.com/Yeachan-Heo/clawhip)
 - [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
 - [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
 - [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
 - [gajae-code](https://github.com/Yeachan-Heo/gajae-code)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+- [Discord de UltraWorkers](https://discord.gg/5TUQKqFWd)
 
-## Ownership / affiliation disclaimer
+## Aviso de propiedad / afiliación
 
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+- Este repositorio **no** reclama la propiedad del material fuente original de Claude Code.
+- Este repositorio **no está afiliado a, respaldado por, ni mantenido por Anthropic**.
