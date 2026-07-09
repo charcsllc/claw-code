@@ -1,7 +1,7 @@
 # Claw Code
 
 <p align="center">
-  <a href="https://github.com/code-yeongyu/lazycodex">
+  <a href="https://github.com/charcsllc/claw-code">
     <img src="https://img.shields.io/badge/LazyCodex-codex%20for%20no--brainers-111111?style=for-the-badge&logo=github&logoColor=white" alt="LazyCodex banner" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/code-yeongyu/lazycodex">
+  <a href="https://github.com/charcsllc/claw-code">
     <img src="https://opengraph.githubassets.com/lazycodex-card/code-yeongyu/lazycodex" alt="LazyCodex GitHub card" width="280" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
@@ -21,13 +21,13 @@
 <h3 align="center">empieza con los harnesses cangrejiles de verdad</h3>
 
 <p align="center">
-  <a href="https://github.com/code-yeongyu/lazycodex"><b>github.com/code-yeongyu/lazycodex</b></a>
+  <a href="https://github.com/charcsllc/claw-code"><b>github.com/code-yeongyu/lazycodex</b></a>
   <br/>
   <a href="https://github.com/Yeachan-Heo/gajae-code"><b>github.com/Yeachan-Heo/gajae-code</b></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/code-yeongyu/lazycodex">
+  <a href="https://github.com/charcsllc/claw-code">
     <img src="https://img.shields.io/badge/Open-LazyCodex-111111?style=flat-square&logo=github&logoColor=white" alt="Abrir LazyCodex en GitHub" />
   </a>
   <a href="https://github.com/Yeachan-Heo/gajae-code">
@@ -57,7 +57,7 @@
 >
 > Como ya describe la filosofía del proyecto, esto no está pensado para operarse a mano como un repo de producto normal. Es una **exhibición gestionada por agentes**: los harnesses planifican, ejecutan, verifican, etiquetan y preservan el artefacto mientras los cangrejos mantienen el acuario en marcha.
 >
-> Si quieres trabajar de verdad, empieza con **[LazyCodex](https://github.com/code-yeongyu/lazycodex)** o **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. Si quieres inspeccionar el pequeño y extraño fósil del momento Claw Code, sigue leyendo.
+> Si quieres trabajar de verdad, empieza con **[LazyCodex](https://github.com/charcsllc/claw-code)** o **[Gajae-Code](https://github.com/Yeachan-Heo/gajae-code)**. Si quieres inspeccionar el pequeño y extraño fósil del momento Claw Code, sigue leyendo.
 >
 > Para la explicación pública más larga detrás de esta filosofía, mira [aquí](https://x.com/realsigridjin/status/2039472968624185713).
 
