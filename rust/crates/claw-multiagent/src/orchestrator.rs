@@ -126,23 +126,76 @@ Rules: tasks MUST follow the architects' designs exactly (files, interfaces, nam
 modules must be independent; two tasks in the same wave must NEVER touch the same
 file; assign complexity honestly (it selects the AI model per task)."#;
 
+/// Process-global Ctrl+C state. The handler can only be installed once per
+/// process (a second install fails), so it must be shared across every
+/// `/web`/`/app` invocation instead of re-installed per build — and it must
+/// do NOTHING outside a build, or it would hijack SIGINT for the whole REPL
+/// after the first build finishes.
+struct BuildSignal {
+    /// True only while a build is running.
+    active: AtomicBool,
+    /// Set by the first Ctrl+C during an active build.
+    aborted: AtomicBool,
+}
+
+static BUILD_SIGNAL: std::sync::OnceLock<Arc<BuildSignal>> = std::sync::OnceLock::new();
+
+/// Returns the shared signal, installing the one-time handler on first use.
+fn build_signal() -> &'static Arc<BuildSignal> {
+    BUILD_SIGNAL.get_or_init(|| {
+        let signal = Arc::new(BuildSignal {
+            active: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+        });
+        let handler_signal = Arc::clone(&signal);
+        let _ = ctrlc::set_handler(move || {
+            // Outside a build, stay out of the way — the REPL and rustyline
+            // own SIGINT then.
+            if !handler_signal.active.load(Ordering::Relaxed) {
+                return;
+            }
+            // Second Ctrl+C force-quits; the first finishes the current wave,
+            // persists state and skips the remaining phases.
+            if handler_signal.aborted.swap(true, Ordering::Relaxed) {
+                std::process::exit(130);
+            }
+            eprintln!(
+                "\n[multiagent] Ctrl+C: se termina la ola en curso y se guarda el estado \
+                 (reanuda con --resume). Ctrl+C de nuevo para forzar la salida."
+            );
+        });
+        signal
+    })
+}
+
+/// Marks a build active for its lifetime and clears the flag on drop, so a
+/// panic or early return never leaves a stale handler armed for the REPL.
+struct BuildGuard(&'static Arc<BuildSignal>);
+
+impl BuildGuard {
+    fn new() -> Self {
+        let signal = build_signal();
+        signal.aborted.store(false, Ordering::Relaxed);
+        signal.active.store(true, Ordering::Relaxed);
+        Self(signal)
+    }
+
+    fn aborted(&self) -> bool {
+        self.0.aborted.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        self.0.active.store(false, Ordering::Relaxed);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     options.catalog.validate_credentials()?;
 
-    let aborted = Arc::new(AtomicBool::new(false));
-    let aborted_clone = Arc::clone(&aborted);
-    let _ = ctrlc::set_handler(move || {
-        // Second Ctrl+C force-quits; the first one finishes the current
-        // wave, persists state and skips the remaining phases.
-        if aborted_clone.swap(true, Ordering::Relaxed) {
-            std::process::exit(130);
-        }
-        eprintln!(
-            "\n[multiagent] Ctrl+C: se termina la ola en curso y se guarda el estado \
-             (reanuda con --resume). Ctrl+C de nuevo para forzar la salida."
-        );
-    });
+    let abort_guard = BuildGuard::new();
 
     let workflow = WorkflowLog::new();
     workflow.event(
@@ -469,7 +522,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let mut sups: Vec<SupSlot> = Vec::new();
 
     'scheduler: loop {
-        if aborted.load(Ordering::Relaxed) {
+        if abort_guard.aborted() {
             workflow.phase("Construcción abortada por usuario (Ctrl+C)");
             save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
             user_aborted = true;

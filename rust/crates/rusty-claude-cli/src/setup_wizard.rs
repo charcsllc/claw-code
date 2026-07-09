@@ -121,8 +121,15 @@ fn prompt_api_key(
     let current_key = current.api_key();
     let hint = match current_key {
         Some(key) if !key.is_empty() => {
-            let masked = if key.len() > 4 {
-                format!("****{}", &key[key.len() - 4..])
+            // Char-based, not byte-based: a multibyte key (e.g. one with a
+            // `€`) would panic on a mid-codepoint byte slice.
+            let last4: String = {
+                let chars: Vec<char> = key.chars().collect();
+                let start = chars.len().saturating_sub(4);
+                chars[start..].iter().collect()
+            };
+            let masked = if key.chars().count() > 4 {
+                format!("****{last4}")
             } else {
                 "****".to_string()
             };

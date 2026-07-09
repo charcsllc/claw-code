@@ -7,6 +7,33 @@ use std::time::Duration;
 
 use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
 
+/// Restores the REPL's working directory and `CLAWD_AGENT_STORE` when
+/// dropped, so a build that errors, `?`s, or panics after mutating them
+/// never strands the interactive session in the generated project.
+struct ReplEnvGuard {
+    cwd: PathBuf,
+    store: Option<std::ffi::OsString>,
+}
+
+impl ReplEnvGuard {
+    fn capture(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            store: std::env::var_os("CLAWD_AGENT_STORE"),
+        }
+    }
+}
+
+impl Drop for ReplEnvGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        match &self.store {
+            Some(store) => std::env::set_var("CLAWD_AGENT_STORE", store),
+            None => std::env::remove_var("CLAWD_AGENT_STORE"),
+        }
+    }
+}
+
 const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N] \
 [--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold]\n\
                             /app <prompt> [same options]\n\
@@ -84,7 +111,6 @@ pub(crate) fn run_multiagent_build(
     }
 
     let original_cwd = std::env::current_dir()?;
-    let original_store = std::env::var_os("CLAWD_AGENT_STORE");
     std::fs::create_dir_all(&output)?;
     let project_dir = output.canonicalize()?;
     let catalog = ModelCatalog::load(&original_cwd);
@@ -98,6 +124,12 @@ pub(crate) fn run_multiagent_build(
         catalog.medium,
         catalog.complex
     );
+
+    // The build mutates process cwd + CLAWD_AGENT_STORE; this guard restores
+    // both when it drops — on the happy path, on `?`, AND on a panic inside
+    // run(). Without it, an error after set_current_dir left the REPL in the
+    // generated project's directory.
+    let _env_guard = ReplEnvGuard::capture(original_cwd);
 
     let result = run(&RunOptions {
         kind,
@@ -113,13 +145,6 @@ pub(crate) fn run_multiagent_build(
         scaffold,
         approve,
     });
-
-    // Restore REPL environment regardless of the outcome.
-    std::env::set_current_dir(&original_cwd)?;
-    match original_store {
-        Some(store) => std::env::set_var("CLAWD_AGENT_STORE", store),
-        None => std::env::remove_var("CLAWD_AGENT_STORE"),
-    }
 
     match result {
         Ok(summary) => {

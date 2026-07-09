@@ -180,9 +180,14 @@ impl LineEditor {
     }
 
     fn read_line_fallback(&self) -> io::Result<ReadOutcome> {
-        let mut stdout = io::stdout();
-        write!(stdout, "{}", self.prompt)?;
-        stdout.flush()?;
+        // This path is taken precisely when stdout/stdin is not a terminal
+        // (piped). Writing the prompt then would splice "> " into the
+        // program's redirected output, so only show it on a real terminal.
+        if io::IsTerminal::is_terminal(&io::stdout()) {
+            let mut stdout = io::stdout();
+            write!(stdout, "{}", self.prompt)?;
+            stdout.flush()?;
+        }
 
         let mut buffer = String::new();
         let bytes_read = io::stdin().read_line(&mut buffer)?;

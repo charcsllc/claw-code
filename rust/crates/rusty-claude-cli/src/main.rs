@@ -7064,6 +7064,12 @@ fn run_repl(
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    // Seed Up-arrow / Ctrl-R with the session's persisted prompt history:
+    // /history could already show these entries, but the editor never
+    // recalled them across restarts or --resume.
+    for entry in &cli.runtime.session().prompt_history {
+        editor.push_history(entry.text.clone());
+    }
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
@@ -7075,14 +7081,26 @@ fn run_repl(
                 if trimmed.is_empty() {
                     continue;
                 }
+                // Everything typed is recallable with Up/Ctrl-R — including
+                // slash commands and lines that later fail to parse.
+                editor.push_history(input);
                 if matches!(trimmed.as_str(), "/exit" | "/quit") {
                     cli.persist_session()?;
                     break;
                 }
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        // A failed command (bad flag, missing session, IO
+                        // error) returns to the prompt; it must never
+                        // terminate the whole session.
+                        match cli.handle_repl_command(command) {
+                            Ok(true) => {
+                                if let Err(error) = cli.persist_session() {
+                                    eprintln!("warning: could not persist session: {error}");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => eprintln!("{error}"),
                         }
                         continue;
                     }
@@ -7096,15 +7114,14 @@ fn run_repl(
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
                 let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
-                }
-                editor.push_history(input);
+                let prompt = try_resolve_bare_skill_prompt(&cwd, &trimmed)
+                    .unwrap_or_else(|| trimmed.clone());
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                // A failed turn (network blip, 429, expired key) also returns
+                // to the prompt instead of exiting the REPL.
+                if let Err(error) = cli.run_turn(&prompt) {
+                    eprintln!("{error}");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -7785,14 +7802,17 @@ impl LiveCli {
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
                 let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
+                let theme = *TerminalRenderer::new().color_theme();
+                if final_text.is_empty() {
+                    // Tool-only turn: the spinner line is untouched, clear it.
+                    spinner.finish("✨ Done", &theme, &mut stdout)?;
+                } else {
+                    // The response was already rendered by the streaming path;
+                    // do NOT print it again as raw markdown. Terminate its
+                    // last line and place the marker below, without erasing it.
+                    let _ = writeln!(stdout);
+                    spinner.finish_below("✨ Done", &theme, &mut stdout)?;
                 }
                 println!();
                 if let Some(event) = summary.auto_compaction {
@@ -8294,6 +8314,15 @@ impl LiveCli {
     }
 
     fn print_status(&self) {
+        // status_context reads the cwd; if it was deleted out from under the
+        // REPL, report it instead of panicking (which would abort the CLI).
+        let context = match status_context(Some(&self.session.path)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("could not load status: {error}");
+                return;
+            }
+        };
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
         println!(
@@ -8308,7 +8337,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
+                &context,
                 None, // #148: REPL /status doesn't carry flag provenance
                 None,
             )
@@ -8366,7 +8395,13 @@ impl LiveCli {
     }
 
     fn print_sandbox_status() {
-        let cwd = env::current_dir().expect("current dir");
+        let cwd = match env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                eprintln!("could not read the current directory: {error}");
+                return;
+            }
+        };
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader
             .load()
@@ -19048,7 +19083,8 @@ UU conflicted.rs",
 
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("Heading"));
-        assert!(rendered.contains('\u{1b}'));
+        // The sink is not a TTY, so rendering is correctly plain (no ANSI).
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]
