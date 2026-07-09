@@ -678,6 +678,47 @@ cd rust
 cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ```
 
+## Autonomous multi-agent builds (WEB / APP)
+
+`claw-multiagent` turns one prompt into a complete project through a
+hierarchy of specialized agents — Director General (plan, scope, stack),
+Subdirector Técnico (fully specified TaskSpecs with per-task model tier),
+Architects in parallel (software, frontend, backend, DevOps, UX/UI),
+Developer agents in parallel waves over disjoint modules, a Supervisor that
+reviews every delivery into `docs/SUPERVISION.md` and dispatches a Fixer on
+a superior model, then QA and Documentation agents:
+
+Inside an interactive claw session, just type:
+
+```
+/web un ecommerce para vender productos electrónicos --dry-run
+/app app de notas offline para Android [--parallel N] [--output <dir>]
+```
+
+Or use the standalone binary:
+
+```bash
+# Plan only (Director + Subdirector, no code written)
+claw-multiagent web "un ecommerce para vender productos electrónicos" --dry-run
+
+# Full autonomous build, 4 developers in parallel per wave
+claw-multiagent web "un ecommerce para vender productos electrónicos" \
+  --output ./mi-tienda --parallel 4
+
+# Apps: desktop/mobile (Electron/Tauri/Flutter/React Native/MAUI/Kotlin/Swift)
+claw-multiagent app "app de notas offline para Android y escritorio"
+```
+
+Model tiers map task complexity to any provider with credentials configured
+(Anthropic, OpenAI, xAI, DashScope, Ollama) — override per run
+(`--simple-model qwen-turbo --complex-model gpt-4o`) or persistently in
+`.claw/multiagent.json`. The run fails fast listing any missing credential.
+The Director leaves per-model instruction files (`CLAUDE.md`, `AGENTS.md`,
+`GROK.md`) in the project describing each role. Set `CLAW_DASHBOARD_EVENTS`
+(or run under `claw --dashboard`) to watch every agent live, and
+`CLAW_MULTIAGENT_REINDEX_CMD` to reindex codebase-memory after each
+supervised delivery.
+
 ## Live token & agent dashboard
 
 `claw-dashboard` serves a local web UI showing live input/output/cache token
@@ -729,6 +770,7 @@ Current Rust crates:
 - `api`
 - `claw-analog`
 - `claw-dashboard`
+- `claw-multiagent`
 - `claw-rag-service`
 - `commands`
 - `compat-harness`

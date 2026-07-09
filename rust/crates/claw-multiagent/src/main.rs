@@ -1,0 +1,141 @@
+//! CLI: `claw-multiagent web|app "<prompt>"` builds a complete project
+//! autonomously through the specialized agent hierarchy.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+
+use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "claw-multiagent",
+    about = "Autonomous multi-agent platform: builds WEB and APP projects from one prompt"
+)]
+struct Args {
+    #[command(subcommand)]
+    aplicativo: Aplicativo,
+}
+
+#[derive(Debug, Subcommand)]
+enum Aplicativo {
+    /// Build a website (landing, ecommerce, SaaS, CRM, dashboard, ...).
+    Web(CommonArgs),
+    /// Build an application (Windows/Linux/macOS/Android/iOS/tablets).
+    App(CommonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct CommonArgs {
+    /// What to build, e.g. "un ecommerce para vender productos electrónicos".
+    prompt: String,
+
+    /// Directory where the project is generated (created if missing).
+    #[arg(long, default_value = "./multiagent-project")]
+    output: PathBuf,
+
+    /// Max developer agents running in parallel inside a wave.
+    #[arg(long, default_value_t = 4)]
+    parallel: usize,
+
+    /// Plan only: run Director + Subdirector, print the plan, stop.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Per-agent timeout in seconds.
+    #[arg(long, default_value_t = 1800)]
+    agent_timeout_secs: u64,
+
+    /// Model for simple tasks (overrides .claw/multiagent.json).
+    #[arg(long)]
+    simple_model: Option<String>,
+    /// Model for medium tasks.
+    #[arg(long)]
+    medium_model: Option<String>,
+    /// Model for complex tasks.
+    #[arg(long)]
+    complex_model: Option<String>,
+    /// Model for Director/Subdirector/Architects.
+    #[arg(long)]
+    director_model: Option<String>,
+    /// Model for Supervisor/Fixer (the spec demands a superior model).
+    #[arg(long)]
+    supervisor_model: Option<String>,
+}
+
+fn main() {
+    let args = Args::parse();
+    let (kind, common) = match args.aplicativo {
+        Aplicativo::Web(common) => (ProjectKind::Web, common),
+        Aplicativo::App(common) => (ProjectKind::App, common),
+    };
+
+    if let Err(error) = execute(kind, common) {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
+    std::fs::create_dir_all(&common.output).map_err(|error| error.to_string())?;
+    let project_dir = common
+        .output
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let mut catalog = ModelCatalog::load(&cwd);
+    if let Some(model) = common.simple_model {
+        catalog.simple = model;
+    }
+    if let Some(model) = common.medium_model {
+        catalog.medium = model;
+    }
+    if let Some(model) = common.complex_model {
+        catalog.complex = model;
+    }
+    if let Some(model) = common.director_model {
+        catalog.director = model;
+    }
+    if let Some(model) = common.supervisor_model {
+        catalog.supervisor = model;
+    }
+
+    println!("[multiagent] aplicativo: {}", kind.as_str());
+    println!("[multiagent] proyecto:   {}", project_dir.display());
+    println!(
+        "[multiagent] modelos:    simple={} medium={} complex={} director={} supervisor={}",
+        catalog.simple, catalog.medium, catalog.complex, catalog.director, catalog.supervisor
+    );
+    if std::env::var("CLAW_DASHBOARD_EVENTS").is_err() {
+        println!(
+            "[multiagent] tip: exporta CLAW_DASHBOARD_EVENTS y abre claw-dashboard \
+             para ver los agentes en vivo"
+        );
+    }
+
+    let summary = run(&RunOptions {
+        kind,
+        prompt: common.prompt,
+        project_dir,
+        catalog,
+        parallel: common.parallel,
+        dry_run: common.dry_run,
+        agent_timeout: Duration::from_secs(common.agent_timeout_secs),
+    })?;
+
+    println!("\n[multiagent] === resumen ===");
+    println!("  visión:        {}", summary.plan.vision);
+    println!("  stack:         {}", summary.plan.stack.kind);
+    println!("  tareas:        {}", summary.tasks);
+    println!("  olas:          {}", summary.waves);
+    if common.dry_run {
+        println!("  (dry-run: planificación completada, ejecución omitida)");
+    } else {
+        println!("  completadas:   {}", summary.completed);
+        println!("  fallidas:      {}", summary.failed);
+        println!("  issues de supervisión: {}", summary.supervision_issues);
+    }
+    Ok(())
+}

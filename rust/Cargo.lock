@@ -493,6 +493,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-multiagent"
+version = "0.1.3"
+dependencies = [
+ "api",
+ "clap",
+ "serde",
+ "serde_json",
+ "tools",
+]
+
+[[package]]
 name = "claw-rag-service"
 version = "0.1.3"
 dependencies = [
@@ -2256,6 +2267,7 @@ name = "rusty-claude-cli"
 version = "0.1.3"
 dependencies = [
  "api",
+ "claw-multiagent",
  "commands",
  "crossterm",
  "log",

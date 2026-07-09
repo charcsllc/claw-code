@@ -17,6 +17,7 @@
 mod dashboard;
 mod init;
 mod input;
+mod multiagent_build;
 mod render;
 mod setup_wizard;
 
@@ -6889,6 +6890,8 @@ fn run_resume_command(
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
+        | SlashCommand::Web { .. }
+        | SlashCommand::App { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -8122,6 +8125,20 @@ impl LiveCli {
             }
             SlashCommand::Sandbox => {
                 Self::print_sandbox_status();
+                false
+            }
+            SlashCommand::Web { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::Web,
+                    prompt.as_deref(),
+                )?;
+                false
+            }
+            SlashCommand::App { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::App,
+                    prompt.as_deref(),
+                )?;
                 false
             }
             SlashCommand::Compact => {

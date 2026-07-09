@@ -245,6 +245,20 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "web",
+        aliases: &[],
+        summary: "Build a complete website autonomously (multi-agent platform)",
+        argument_hint: Some("<prompt> [--dry-run] [--parallel N] [--output <dir>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
+        name: "app",
+        aliases: &[],
+        summary: "Build a desktop/mobile app autonomously (multi-agent platform)",
+        argument_hint: Some("<prompt> [--dry-run] [--parallel N] [--output <dir>]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1105,6 +1119,14 @@ pub enum SlashCommand {
     Agents {
         args: Option<String>,
     },
+    /// Autonomous multi-agent WEB build from a prompt.
+    Web {
+        prompt: Option<String>,
+    },
+    /// Autonomous multi-agent APP build from a prompt.
+    App {
+        prompt: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1294,6 +1316,8 @@ impl SlashCommand {
             Self::Sandbox => "/sandbox",
             Self::Mcp { .. } => "/mcp",
             Self::Export { .. } => "/export",
+            Self::Web { .. } => "/web",
+            Self::App { .. } => "/app",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1394,6 +1418,8 @@ pub fn validate_slash_command_input(
         "agents" => SlashCommand::Agents {
             args: parse_list_or_help_args(command, remainder)?,
         },
+        "web" => SlashCommand::Web { prompt: remainder },
+        "app" => SlashCommand::App { prompt: remainder },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -5788,6 +5814,8 @@ pub fn handle_slash_command(
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall
         | SlashCommand::Sandbox
+        | SlashCommand::Web { .. }
+        | SlashCommand::App { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
@@ -6155,6 +6183,22 @@ mod tests {
         assert_eq!(
             SlashCommand::parse("/sandbox"),
             Ok(Some(SlashCommand::Sandbox))
+        );
+        assert_eq!(
+            SlashCommand::parse("/web un ecommerce de electrónica --dry-run"),
+            Ok(Some(SlashCommand::Web {
+                prompt: Some("un ecommerce de electrónica --dry-run".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/app notas offline"),
+            Ok(Some(SlashCommand::App {
+                prompt: Some("notas offline".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/web"),
+            Ok(Some(SlashCommand::Web { prompt: None }))
         );
         assert_eq!(
             SlashCommand::parse("/bughunter runtime"),
@@ -6637,7 +6681,7 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 140);
+        assert_eq!(slash_command_specs().len(), 142);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
