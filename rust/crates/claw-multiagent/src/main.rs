@@ -251,6 +251,9 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
         if summary.budget_aborted {
             println!("  ⚠ abortado por presupuesto (--max-cost-usd)");
         }
+        if summary.user_aborted {
+            println!("  ⚠ abortado por usuario (Ctrl+C) — reanuda con --resume");
+        }
     }
     Ok(())
 }

@@ -89,6 +89,7 @@ pub struct RunSummary {
     pub supervision_issues: usize,
     pub resumed_tasks: usize,
     pub budget_aborted: bool,
+    pub user_aborted: bool,
 }
 
 const DIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
@@ -124,7 +125,15 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let aborted = Arc::new(AtomicBool::new(false));
     let aborted_clone = Arc::clone(&aborted);
     let _ = ctrlc::set_handler(move || {
-        aborted_clone.store(true, Ordering::Relaxed);
+        // Second Ctrl+C force-quits; the first one finishes the current
+        // wave, persists state and skips the remaining phases.
+        if aborted_clone.swap(true, Ordering::Relaxed) {
+            std::process::exit(130);
+        }
+        eprintln!(
+            "\n[multiagent] Ctrl+C: se termina la ola en curso y se guarda el estado \
+             (reanuda con --resume). Ctrl+C de nuevo para forzar la salida."
+        );
     });
 
     let workflow = WorkflowLog::new();
@@ -173,6 +182,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             &director_report,
             "Director",
             Role::Director,
+            DIRECTOR_JSON_SCHEMA,
             options,
             &workflow,
         )?;
@@ -244,51 +254,46 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
 
         // Phase 3: Subdirector turns plan + designs into the backlog.
         workflow.phase("Subdirector Técnico: creando el backlog desde los diseños");
+        let subdirector_prompt = format!(
+            "Approved plan:\n```json\n{plan_json}\n```{decisions}\n\nArchitect \
+             designs (authoritative):{designs_digest}\n\nBreak the project into \
+             fully specified, parallelizable TaskSpecs that implement these \
+             designs.\n{SUBDIRECTOR_JSON_SCHEMA}"
+        );
         let subdirector_report = run_single(
             Role::Subdirector,
             &options.catalog.director,
             options,
-            &format!(
-                "Approved plan:\n```json\n{plan_json}\n```{decisions}\n\nArchitect \
-                 designs (authoritative):{designs_digest}\n\nBreak the project into \
-                 fully specified, parallelizable TaskSpecs that implement these \
-                 designs.\n{SUBDIRECTOR_JSON_SCHEMA}"
-            ),
+            &subdirector_prompt,
         )?;
-        let mut tasks_value = extract_json(&subdirector_report.report)
-            .ok_or("Subdirector produced no JSON backlog")?;
-        let mut tasks: Result<Vec<TaskSpec>, serde_json::Error> = serde_json::from_value(
-            tasks_value
-                .get("tasks")
-                .cloned()
-                .unwrap_or_else(|| tasks_value.clone()),
-        );
-        if tasks.is_err() {
-            workflow
-                .phase("  Subdirector: JSON validation falló, reintentando con retroalimentación");
-            let parse_error = tasks.as_ref().err().unwrap().to_string();
+        let mut tasks = parse_backlog(&subdirector_report.report).and_then(|tasks| {
+            validate_backlog(&tasks)?;
+            Ok(tasks)
+        });
+        if let Err(problems) = &tasks {
+            // One repair round. Agents are stateless: the retry prompt must
+            // carry the full original context plus the faulty output.
+            workflow.phase(&format!(
+                "  Subdirector: backlog rechazado, reintentando con retroalimentación\n{problems}"
+            ));
             let retry_report = run_single(
                 Role::Subdirector,
                 &options.catalog.director,
                 options,
                 &format!(
-                    "Your previous response failed validation:\n\n{}\n\n\
-                     Please correct it and produce valid JSON again, ensuring \
-                     the structure is `{{\"tasks\": [...]}}` with each task \
-                     fully specified.",
-                    parse_error
+                    "{subdirector_prompt}\n\n---\nA previous attempt at this backlog \
+                     was rejected. Previous output (truncated):\n```\n{}\n```\n\n\
+                     Problems found:\n{problems}\n\nProduce a corrected backlog that \
+                     fixes every problem while still following the designs.",
+                    truncate_chars(&subdirector_report.report, 6_000)
                 ),
             )?;
-            tasks_value = extract_json(&retry_report.report)
-                .ok_or("Subdirector retry produced no JSON backlog")?;
-            tasks =
-                serde_json::from_value(tasks_value.get("tasks").cloned().unwrap_or(tasks_value));
+            tasks = parse_backlog(&retry_report.report).and_then(|tasks| {
+                validate_backlog(&tasks)?;
+                Ok(tasks)
+            });
         }
         let tasks = tasks.map_err(|error| format!("Subdirector backlog invalid: {error}"))?;
-        if tasks.is_empty() {
-            return Err("Subdirector produced an empty backlog".to_string());
-        }
-        validate_backlog_against_designs(&tasks)?;
         save_doc(
             &docs,
             "backlog.json",
@@ -316,6 +321,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             supervision_issues: 0,
             resumed_tasks: 0,
             budget_aborted: false,
+            user_aborted: false,
         });
     }
 
@@ -338,6 +344,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let mut failed = 0_usize;
     let mut supervision_issues = 0_usize;
     let mut budget_aborted = false;
+    let mut user_aborted = false;
     // Inter-wave context: what earlier waves already built.
     let mut built_context: Vec<String> = tasks
         .iter()
@@ -349,6 +356,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         if aborted.load(Ordering::Relaxed) {
             workflow.phase("Construcción abortada por usuario (Ctrl+C)");
             save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
+            user_aborted = true;
             break 'waves;
         }
         if let Some(spent) = budget.exceeded() {
@@ -376,6 +384,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         let wave_context = render_wave_context(&built_context);
 
         for chunk in pending.chunks(options.parallel.max(1)) {
+            if aborted.load(Ordering::Relaxed) {
+                workflow.phase("Construcción abortada por usuario (Ctrl+C)");
+                save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
+                user_aborted = true;
+                break 'waves;
+            }
             let mut handles = Vec::new();
             for &task_index in chunk {
                 let task = &tasks[task_index];
@@ -452,7 +466,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         run_build_gate(options, &workflow, &supervision_md, wave_index + 1)?;
     }
 
-    if !budget_aborted {
+    if !budget_aborted && !user_aborted {
         // ---- QA ----
         workflow.phase("Agente QA: generando y ejecutando pruebas");
         let qa = run_single(
@@ -478,8 +492,10 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                     test_error
                 ));
 
-                // Dispatch Fixer to repair test failures.
-                let fixer_report = run_single(
+                // Dispatch Fixer to repair test failures. The build is already
+                // done at this point, so a Fixer failure degrades to a warning
+                // instead of erroring out the whole run.
+                match run_single(
                     Role::Fixer,
                     &options.catalog.supervisor,
                     options,
@@ -487,25 +503,39 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                         "The generated tests are failing:\n\n```\n{}\n```\n\n\
                          Analyze the failures, fix the source code or tests to make them pass, \
                          and report what you changed.",
-                        test_error
+                        truncate_chars(&test_error, 12_000)
                     ),
-                )?;
-                save_doc(&docs, "fixer-qa-report.md", &fixer_report.report)?;
-                let _ = git_commit(&options.project_dir, "fix: repair test failures (Fixer)");
-
-                // Retry tests after fixes.
-                workflow.phase("Reintentando tests después de fixes del Fixer");
-                match run_tests_for_qa(&options.project_dir, &options.build_command) {
-                    Ok(test_output) => {
-                        workflow.event("qa_tests_fixed", &[("output", test_output)]);
+                ) {
+                    Ok(fixer_report) => {
+                        save_doc(&docs, "fixer-qa-report.md", &fixer_report.report)?;
                         let _ =
-                            git_commit(&options.project_dir, "qa: all tests passed (after fixes)");
+                            git_commit(&options.project_dir, "fix: repair test failures (Fixer)");
+
+                        // Retry tests after fixes.
+                        workflow.phase("Reintentando tests después de fixes del Fixer");
+                        match run_tests_for_qa(&options.project_dir, &options.build_command) {
+                            Ok(test_output) => {
+                                workflow.event("qa_tests_fixed", &[("output", test_output)]);
+                                let _ = git_commit(
+                                    &options.project_dir,
+                                    "qa: all tests passed (after fixes)",
+                                );
+                            }
+                            Err(retry_error) => {
+                                workflow.event(
+                                    "qa_tests_still_failing",
+                                    &[("error", retry_error.clone())],
+                                );
+                                workflow.phase(&format!(
+                                    "✗ Tests aún fallan después de fixes:\n{}",
+                                    retry_error
+                                ));
+                            }
+                        }
                     }
-                    Err(retry_error) => {
-                        workflow.event("qa_tests_still_failing", &[("error", retry_error.clone())]);
+                    Err(fixer_error) => {
                         workflow.phase(&format!(
-                            "✗ Tests aún fallan después de fixes:\n{}",
-                            retry_error
+                            "⚠ Fixer no disponible ({fixer_error}); los tests quedan fallando"
                         ));
                     }
                 }
@@ -532,6 +562,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             ("tasks", tasks.len().to_string()),
             ("completed", completed.to_string()),
             ("failed", failed.to_string()),
+            ("user_aborted", user_aborted.to_string()),
         ],
     );
     Ok(RunSummary {
@@ -543,6 +574,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         supervision_issues,
         resumed_tasks,
         budget_aborted,
+        user_aborted,
     })
 }
 
@@ -1057,11 +1089,19 @@ fn git_commit(project_dir: &Path, message: &str) -> Result<(), String> {
     if !status.success() {
         return Ok(());
     }
+    // Explicit identity: without it, commits fail silently on machines
+    // where git user.name/user.email were never configured.
     let _status = std::process::Command::new("git")
-        .arg("commit")
-        .arg("-m")
-        .arg(message)
-        .arg("--quiet")
+        .args([
+            "-c",
+            "user.name=Claw Multiagent",
+            "-c",
+            "user.email=multiagent@claw.local",
+            "commit",
+            "-m",
+            message,
+            "--quiet",
+        ])
         .current_dir(project_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1070,22 +1110,24 @@ fn git_commit(project_dir: &Path, message: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parses the agent's report into `T`; on validation failure, re-runs the
+/// role once with a prompt that carries the full original context, the
+/// faulty output and the exact error (agents are stateless — a bare "fix
+/// your previous response" would reach an agent that never saw it).
 fn retry_parse_json_with_feedback<T: serde::de::DeserializeOwned>(
     result: &AgentResult,
     who: &str,
     role: Role,
+    schema: &str,
     options: &RunOptions,
     workflow: &WorkflowLog,
 ) -> Result<T, String> {
     let value = extract_json(&result.report)
         .ok_or_else(|| format!("{who} produced no JSON (status {})", result.status))?;
-    if let Ok(parsed) = serde_json::from_value::<T>(value.clone()) {
-        return Ok(parsed);
-    }
-    let parse_error = serde_json::from_value::<T>(value)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    let parse_error = match serde_json::from_value::<T>(value) {
+        Ok(parsed) => return Ok(parsed),
+        Err(error) => error.to_string(),
+    };
     workflow.phase(&format!(
         "  {who}: JSON validation falló, reintentando con retroalimentación"
     ));
@@ -1094,9 +1136,11 @@ fn retry_parse_json_with_feedback<T: serde::de::DeserializeOwned>(
         &options.catalog.director,
         options,
         &format!(
-            "Your previous response failed validation:\n\n{}\n\n\
-             Please correct it and produce valid JSON again.",
-            parse_error
+            "User prompt:\n{}\n\nA previous attempt produced this response \
+             (truncated):\n```\n{}\n```\n\nIts JSON failed validation with:\n\
+             {parse_error}\n\nProduce the corrected, complete response.\n{schema}",
+            options.prompt,
+            truncate_chars(&result.report, 6_000)
         ),
     )?;
     let value = extract_json(&retry_report.report)
@@ -1105,8 +1149,20 @@ fn retry_parse_json_with_feedback<T: serde::de::DeserializeOwned>(
         .map_err(|error| format!("{who} retry JSON still invalid: {error}"))
 }
 
-fn validate_backlog_against_designs(tasks: &[TaskSpec]) -> Result<(), String> {
+/// Extracts the `{"tasks": [...]}` backlog from the Subdirector's report.
+fn parse_backlog(report: &str) -> Result<Vec<TaskSpec>, String> {
+    let value = extract_json(report).ok_or("no JSON backlog in the response")?;
+    let tasks_value = value.get("tasks").cloned().unwrap_or(value);
+    serde_json::from_value(tasks_value)
+        .map_err(|error| format!("backlog JSON did not validate: {error}"))
+}
+
+/// Structural sanity checks on the backlog before spending developer runs.
+fn validate_backlog(tasks: &[TaskSpec]) -> Result<(), String> {
     let mut issues = Vec::new();
+    if tasks.is_empty() {
+        issues.push("the backlog is empty".to_string());
+    }
     for task in tasks {
         if task.files_to_create.is_empty() && task.files_to_modify.is_empty() {
             issues.push(format!(
@@ -1132,29 +1188,33 @@ fn validate_backlog_against_designs(tasks: &[TaskSpec]) -> Result<(), String> {
 }
 
 fn run_tests_for_qa(project_dir: &Path, build_cmd: &Option<String>) -> Result<String, String> {
-    let test_cmd = if let Some(cmd) = build_cmd {
-        if cmd == "off" {
-            return Ok("tests skipped (disabled)".to_string());
+    let test_cmd = match build_cmd.as_deref() {
+        Some("off") => return Ok("tests skipped (disabled)".to_string()),
+        Some(cmd) if cmd.contains("npm") => "npm test".to_string(),
+        Some(cmd) if cmd.contains("cargo") => "cargo test".to_string(),
+        // Unknown custom build command: don't guess a test runner — a wrong
+        // guess reads as a test failure and wastes a Fixer run.
+        Some(cmd) => return Ok(format!("tests skipped (no known test runner for '{cmd}')")),
+        None => {
+            if project_dir.join("Cargo.toml").exists() {
+                "cargo test".to_string()
+            } else if project_dir.join("package.json").exists() {
+                "npm test".to_string()
+            } else {
+                return Ok("no test command detected".to_string());
+            }
         }
-        if cmd.contains("npm") {
-            "npm test".to_string()
-        } else if cmd.contains("cargo") {
-            "cargo test".to_string()
-        } else {
-            format!("{} test", cmd)
-        }
+    };
+    // Same bound as the build gate: a hung test run (e.g. a watch-mode
+    // default) must not stall the pipeline forever.
+    let wrapped = if cfg!(windows) {
+        test_cmd.clone()
     } else {
-        if project_dir.join("Cargo.toml").exists() {
-            "cargo test".to_string()
-        } else if project_dir.join("package.json").exists() {
-            "npm test".to_string()
-        } else {
-            return Ok("no test command detected".to_string());
-        }
+        format!("timeout 900 sh -c {}", shell_quote(&test_cmd))
     };
     let output = std::process::Command::new("sh")
         .arg("-c")
-        .arg(&test_cmd)
+        .arg(&wrapped)
         .current_dir(project_dir)
         .output()
         .map_err(|error| format!("test execution failed: {error}"))?;
@@ -1164,7 +1224,7 @@ fn run_tests_for_qa(project_dir: &Path, build_cmd: &Option<String>) -> Result<St
         Ok(format!("✓ tests passed\n{}", stdout))
     } else {
         Err(format!(
-            "✗ tests failed:\nstdout:\n{}\nstderr:\n{}",
+            "✗ tests failed ({test_cmd}):\nstdout:\n{}\nstderr:\n{}",
             stdout, stderr
         ))
     }
@@ -1306,6 +1366,73 @@ mod tests {
             Some("make check".to_string())
         );
         assert_eq!(detect_build_command(&dir, Some("off")), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parse_backlog_accepts_wrapped_and_bare_task_arrays() {
+        let wrapped = r#"Backlog: {"tasks": [{"id": "T1", "module": "auth",
+            "functional_objective": "login", "files_to_create": ["src/a.ts"]}]}"#;
+        let tasks = parse_backlog(wrapped).expect("wrapped backlog");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "T1");
+        assert!(parse_backlog("no json at all").is_err());
+    }
+
+    #[test]
+    fn validate_backlog_flags_empty_orphan_and_oversized_tasks() {
+        assert!(validate_backlog(&[]).unwrap_err().contains("empty"));
+
+        let orphan = TaskSpec {
+            id: "T1".to_string(),
+            functional_objective: "x".to_string(),
+            ..TaskSpec::default()
+        };
+        assert!(validate_backlog(std::slice::from_ref(&orphan))
+            .unwrap_err()
+            .contains("orphan"));
+
+        let oversized = TaskSpec {
+            id: "T2".to_string(),
+            functional_objective: "x".to_string(),
+            files_to_create: (0..31).map(|i| format!("src/f{i}.ts")).collect(),
+            ..TaskSpec::default()
+        };
+        assert!(validate_backlog(std::slice::from_ref(&oversized))
+            .unwrap_err()
+            .contains("too many files"));
+
+        let ok = TaskSpec {
+            id: "T3".to_string(),
+            functional_objective: "login".to_string(),
+            files_to_create: vec!["src/auth/login.ts".to_string()],
+            ..TaskSpec::default()
+        };
+        assert!(validate_backlog(std::slice::from_ref(&ok)).is_ok());
+    }
+
+    #[test]
+    fn qa_tests_skip_when_disabled_unknown_or_undetected() {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-qa-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // Disabled explicitly.
+        assert!(run_tests_for_qa(&dir, &Some("off".to_string()))
+            .expect("off")
+            .contains("skipped"));
+        // Unknown custom runner: skip instead of guessing "<cmd> test".
+        assert!(run_tests_for_qa(&dir, &Some("make build".to_string()))
+            .expect("unknown runner")
+            .contains("skipped"));
+        // Nothing to detect in an empty project.
+        assert!(run_tests_for_qa(&dir, &None)
+            .expect("no manifest")
+            .contains("no test command"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
