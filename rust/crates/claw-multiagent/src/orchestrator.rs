@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use telemetry::{AnalyticsEvent, JsonlTelemetrySink, SessionTracer};
@@ -118,6 +120,13 @@ file; assign complexity honestly (it selects the AI model per task)."#;
 #[allow(clippy::too_many_lines)]
 pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     options.catalog.validate_credentials()?;
+
+    let aborted = Arc::new(AtomicBool::new(false));
+    let aborted_clone = Arc::clone(&aborted);
+    let _ = ctrlc::set_handler(move || {
+        aborted_clone.store(true, Ordering::Relaxed);
+    });
+
     let workflow = WorkflowLog::new();
     workflow.event(
         "started",
@@ -132,6 +141,8 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // Keep every agent artifact inside the generated project.
     std::env::set_var("CLAWD_AGENT_STORE", options.project_dir.join(".multiagent"));
     std::env::set_current_dir(&options.project_dir).map_err(|error| error.to_string())?;
+
+    let _ = init_git_repo(&options.project_dir, &workflow);
 
     let budget = Budget::new(options.max_cost_usd);
     if budget.enabled() {
@@ -158,7 +169,13 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 options.prompt, DIRECTOR_JSON_SCHEMA
             ),
         )?;
-        let plan: Plan = parse_agent_json(&director_report, "Director")?;
+        let plan: Plan = retry_parse_json_with_feedback(
+            &director_report,
+            "Director",
+            Role::Director,
+            options,
+            &workflow,
+        )?;
         save_doc(
             &docs,
             "plan.json",
@@ -238,14 +255,40 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                  designs.\n{SUBDIRECTOR_JSON_SCHEMA}"
             ),
         )?;
-        let tasks_value = extract_json(&subdirector_report.report)
+        let mut tasks_value = extract_json(&subdirector_report.report)
             .ok_or("Subdirector produced no JSON backlog")?;
-        let tasks: Vec<TaskSpec> =
-            serde_json::from_value(tasks_value.get("tasks").cloned().unwrap_or(tasks_value))
-                .map_err(|error| format!("Subdirector backlog did not validate: {error}"))?;
+        let mut tasks: Result<Vec<TaskSpec>, serde_json::Error> = serde_json::from_value(
+            tasks_value
+                .get("tasks")
+                .cloned()
+                .unwrap_or_else(|| tasks_value.clone()),
+        );
+        if tasks.is_err() {
+            workflow
+                .phase("  Subdirector: JSON validation falló, reintentando con retroalimentación");
+            let parse_error = tasks.as_ref().err().unwrap().to_string();
+            let retry_report = run_single(
+                Role::Subdirector,
+                &options.catalog.director,
+                options,
+                &format!(
+                    "Your previous response failed validation:\n\n{}\n\n\
+                     Please correct it and produce valid JSON again, ensuring \
+                     the structure is `{{\"tasks\": [...]}}` with each task \
+                     fully specified.",
+                    parse_error
+                ),
+            )?;
+            tasks_value = extract_json(&retry_report.report)
+                .ok_or("Subdirector retry produced no JSON backlog")?;
+            tasks =
+                serde_json::from_value(tasks_value.get("tasks").cloned().unwrap_or(tasks_value));
+        }
+        let tasks = tasks.map_err(|error| format!("Subdirector backlog invalid: {error}"))?;
         if tasks.is_empty() {
             return Err("Subdirector produced an empty backlog".to_string());
         }
+        validate_backlog_against_designs(&tasks)?;
         save_doc(
             &docs,
             "backlog.json",
@@ -303,6 +346,11 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         .collect();
 
     'waves: for (wave_index, wave) in waves.iter().enumerate() {
+        if aborted.load(Ordering::Relaxed) {
+            workflow.phase("Construcción abortada por usuario (Ctrl+C)");
+            save_doc(&docs, "ABORT.txt", "Build interrupted by user\n")?;
+            break 'waves;
+        }
         if let Some(spent) = budget.exceeded() {
             workflow.phase(&format!(
                 "Presupuesto superado ({spent:.2} USD): abortando limpiamente antes de la ola {}",
@@ -388,6 +436,13 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                         state.completed.insert(task.id.clone());
                         state.save(&options.project_dir);
                         built_context.push(context_line(task));
+                        let commit_msg = format!(
+                            "{} ({}): {}",
+                            task.id,
+                            task.module,
+                            truncate_chars(&task.functional_objective, 60)
+                        );
+                        let _ = git_commit(&options.project_dir, &commit_msg);
                     }
                 }
             }
@@ -409,6 +464,19 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         )?;
         save_doc(&docs, "qa-report.md", &qa.report)?;
 
+        // Run actual tests as a gate.
+        workflow.phase("Ejecutando tests generados por QA");
+        match run_tests_for_qa(&options.project_dir, &options.build_command) {
+            Ok(test_output) => {
+                workflow.event("qa_tests_passed", &[("output", test_output)]);
+                let _ = git_commit(&options.project_dir, "qa: all tests passed");
+            }
+            Err(test_error) => {
+                workflow.event("qa_tests_failed", &[("error", test_error.clone())]);
+                workflow.phase(&format!("⚠ QA tests fallaron:\n{}", test_error));
+            }
+        }
+
         // ---- Documentation ----
         workflow.phase("Agente de Documentación: README, ADRs y changelog");
         let docs_agent = run_single(
@@ -420,6 +488,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
              reflecting the project as actually built.",
         )?;
         save_doc(&docs, "docs-report.md", &docs_agent.report)?;
+        let _ = git_commit(&options.project_dir, "docs: add documentation and README");
     }
 
     workflow.event(
@@ -880,15 +949,6 @@ fn run_single(
     Ok(result)
 }
 
-fn parse_agent_json<T: serde::de::DeserializeOwned>(
-    result: &AgentResult,
-    who: &str,
-) -> Result<T, String> {
-    let value = extract_json(&result.report)
-        .ok_or_else(|| format!("{who} produced no JSON (status {})", result.status))?;
-    serde_json::from_value(value).map_err(|error| format!("{who} JSON did not validate: {error}"))
-}
-
 /// Architects relevant to the project: software + devops + UX always; the
 /// frontend/backend pair only when the stack is not a simple static site.
 fn architects_for(kind: ProjectKind, plan: &Plan) -> Vec<Role> {
@@ -938,6 +998,141 @@ fn append_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(content.as_bytes())
         .map_err(|error| error.to_string())
+}
+
+fn init_git_repo(project_dir: &Path, _workflow: &WorkflowLog) -> Result<(), String> {
+    let _status = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("git init failed: {error}"))?;
+    Ok(())
+}
+
+fn git_commit(project_dir: &Path, message: &str) -> Result<(), String> {
+    let status = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("git add failed: {error}"))?;
+    if !status.success() {
+        return Ok(());
+    }
+    let _status = std::process::Command::new("git")
+        .arg("commit")
+        .arg("-m")
+        .arg(message)
+        .arg("--quiet")
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("git commit failed: {error}"))?;
+    Ok(())
+}
+
+fn retry_parse_json_with_feedback<T: serde::de::DeserializeOwned>(
+    result: &AgentResult,
+    who: &str,
+    role: Role,
+    options: &RunOptions,
+    workflow: &WorkflowLog,
+) -> Result<T, String> {
+    let value = extract_json(&result.report)
+        .ok_or_else(|| format!("{who} produced no JSON (status {})", result.status))?;
+    if let Ok(parsed) = serde_json::from_value::<T>(value.clone()) {
+        return Ok(parsed);
+    }
+    let parse_error = serde_json::from_value::<T>(value)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    workflow.phase(&format!(
+        "  {who}: JSON validation falló, reintentando con retroalimentación"
+    ));
+    let retry_report = run_single(
+        role,
+        &options.catalog.director,
+        options,
+        &format!(
+            "Your previous response failed validation:\n\n{}\n\n\
+             Please correct it and produce valid JSON again.",
+            parse_error
+        ),
+    )?;
+    let value = extract_json(&retry_report.report)
+        .ok_or_else(|| format!("{who} retry produced no JSON"))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("{who} retry JSON still invalid: {error}"))
+}
+
+fn validate_backlog_against_designs(tasks: &[TaskSpec]) -> Result<(), String> {
+    let mut issues = Vec::new();
+    for task in tasks {
+        if task.files_to_create.is_empty() && task.files_to_modify.is_empty() {
+            issues.push(format!(
+                "{}: no files to create or modify (orphan task)",
+                task.id
+            ));
+        }
+        if task.functional_objective.is_empty() {
+            issues.push(format!("{}: missing functional objective", task.id));
+        }
+        if task.files_to_create.len() + task.files_to_modify.len() > 30 {
+            issues.push(format!(
+                "{}: too many files ({}) — split into smaller tasks",
+                task.id,
+                task.files_to_create.len() + task.files_to_modify.len()
+            ));
+        }
+    }
+    if !issues.is_empty() {
+        return Err(format!("Backlog validation failed:\n{}", issues.join("\n")));
+    }
+    Ok(())
+}
+
+fn run_tests_for_qa(project_dir: &Path, build_cmd: &Option<String>) -> Result<String, String> {
+    let test_cmd = if let Some(cmd) = build_cmd {
+        if cmd == "off" {
+            return Ok("tests skipped (disabled)".to_string());
+        }
+        if cmd.contains("npm") {
+            "npm test".to_string()
+        } else if cmd.contains("cargo") {
+            "cargo test".to_string()
+        } else {
+            format!("{} test", cmd)
+        }
+    } else {
+        if project_dir.join("Cargo.toml").exists() {
+            "cargo test".to_string()
+        } else if project_dir.join("package.json").exists() {
+            "npm test".to_string()
+        } else {
+            return Ok("no test command detected".to_string());
+        }
+    };
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&test_cmd)
+        .current_dir(project_dir)
+        .output()
+        .map_err(|error| format!("test execution failed: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(format!("✓ tests passed\n{}", stdout))
+    } else {
+        Err(format!(
+            "✗ tests failed:\nstdout:\n{}\nstderr:\n{}",
+            stdout, stderr
+        ))
+    }
 }
 
 #[cfg(test)]
