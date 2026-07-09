@@ -6,10 +6,50 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use telemetry::{AnalyticsEvent, JsonlTelemetrySink, SessionTracer};
+
 use crate::agents::{extract_json, spawn_agent, wait_all, AgentResult};
 use crate::catalog::ModelCatalog;
 use crate::contracts::{schedule_waves, Plan, ProjectKind, SupervisionVerdict, TaskSpec};
 use crate::roles::{system_prompt, write_role_instruction_files, Role};
+
+/// Emits workflow progress to the dashboard events file (when
+/// `CLAW_DASHBOARD_EVENTS` is set) and mirrors every phase to stdout.
+pub struct WorkflowLog {
+    tracer: Option<SessionTracer>,
+}
+
+impl WorkflowLog {
+    fn new() -> Self {
+        let tracer = std::env::var("CLAW_DASHBOARD_EVENTS")
+            .ok()
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty())
+            .and_then(|path| JsonlTelemetrySink::new(path).ok())
+            .map(|sink| SessionTracer::new("multiagent", std::sync::Arc::new(sink)));
+        Self { tracer }
+    }
+
+    fn phase(&self, message: &str) {
+        println!("[multiagent] {message}");
+        if let Some(tracer) = &self.tracer {
+            tracer.record_analytics(
+                AnalyticsEvent::new("workflow", "phase")
+                    .with_property("phase", serde_json::Value::String(message.to_string())),
+            );
+        }
+    }
+
+    fn event(&self, action: &str, properties: &[(&str, String)]) {
+        if let Some(tracer) = &self.tracer {
+            let mut event = AnalyticsEvent::new("workflow", action);
+            for (key, value) in properties {
+                event = event.with_property(*key, serde_json::Value::String(value.clone()));
+            }
+            tracer.record_analytics(event);
+        }
+    }
+}
 
 pub struct RunOptions {
     pub kind: ProjectKind,
@@ -60,6 +100,15 @@ same file; assign complexity honestly (it selects the AI model per task)."#;
 
 pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     options.catalog.validate_credentials()?;
+    let workflow = WorkflowLog::new();
+    workflow.event(
+        "started",
+        &[
+            ("kind", options.kind.as_str().to_string()),
+            ("prompt", options.prompt.clone()),
+            ("project", options.project_dir.display().to_string()),
+        ],
+    );
     let docs = options.project_dir.join("docs");
     std::fs::create_dir_all(&docs).map_err(|error| error.to_string())?;
     // Keep every agent artifact inside the generated project.
@@ -67,7 +116,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     std::env::set_current_dir(&options.project_dir).map_err(|error| error.to_string())?;
 
     // ---- Phase 1: Director General ----
-    log_phase("Director General: interpretando el prompt y creando el plan");
+    workflow.phase("Director General: interpretando el prompt y creando el plan");
     let director_report = run_single(
         Role::Director,
         &options.catalog.director,
@@ -86,7 +135,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     save_doc(&docs, "director-report.md", &director_report.report)?;
 
     // ---- Phase 2: Subdirector Técnico ----
-    log_phase("Subdirector Técnico: creando el backlog ejecutable");
+    workflow.phase("Subdirector Técnico: creando el backlog ejecutable");
     let plan_json = serde_json::to_string(&plan).unwrap_or_default();
     let subdirector_report = run_single(
         Role::Subdirector,
@@ -114,7 +163,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // Instruction files per model family (CLAUDE.md / AGENTS.md / GROK.md).
     let instruction_files =
         write_role_instruction_files(&options.project_dir, &options.catalog, options.kind)?;
-    log_phase(&format!(
+    workflow.phase(&format!(
         "Archivos de rol por modelo escritos: {}",
         instruction_files.join(", ")
     ));
@@ -132,7 +181,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     }
 
     // ---- Phase 3: Architects (parallel) ----
-    log_phase("Arquitectos: diseñando la solución en paralelo");
+    workflow.phase("Arquitectos: diseñando la solución en paralelo");
     let architect_roles = architects_for(options.kind, &plan);
     let mut architect_handles = Vec::new();
     for role in &architect_roles {
@@ -150,7 +199,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         architect_handles.push(handle);
     }
     for result in wait_all(architect_handles, options.agent_timeout, |result| {
-        log_phase(&format!("  arquitecto {} → {}", result.name, result.status));
+        workflow.phase(&format!("  arquitecto {} → {}", result.name, result.status));
     }) {
         save_doc(&docs, &format!("{}.md", result.name), &result.report)?;
     }
@@ -162,7 +211,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let mut supervision_issues = 0_usize;
 
     for (wave_index, wave) in waves.iter().enumerate() {
-        log_phase(&format!(
+        workflow.phase(&format!(
             "Ola {}/{}: {} tareas en paralelo",
             wave_index + 1,
             waves.len(),
@@ -181,7 +230,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                     &system_prompt(Role::Developer, options.kind),
                     &task.render_prompt(),
                 )?;
-                log_phase(&format!(
+                workflow.phase(&format!(
                     "  {} → modelo {} (complejidad {:?})",
                     task.id, model, task.complexity
                 ));
@@ -189,7 +238,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
             let handle_list: Vec<_> = handles.iter().map(|(_, h)| h.clone()).collect();
             let results = wait_all(handle_list, options.agent_timeout, |result| {
-                log_phase(&format!("  entrega {} → {}", result.name, result.status));
+                workflow.phase(&format!("  entrega {} → {}", result.name, result.status));
             });
             // Supervisor reviews each delivery as it lands, one by one.
             for result in &results {
@@ -204,14 +253,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 }
                 if let Some(task) = task {
                     supervision_issues +=
-                        supervise_delivery(options, &supervision_md, task, result)?;
+                        supervise_delivery(options, &workflow, &supervision_md, task, result)?;
                 }
             }
         }
     }
 
     // ---- Phase 5: QA ----
-    log_phase("Agente QA: generando y ejecutando pruebas");
+    workflow.phase("Agente QA: generando y ejecutando pruebas");
     let qa = run_single(
         Role::Qa,
         &options.catalog.medium,
@@ -222,7 +271,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     save_doc(&docs, "qa-report.md", &qa.report)?;
 
     // ---- Phase 6: Documentation ----
-    log_phase("Agente de Documentación: README, ADRs y changelog");
+    workflow.phase("Agente de Documentación: README, ADRs y changelog");
     let docs_agent = run_single(
         Role::Docs,
         &options.catalog.simple,
@@ -233,6 +282,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     )?;
     save_doc(&docs, "docs-report.md", &docs_agent.report)?;
 
+    workflow.event(
+        "finished",
+        &[
+            ("tasks", tasks.len().to_string()),
+            ("completed", completed.to_string()),
+            ("failed", failed.to_string()),
+        ],
+    );
     Ok(RunSummary {
         plan,
         tasks: tasks.len(),
@@ -248,6 +305,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
 /// (superior model) with the exact issue list.
 fn supervise_delivery(
     options: &RunOptions,
+    workflow: &WorkflowLog,
     supervision_md: &Path,
     task: &TaskSpec,
     delivery: &AgentResult,
@@ -291,7 +349,7 @@ fn supervise_delivery(
     run_reindex_hook();
 
     if !verdict.issues.is_empty() {
-        log_phase(&format!(
+        workflow.phase(&format!(
             "  supervisor: {} issue(s) en {} → despachando Técnico",
             verdict.issues.len(),
             task.id
@@ -397,10 +455,6 @@ fn append_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(content.as_bytes())
         .map_err(|error| error.to_string())
-}
-
-fn log_phase(message: &str) {
-    println!("[multiagent] {message}");
 }
 
 #[cfg(test)]

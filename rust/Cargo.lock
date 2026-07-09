@@ -500,6 +500,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "telemetry",
  "tools",
 ]
 

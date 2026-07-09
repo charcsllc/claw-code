@@ -97,6 +97,17 @@ pub struct UsageSample {
     pub output_tokens: u64,
 }
 
+/// Live multi-agent workflow status (emitted by claw-multiagent).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct WorkflowState {
+    pub kind: String,
+    pub prompt: String,
+    pub project: String,
+    pub phase: String,
+    pub finished: bool,
+    pub updated_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     /// Monotonic change counter; SSE consumers emit only when it moves.
@@ -110,6 +121,8 @@ pub struct Snapshot {
     pub running: usize,
     pub completed: usize,
     pub failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowState>,
     pub agents: Vec<AgentState>,
     pub history: Vec<UsageSample>,
     pub parse_errors: u64,
@@ -119,6 +132,7 @@ pub struct Snapshot {
 pub struct Aggregator {
     agents: BTreeMap<String, AgentState>,
     history: VecDeque<UsageSample>,
+    workflow: Option<WorkflowState>,
     parse_errors: u64,
     version: u64,
 }
@@ -133,6 +147,7 @@ impl Aggregator {
     pub fn reset(&mut self) {
         self.agents.clear();
         self.history.clear();
+        self.workflow = None;
         self.parse_errors = 0;
         self.version += 1;
     }
@@ -165,6 +180,10 @@ impl Aggregator {
             }
             if namespace == telemetry::API_NAMESPACE && action == telemetry::MESSAGE_USAGE_ACTION {
                 self.ingest_message_usage(record);
+                return;
+            }
+            if namespace == "workflow" {
+                self.ingest_workflow(record, &action);
                 return;
             }
             return;
@@ -272,6 +291,32 @@ impl Aggregator {
         }
     }
 
+    fn ingest_workflow(&mut self, record: &SessionTraceRecord, action: &str) {
+        let workflow = self.workflow.get_or_insert_with(WorkflowState::default);
+        workflow.updated_ms = record.timestamp_ms;
+        match action {
+            "started" => {
+                workflow.kind = attribute_string(&record.attributes, "kind").unwrap_or_default();
+                workflow.prompt =
+                    attribute_string(&record.attributes, "prompt").unwrap_or_default();
+                workflow.project =
+                    attribute_string(&record.attributes, "project").unwrap_or_default();
+                workflow.phase = "iniciando".to_string();
+                workflow.finished = false;
+            }
+            "phase" => {
+                if let Some(phase) = attribute_string(&record.attributes, "phase") {
+                    workflow.phase = phase;
+                }
+            }
+            "finished" => {
+                workflow.finished = true;
+                workflow.phase = "completado".to_string();
+            }
+            _ => {}
+        }
+    }
+
     fn agent_entry(&mut self, id: String, timestamp_ms: u64) -> &mut AgentState {
         let agent = self
             .agents
@@ -316,6 +361,7 @@ impl Aggregator {
         Snapshot {
             version: self.version,
             generated_ms: now_ms,
+            workflow: self.workflow.clone(),
             total_tokens: totals.total_tokens(),
             totals,
             estimated_cost_usd: cost,
@@ -502,5 +548,50 @@ mod tests {
             aggregator.snapshot(3_000).agents[0].status,
             AgentStatus::Completed
         );
+    }
+
+    #[test]
+    fn workflow_events_drive_the_banner_state() {
+        let mut aggregator = Aggregator::new();
+        assert!(aggregator.snapshot(1_000).workflow.is_none());
+
+        aggregator.ingest_line(&trace_line(
+            "multiagent",
+            0,
+            "analytics",
+            json!({
+                "namespace": "workflow", "action": "started",
+                "kind": "web", "prompt": "un ecommerce", "project": "/tmp/tienda",
+            }),
+        ));
+        aggregator.ingest_line(&trace_line(
+            "multiagent",
+            1,
+            "analytics",
+            json!({"namespace": "workflow", "action": "phase",
+                   "phase": "Ola 2/4: 3 tareas en paralelo"}),
+        ));
+        let snapshot = aggregator.snapshot(2_000);
+        let workflow = snapshot.workflow.expect("workflow state");
+        assert_eq!(workflow.kind, "web");
+        assert_eq!(workflow.prompt, "un ecommerce");
+        assert_eq!(workflow.phase, "Ola 2/4: 3 tareas en paralelo");
+        assert!(!workflow.finished);
+
+        aggregator.ingest_line(&trace_line(
+            "multiagent",
+            2,
+            "analytics",
+            json!({"namespace": "workflow", "action": "finished", "tasks": "8"}),
+        ));
+        let done = aggregator.snapshot(3_000).workflow.expect("workflow");
+        assert!(done.finished);
+        assert_eq!(done.phase, "completado");
+        // No agent card is created for the orchestrator session itself.
+        assert!(aggregator
+            .snapshot(3_000)
+            .agents
+            .iter()
+            .all(|agent| agent.id != "multiagent"));
     }
 }

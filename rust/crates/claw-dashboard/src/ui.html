@@ -115,6 +115,19 @@
   .card .action { font-size: 11.5px; color: var(--text-muted); border-top: 1px solid var(--grid); padding-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .stalewarn { color: var(--status-warning); }
 
+  .wf-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .wf-kind {
+    font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    background: var(--series-in); color: #fff; border-radius: 6px; padding: 2px 8px;
+  }
+  #workflow.done .wf-kind { background: var(--status-good); }
+  .wf-phase { font-size: 14px; font-weight: 600; }
+  #workflow:not(.done) .wf-phase::after {
+    content: "…"; animation: pulse 1.2s ease-in-out infinite; display: inline-block;
+  }
+  .wf-meta { font-size: 12px; color: var(--text-muted); margin-top: 6px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   #empty { text-align: center; color: var(--text-secondary); padding: 30px 10px; font-size: 13.5px; line-height: 1.7; }
   #empty code {
     background: var(--page); border: 1px solid var(--border); border-radius: 6px;
@@ -129,6 +142,15 @@
   <h1>claw · consumo de tokens y agentes</h1>
   <span id="conn"><span class="dot"></span><span id="connText">conectando…</span></span>
 </header>
+
+<div class="panel" id="workflow" hidden>
+  <h2>Workflow multiagente</h2>
+  <div class="wf-top">
+    <span class="wf-kind" id="wfKind"></span>
+    <span class="wf-phase" id="wfPhase"></span>
+  </div>
+  <div class="wf-meta" id="wfMeta"></div>
+</div>
 
 <div class="tiles">
   <div class="tile"><div class="k"><span class="swatch" style="background:var(--series-in)"></span>Tokens de entrada</div><div class="v" id="tIn">–</div><div class="s" id="tInSub"></div></div>
@@ -226,6 +248,15 @@ function connect() {
 }
 
 function render(snap) {
+  const wf = snap.workflow;
+  $("workflow").hidden = !wf;
+  if (wf) {
+    $("workflow").classList.toggle("done", wf.finished);
+    $("wfKind").textContent = wf.kind || "build";
+    $("wfPhase").textContent = wf.phase;
+    $("wfMeta").textContent = `«${wf.prompt}» → ${wf.project}`;
+    $("wfMeta").title = wf.prompt;
+  }
   $("tIn").textContent = compact(snap.totals.input_tokens);
   $("tIn").title = nfmt.format(snap.totals.input_tokens);
   $("tInSub").textContent = nfmt.format(snap.totals.input_tokens) + " exactos";

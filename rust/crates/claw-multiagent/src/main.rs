@@ -62,6 +62,91 @@ struct CommonArgs {
     /// Model for Supervisor/Fixer (the spec demands a superior model).
     #[arg(long)]
     supervisor_model: Option<String>,
+
+    /// Start claw-dashboard (or reuse a running one), point the telemetry
+    /// events file at this build, and open the browser to watch every
+    /// agent and the workflow phase live.
+    #[arg(long)]
+    dashboard: bool,
+}
+
+const DASHBOARD_PORT: u16 = 4110;
+
+/// Points `CLAW_DASHBOARD_EVENTS` at this build, spawns the sibling
+/// `claw-dashboard` binary unless one is already listening, and opens the
+/// browser. Failures degrade to a warning; the build proceeds either way.
+fn launch_dashboard(project_dir: &std::path::Path) {
+    let events = std::env::var("CLAW_DASHBOARD_EVENTS")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            project_dir
+                .join(".multiagent")
+                .join("events.jsonl")
+                .display()
+                .to_string()
+        });
+    if let Some(parent) = std::path::Path::new(&events).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::env::set_var("CLAW_DASHBOARD_EVENTS", &events);
+
+    let url = format!("http://127.0.0.1:{DASHBOARD_PORT}");
+    let already_running =
+        std::net::TcpListener::bind(("127.0.0.1", DASHBOARD_PORT)).map_or(true, |probe| {
+            drop(probe);
+            false
+        });
+    if already_running {
+        println!("[multiagent] dashboard ya activo en {url}");
+    } else {
+        let binary_name = if cfg!(windows) {
+            "claw-dashboard.exe"
+        } else {
+            "claw-dashboard"
+        };
+        let sibling = std::env::current_exe().ok().and_then(|exe| {
+            let candidate = exe.with_file_name(binary_name);
+            candidate.exists().then_some(candidate)
+        });
+        match sibling {
+            Some(binary) => {
+                match std::process::Command::new(binary)
+                    .args(["--events", &events])
+                    .args(["--port", &DASHBOARD_PORT.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(_) => println!("[multiagent] dashboard iniciado en {url}"),
+                    Err(error) => {
+                        eprintln!("[multiagent] aviso: no se pudo iniciar el dashboard: {error}");
+                        return;
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "[multiagent] aviso: claw-dashboard no está junto a este binario; \
+                     compílalo con `cargo build -p claw-dashboard`"
+                );
+                return;
+            }
+        }
+    }
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn main() {
@@ -100,6 +185,10 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
     }
     if let Some(model) = common.supervisor_model {
         catalog.supervisor = model;
+    }
+
+    if common.dashboard {
+        launch_dashboard(&project_dir);
     }
 
     println!("[multiagent] aplicativo: {}", kind.as_str());
