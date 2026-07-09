@@ -7,10 +7,10 @@ use aspect_macros::aspect;
 use aspect_std::LoggingAspect;
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    max_tokens_for_model, model_family_identity_for, resolve_model_alias, AnalyticsEvent, ApiError,
+    ContentBlockDelta, InputContentBlock, InputMessage, JsonlTelemetrySink, MessageRequest,
+    MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -4156,6 +4156,13 @@ where
     };
     write_agent_manifest(&manifest)?;
 
+    if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
+        tracer.record_analytics(AnalyticsEvent::agent_started(
+            &manifest.agent_id,
+            &manifest.name,
+        ));
+    }
+
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
@@ -4217,17 +4224,25 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let mut api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let dashboard_tracer = dashboard_agent_tracer(&job.manifest.agent_id);
+    if let Some(tracer) = &dashboard_tracer {
+        api_client = api_client.with_session_tracer(tracer);
+    }
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
         .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    Ok(ConversationRuntime::new(
+    let mut runtime = ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
         job.system_prompt.clone(),
-    ))
+    );
+    if let Some(tracer) = dashboard_tracer {
+        runtime = runtime.with_session_tracer(tracer);
+    }
+    Ok(runtime)
 }
 
 fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
@@ -4358,6 +4373,17 @@ fn persist_agent_terminal_state(
     result: Option<&str>,
     error: Option<String>,
 ) -> Result<(), String> {
+    if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
+        let event = if status == "completed" {
+            AnalyticsEvent::agent_finished(&manifest.agent_id)
+        } else {
+            AnalyticsEvent::agent_failed(
+                &manifest.agent_id,
+                error.as_deref().unwrap_or("sub-agent failed"),
+            )
+        };
+        tracer.record_analytics(event);
+    }
     let blocker = error.as_deref().map(classify_lane_blocker);
     append_agent_output(
         &manifest.output_file,
@@ -5159,6 +5185,19 @@ impl ProviderRuntimeClient {
             allowed_tools,
         })
     }
+
+    /// Attaches a session tracer to every provider in the fallback chain so
+    /// sub-agent requests emit `message_usage` telemetry.
+    fn with_session_tracer(mut self, tracer: &SessionTracer) -> Self {
+        self.chain = std::mem::take(&mut self.chain)
+            .into_iter()
+            .map(|mut entry| {
+                entry.client = entry.client.with_session_tracer(tracer.clone());
+                entry
+            })
+            .collect();
+        self
+    }
 }
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
@@ -5683,6 +5722,19 @@ fn make_agent_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("agent-{nanos}")
+}
+
+/// Builds a telemetry tracer for a sub-agent when `CLAW_DASHBOARD_EVENTS`
+/// is set, so each parallel agent shows up as its own card (with live token
+/// usage) in `claw-dashboard`. Local JSONL file only.
+fn dashboard_agent_tracer(agent_id: &str) -> Option<SessionTracer> {
+    let path = std::env::var("CLAW_DASHBOARD_EVENTS").ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let sink = JsonlTelemetrySink::new(path).ok()?;
+    Some(SessionTracer::new(agent_id, std::sync::Arc::new(sink)))
 }
 
 fn slugify_agent_name(description: &str) -> String {
@@ -6591,11 +6643,36 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    // Resolve against PATH without spawning a shell: forking `sh` for every
+    // probe fails spuriously under load (EAGAIN), which made runtime
+    // detection report "not found" for interpreters that exist.
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(std::path::Path::new(command));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            if is_executable_file(&dir.join(command)) {
+                return true;
+            }
+            if cfg!(windows) {
+                return is_executable_file(&dir.join(format!("{command}.exe")));
+            }
+            false
+        })
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8680,6 +8757,60 @@ mod tests {
             serde_json::from_str(&selected_with_alias).expect("valid json");
         assert_eq!(selected_with_alias_output["matches"][0], "Agent");
         assert_eq!(selected_with_alias_output["matches"][1], "Skill");
+    }
+
+    #[test]
+    fn agent_emits_dashboard_lifecycle_events() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-dashboard");
+        let events = dir.join("events.jsonl");
+        std::fs::create_dir_all(&dir).expect("store dir");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("CLAW_DASHBOARD_EVENTS", &events);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Trace usage".to_string(),
+                prompt: "Do the traced work.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("traced-agent".to_string()),
+                model: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("Agent should succeed");
+        persist_agent_terminal_state(&manifest, "completed", Some("done"), None)
+            .expect("terminal state persists");
+        let failed = manifest.clone();
+        persist_agent_terminal_state(&failed, "failed", None, Some("boom".to_string()))
+            .expect("failed state persists");
+
+        std::env::remove_var("CLAW_DASHBOARD_EVENTS");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+
+        let contents = std::fs::read_to_string(&events).expect("events file exists");
+        assert!(
+            contents.contains("\"namespace\":\"agent\"") && contents.contains("\"started\""),
+            "agent_started should be emitted: {contents}"
+        );
+        assert!(
+            contents.contains("\"label\":\"traced-agent\""),
+            "label should be the agent name: {contents}"
+        );
+        assert!(
+            contents.contains("\"finished\""),
+            "agent_finished should be emitted: {contents}"
+        );
+        assert!(
+            contents.contains("\"failed\"") && contents.contains("boom"),
+            "agent_failed should carry the error: {contents}"
+        );
+        assert!(
+            contents.contains(&format!("\"agent_id\":\"{}\"", manifest.agent_id)),
+            "events should reference the agent id: {contents}"
+        );
     }
 
     #[test]

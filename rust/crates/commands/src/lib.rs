@@ -132,7 +132,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "mcp",
         aliases: &[],
         summary: "Inspect configured MCP servers",
-        argument_hint: Some("[list|show <server>|help]"),
+        argument_hint: Some("[list|show <server>|add <name> <command|url>|remove <name>|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1708,7 +1708,7 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
         [action, ..] => Err(command_error(
             &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
             "mcp",
-            "/mcp [list|show <server>|help]",
+            "/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
         )),
     }
 }
@@ -3221,13 +3221,26 @@ fn render_mcp_report_for(
                 "use `claw mcp show <server>` to inspect a server",
             ))
         }
+        Some("add") => Ok(format!(
+            "MCP\n  Error            missing arguments for 'add'\n  Usage            {MCP_ADD_USAGE}"
+        )),
+        Some(args) if args.split_whitespace().next() == Some("add") => {
+            Ok(render_mcp_add_text(cwd, args["add".len()..].trim_start()))
+        }
+        Some("remove" | "rm") => Ok(format!(
+            "MCP\n  Error            missing server name for 'remove'\n  Usage            {MCP_REMOVE_USAGE}"
+        )),
+        Some(args) if matches!(args.split_whitespace().next(), Some("remove" | "rm")) => {
+            let rest = args.split_once(' ').map_or("", |(_, rest)| rest);
+            Ok(render_mcp_remove_text(cwd, rest))
+        }
         Some(args) => Ok(render_mcp_usage(Some(args))),
     }
 }
 
 fn render_mcp_unsupported_action_text(action: &str, hint: &str) -> String {
     format!(
-        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+        "MCP\n  Error            unsupported action '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"
     )
 }
 
@@ -3240,8 +3253,8 @@ fn render_mcp_unsupported_action_json(action: &str, hint: &str) -> Value {
         "requested_action": action,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
+            "direct_cli": "claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
         },
     })
 }
@@ -3351,13 +3364,39 @@ fn render_mcp_report_json_for(
                 "use `claw mcp show <server>` to inspect a server",
             ))
         }
+        Some("add") => Ok(json!({
+            "kind": "mcp",
+            "action": "add",
+            "ok": false,
+            "status": "error",
+            "error_kind": "missing_argument",
+            "message": "mcp add requires a server name and a command or URL",
+            "hint": MCP_ADD_USAGE,
+        })),
+        Some(args) if args.split_whitespace().next() == Some("add") => {
+            Ok(render_mcp_add_json(cwd, args["add".len()..].trim_start()))
+        }
+        Some("remove" | "rm") => Ok(json!({
+            "kind": "mcp",
+            "action": "remove",
+            "ok": false,
+            "status": "error",
+            "error_kind": "missing_argument",
+            "message": "mcp remove requires a server name",
+            "hint": MCP_REMOVE_USAGE,
+        })),
+        Some(args) if matches!(args.split_whitespace().next(), Some("remove" | "rm")) => {
+            let rest = args.split_once(' ').map_or("", |(_, rest)| rest);
+            Ok(render_mcp_remove_json(cwd, rest))
+        }
         Some(args) => {
-            // #681: unsupported mutation verbs (add, remove, delete, enable, disable)
-            // and other unknown sub-actions return a typed error instead of help with exit 0.
+            // #681: unsupported mutation verbs (delete, enable, disable) and
+            // other unknown sub-actions return a typed error instead of help
+            // with exit 0.
             let verb = args.split_whitespace().next().unwrap_or(args);
             Ok(render_mcp_unsupported_action_json(
                 args,
-                &format!("`{verb}` is not a supported MCP sub-action; supported actions: list, show, help"),
+                &format!("`{verb}` is not a supported MCP sub-action; supported actions: list, show, add, remove, help"),
             ))
         }
     }
@@ -4970,11 +5009,422 @@ fn render_skills_usage_json(unexpected: Option<&str>) -> Value {
     })
 }
 
+// ---------- MCP add/remove (config mutations) ----------
+
+const MCP_ADD_USAGE: &str = "claw mcp add <name> <command> [args...]  |  claw mcp add <name> <url> [--sse]\n                   Options: --scope local|project  --env K=V  --header K=V  --force";
+const MCP_REMOVE_USAGE: &str = "claw mcp remove <name> [--scope local|project]";
+
+/// Result of a successful `mcp add`.
+struct McpAddOutcome {
+    name: String,
+    transport: &'static str,
+    scope: &'static str,
+    path: PathBuf,
+    replaced: bool,
+    summary: String,
+}
+
+/// Result of a successful `mcp remove`.
+struct McpRemoveOutcome {
+    name: String,
+    removed_from: Vec<PathBuf>,
+}
+
+fn mcp_settings_path(cwd: &Path, scope: &str) -> PathBuf {
+    match scope {
+        "project" => cwd.join(".claw").join("settings.json"),
+        _ => cwd.join(".claw").join("settings.local.json"),
+    }
+}
+
+fn valid_mcp_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn parse_key_value_pair(raw: &str, flag: &str) -> Result<(String, String), String> {
+    raw.split_once('=')
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| format!("{flag} expects KEY=VALUE, got '{raw}'"))
+}
+
+/// Parses and applies `mcp add`. Errors are user-facing messages.
+fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut name: Option<&str> = None;
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut scope: &'static str = "local";
+    let mut env_pairs: Vec<(String, String)> = Vec::new();
+    let mut header_pairs: Vec<(String, String)> = Vec::new();
+    let mut force = false;
+    let mut sse = false;
+
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        match token {
+            "--" => {
+                // Everything after `--` is the literal command line.
+                positionals.extend(&tokens[index + 1..]);
+                break;
+            }
+            "--force" => force = true,
+            "--sse" => sse = true,
+            "--scope" => {
+                index += 1;
+                scope = match tokens.get(index) {
+                    Some(&"local") => "local",
+                    Some(&"project") => "project",
+                    other => {
+                        return Err(format!(
+                            "--scope expects 'local' or 'project', got '{}'",
+                            other.copied().unwrap_or("<missing>")
+                        ))
+                    }
+                };
+            }
+            "--env" => {
+                index += 1;
+                let raw = tokens
+                    .get(index)
+                    .ok_or_else(|| "--env expects KEY=VALUE".to_string())?;
+                env_pairs.push(parse_key_value_pair(raw, "--env")?);
+            }
+            "--header" => {
+                index += 1;
+                let raw = tokens
+                    .get(index)
+                    .ok_or_else(|| "--header expects KEY=VALUE".to_string())?;
+                header_pairs.push(parse_key_value_pair(raw, "--header")?);
+            }
+            flag if flag.starts_with("--") && name.is_none() => {
+                return Err(format!("unknown option '{flag}' before the server name"));
+            }
+            _ if name.is_none() => name = Some(token),
+            _ => positionals.push(token),
+        }
+        index += 1;
+    }
+
+    let name = name.ok_or_else(|| "missing server name".to_string())?;
+    if !valid_mcp_server_name(name) {
+        return Err(format!(
+            "invalid server name '{name}' (allowed: letters, digits, '-', '_', '.')"
+        ));
+    }
+    let first = *positionals
+        .first()
+        .ok_or_else(|| "missing command or URL after the server name".to_string())?;
+
+    // URL positional → remote server; anything else → stdio command line.
+    let is_remote = first.starts_with("http://") || first.starts_with("https://");
+    let (entry, transport, summary) = if is_remote {
+        if positionals.len() > 1 {
+            return Err(format!(
+                "unexpected extra arguments after the URL: '{}'",
+                positionals[1..].join(" ")
+            ));
+        }
+        if !env_pairs.is_empty() {
+            return Err("--env applies to stdio servers; use --header for remote ones".to_string());
+        }
+        let transport = if sse { "sse" } else { "http" };
+        let mut entry = json!({ "type": transport, "url": first });
+        if !header_pairs.is_empty() {
+            entry["headers"] = Value::Object(
+                header_pairs
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            );
+        }
+        (entry, transport, first.to_string())
+    } else {
+        if sse {
+            return Err(
+                "--sse applies to URL servers; pass a URL instead of a command".to_string(),
+            );
+        }
+        if !header_pairs.is_empty() {
+            return Err("--header applies to remote servers; use --env for stdio ones".to_string());
+        }
+        let mut entry = json!({
+            "type": "stdio",
+            "command": first,
+            "args": positionals[1..].to_vec(),
+        });
+        if !env_pairs.is_empty() {
+            entry["env"] = Value::Object(
+                env_pairs
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            );
+        }
+        (entry, "stdio", positionals.join(" "))
+    };
+
+    let path = mcp_settings_path(cwd, scope);
+    let original = match fs::read_to_string(&path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    let mut root: Value = match &original {
+        Some(content) if !content.trim().is_empty() => serde_json::from_str(content)
+            .map_err(|error| {
+                format!(
+                    "{} has invalid JSON ({error}); fix it first (`claw doctor` locates the problem)",
+                    path.display()
+                )
+            })?,
+        _ => json!({}),
+    };
+    let object = root.as_object_mut().ok_or_else(|| {
+        format!(
+            "{} must contain a JSON object at the top level",
+            path.display()
+        )
+    })?;
+    let servers = object
+        .entry("mcpServers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| format!("mcpServers in {} must be a JSON object", path.display()))?;
+    let replaced = servers.contains_key(name);
+    if replaced && !force {
+        return Err(format!(
+            "server '{name}' already exists in {}; pass --force to overwrite or pick another name",
+            path.display()
+        ));
+    }
+    servers.insert(name.to_string(), entry);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    }
+    let mut rendered = serde_json::to_string_pretty(&root)
+        .map_err(|error| format!("could not serialize settings: {error}"))?;
+    rendered.push('\n');
+    fs::write(&path, &rendered)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+
+    // Safety net: reload the full config; if the new entry does not validate,
+    // restore the file exactly as it was and report why.
+    let loader = ConfigLoader::default_for(cwd);
+    let validation_error = match loader.load() {
+        Ok(runtime_config) => runtime_config
+            .mcp()
+            .invalid_servers()
+            .iter()
+            .find(|invalid| invalid.name == name)
+            .map(|invalid| format!("{} ({})", invalid.reason, invalid.error_field)),
+        Err(error) => Some(error.to_string()),
+    };
+    if let Some(reason) = validation_error {
+        let restore = match original {
+            Some(content) => fs::write(&path, content),
+            None => fs::remove_file(&path),
+        };
+        let rollback_note = match restore {
+            Ok(()) => "the settings file was restored unchanged",
+            Err(_) => "WARNING: rollback failed, inspect the settings file",
+        };
+        return Err(format!(
+            "the new server did not validate: {reason}; {rollback_note}"
+        ));
+    }
+
+    Ok(McpAddOutcome {
+        name: name.to_string(),
+        transport,
+        scope,
+        path,
+        replaced,
+        summary,
+    })
+}
+
+/// Parses and applies `mcp remove`, deleting the server from every settings
+/// file where it appears (or only the `--scope` one when given).
+fn apply_mcp_remove(cwd: &Path, rest: &str) -> Result<McpRemoveOutcome, String> {
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let mut name: Option<&str> = None;
+    let mut scope: Option<&str> = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index] {
+            "--scope" => {
+                index += 1;
+                scope = match tokens.get(index) {
+                    Some(&"local") => Some("local"),
+                    Some(&"project") => Some("project"),
+                    other => {
+                        return Err(format!(
+                            "--scope expects 'local' or 'project', got '{}'",
+                            other.copied().unwrap_or("<missing>")
+                        ))
+                    }
+                };
+            }
+            token if token.starts_with("--") => {
+                return Err(format!("unknown option '{token}'"));
+            }
+            token if name.is_none() => name = Some(token),
+            token => return Err(format!("unexpected extra argument '{token}'")),
+        }
+        index += 1;
+    }
+    let name = name.ok_or_else(|| "missing server name".to_string())?;
+
+    let candidates: Vec<PathBuf> = match scope {
+        Some(scope) => vec![mcp_settings_path(cwd, scope)],
+        None => vec![
+            mcp_settings_path(cwd, "local"),
+            mcp_settings_path(cwd, "project"),
+        ],
+    };
+    let mut removed_from = Vec::new();
+    for path in candidates {
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut root) = serde_json::from_str::<Value>(&content) else {
+            continue;
+        };
+        let removed = root
+            .get_mut("mcpServers")
+            .and_then(Value::as_object_mut)
+            .and_then(|servers| servers.remove(name))
+            .is_some();
+        if !removed {
+            continue;
+        }
+        let mut rendered = serde_json::to_string_pretty(&root)
+            .map_err(|error| format!("could not serialize settings: {error}"))?;
+        rendered.push('\n');
+        fs::write(&path, rendered)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        removed_from.push(path);
+    }
+    if removed_from.is_empty() {
+        return Err(format!(
+            "server '{name}' not found in any settings file; run `claw mcp list` to see configured servers"
+        ));
+    }
+    Ok(McpRemoveOutcome {
+        name: name.to_string(),
+        removed_from,
+    })
+}
+
+fn render_mcp_add_text(cwd: &Path, rest: &str) -> String {
+    match apply_mcp_add(cwd, rest) {
+        Ok(outcome) => format!(
+            "MCP\n  Action           add\n  Status           ok\n  Server           {}\n  Transport        {}\n  Scope            {} ({})\n  Target           {}\n  Replaced         {}\n  Hint             `claw mcp show {}` inspects it; the next claw session connects automatically",
+            outcome.name,
+            outcome.transport,
+            outcome.scope,
+            display_path(cwd, &outcome.path),
+            outcome.summary,
+            outcome.replaced,
+            outcome.name,
+        ),
+        Err(message) => format!(
+            "MCP\n  Error            {message}\n  Usage            {MCP_ADD_USAGE}"
+        ),
+    }
+}
+
+fn render_mcp_add_json(cwd: &Path, rest: &str) -> Value {
+    match apply_mcp_add(cwd, rest) {
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": "add",
+            "ok": true,
+            "status": "ok",
+            "server": outcome.name,
+            "transport": outcome.transport,
+            "scope": outcome.scope,
+            "file": display_path(cwd, &outcome.path),
+            "target": outcome.summary,
+            "replaced": outcome.replaced,
+        }),
+        Err(message) => json!({
+            "kind": "mcp",
+            "action": "add",
+            "ok": false,
+            "status": "error",
+            "error_kind": "invalid_mcp_add",
+            "message": message,
+            "hint": MCP_ADD_USAGE,
+        }),
+    }
+}
+
+fn render_mcp_remove_text(cwd: &Path, rest: &str) -> String {
+    match apply_mcp_remove(cwd, rest) {
+        Ok(outcome) => {
+            let files = outcome
+                .removed_from
+                .iter()
+                .map(|path| display_path(cwd, path))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "MCP\n  Action           remove\n  Status           ok\n  Server           {}\n  Removed from     {files}",
+                outcome.name
+            )
+        }
+        Err(message) => {
+            format!("MCP\n  Error            {message}\n  Usage            {MCP_REMOVE_USAGE}")
+        }
+    }
+}
+
+fn render_mcp_remove_json(cwd: &Path, rest: &str) -> Value {
+    match apply_mcp_remove(cwd, rest) {
+        Ok(outcome) => json!({
+            "kind": "mcp",
+            "action": "remove",
+            "ok": true,
+            "status": "ok",
+            "server": outcome.name,
+            "removed_from": outcome
+                .removed_from
+                .iter()
+                .map(|path| display_path(cwd, path))
+                .collect::<Vec<_>>(),
+        }),
+        Err(message) => json!({
+            "kind": "mcp",
+            "action": "remove",
+            "ok": false,
+            "status": "error",
+            "error_kind": "invalid_mcp_remove",
+            "message": message,
+            "hint": MCP_REMOVE_USAGE,
+        }),
+    }
+}
+
+/// Renders a path relative to the working directory when possible.
+fn display_path(cwd: &Path, path: &Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
+}
+
 fn render_mcp_usage(unexpected: Option<&str>) -> String {
     let mut lines = vec![
         "MCP".to_string(),
-        "  Usage            /mcp [list|show <server>|help]".to_string(),
-        "  Direct CLI       claw mcp [list|show <server>|help]".to_string(),
+        "  Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"
+            .to_string(),
+        "  Direct CLI       claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"
+            .to_string(),
+        format!("  Add              {MCP_ADD_USAGE}"),
         "  Sources          .claw/settings.json, .claw/settings.local.json".to_string(),
     ];
     if let Some(args) = unexpected {
@@ -4989,7 +5439,7 @@ fn render_mcp_missing_argument_text(action: &str) -> String {
         _ => "provide the required argument for this MCP action",
     };
     format!(
-        "MCP\n  Error            missing argument for '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|help]"
+        "MCP\n  Error            missing argument for '{action}'\n  Hint             {hint}\n  Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"
     )
 }
 
@@ -5001,7 +5451,7 @@ fn render_mcp_missing_argument_json(action: &str) -> Value {
         ),
         _ => (
             "mcp action requires an argument",
-            "Usage: claw mcp [list|show <server>|help]",
+            "Usage: claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
         ),
     };
     json!({
@@ -5013,8 +5463,8 @@ fn render_mcp_missing_argument_json(action: &str) -> Value {
         "message": message,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
+            "direct_cli": "claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
             "sources": [".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": Value::Null,
@@ -5031,7 +5481,7 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
     // #774: add hint field so unknown_mcp_action errors have non-null hint parity
     // with agents/plugins unknown-subcommand envelopes.
     let hint: Value = if unexpected.is_some() {
-        json!("Use: list, show <server>, or help")
+        json!("Use: list, show <server>, add <name> <command|url>, remove <name>, or help")
     } else {
         Value::Null
     };
@@ -5043,8 +5493,10 @@ fn render_mcp_usage_json(unexpected: Option<&str>) -> Value {
         "error_kind": error_kind,
         "hint": hint,
         "usage": {
-            "slash_command": "/mcp [list|show <server>|help]",
-            "direct_cli": "claw mcp [list|show <server>|help]",
+            "slash_command": "/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
+            "direct_cli": "claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]",
+            "add": MCP_ADD_USAGE,
+            "remove": MCP_REMOVE_USAGE,
             "sources": [".claw.json", ".claw/settings.json", ".claw/settings.local.json"],
         },
         "unexpected": unexpected,
@@ -5430,6 +5882,177 @@ mod tests {
             .expect("time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("commands-plugin-{label}-{nanos}"))
+    }
+
+    mod mcp_add_remove {
+        use super::super::{handle_mcp_slash_command, handle_mcp_slash_command_json};
+        use super::temp_dir;
+        use serde_json::Value;
+        use std::fs;
+        use std::path::PathBuf;
+
+        fn workspace(label: &str) -> PathBuf {
+            let dir = temp_dir(label);
+            fs::create_dir_all(&dir).expect("workspace dir");
+            dir
+        }
+
+        fn read_settings(root: &std::path::Path, file: &str) -> Value {
+            let content = fs::read_to_string(root.join(".claw").join(file))
+                .expect("settings file should exist");
+            serde_json::from_str(&content).expect("settings should be valid JSON")
+        }
+
+        #[test]
+        fn add_stdio_writes_local_settings_and_lists() {
+            let root = workspace("mcp-add-stdio");
+            let result = handle_mcp_slash_command_json(
+                Some("add memoria npx -y codebase-memory-mcp --env TOKEN=abc"),
+                &root,
+            )
+            .expect("add should succeed");
+            assert_eq!(result["status"], "ok", "add result: {result}");
+            assert_eq!(result["transport"], "stdio");
+            assert_eq!(result["scope"], "local");
+
+            let settings = read_settings(&root, "settings.local.json");
+            let server = &settings["mcpServers"]["memoria"];
+            assert_eq!(server["type"], "stdio");
+            assert_eq!(server["command"], "npx");
+            assert_eq!(server["args"][1], "codebase-memory-mcp");
+            assert_eq!(server["env"]["TOKEN"], "abc");
+
+            // Roundtrip: the server shows up as configured and valid.
+            let list = handle_mcp_slash_command_json(Some("list"), &root).expect("list");
+            assert_eq!(list["status"], "ok", "list result: {list}");
+            assert_eq!(list["configured_servers"].as_u64(), Some(1));
+        }
+
+        #[test]
+        fn add_url_auto_detects_http_and_sse_flag() {
+            let root = workspace("mcp-add-url");
+            let result = handle_mcp_slash_command_json(
+                Some("add remoto https://example.com/mcp --header X-Auth=tok"),
+                &root,
+            )
+            .expect("add should succeed");
+            assert_eq!(result["status"], "ok", "add result: {result}");
+            assert_eq!(result["transport"], "http");
+            let settings = read_settings(&root, "settings.local.json");
+            assert_eq!(settings["mcpServers"]["remoto"]["type"], "http");
+            assert_eq!(settings["mcpServers"]["remoto"]["headers"]["X-Auth"], "tok");
+
+            let sse = handle_mcp_slash_command_json(
+                Some("add eventos https://example.com/sse --sse"),
+                &root,
+            )
+            .expect("sse add should succeed");
+            assert_eq!(sse["transport"], "sse");
+        }
+
+        #[test]
+        fn add_duplicate_requires_force() {
+            let root = workspace("mcp-add-dup");
+            handle_mcp_slash_command_json(Some("add uno echo hola"), &root).expect("first add");
+            let duplicate =
+                handle_mcp_slash_command_json(Some("add uno echo otra"), &root).expect("dup");
+            assert_eq!(duplicate["status"], "error", "dup result: {duplicate}");
+            assert_eq!(duplicate["error_kind"], "invalid_mcp_add");
+
+            let forced = handle_mcp_slash_command_json(Some("add uno echo otra --force"), &root)
+                .expect("forced add");
+            assert_eq!(forced["status"], "ok");
+            assert_eq!(forced["replaced"], true);
+            let settings = read_settings(&root, "settings.local.json");
+            assert_eq!(settings["mcpServers"]["uno"]["args"][0], "otra");
+        }
+
+        #[test]
+        fn add_project_scope_writes_shared_settings() {
+            let root = workspace("mcp-add-project");
+            let result = handle_mcp_slash_command_json(
+                Some("add compartido --scope project echo hola"),
+                &root,
+            )
+            .expect("add should succeed");
+            assert_eq!(result["status"], "ok", "add result: {result}");
+            assert_eq!(result["scope"], "project");
+            let settings = read_settings(&root, "settings.json");
+            assert_eq!(settings["mcpServers"]["compartido"]["command"], "echo");
+        }
+
+        #[test]
+        fn add_preserves_existing_settings_keys() {
+            let root = workspace("mcp-add-preserve");
+            let claw_dir = root.join(".claw");
+            fs::create_dir_all(&claw_dir).expect("claw dir");
+            fs::write(
+                claw_dir.join("settings.local.json"),
+                "{\n  \"model\": \"opus\"\n}\n",
+            )
+            .expect("seed settings");
+            handle_mcp_slash_command_json(Some("add nuevo echo hola"), &root).expect("add");
+            let settings = read_settings(&root, "settings.local.json");
+            assert_eq!(settings["model"], "opus");
+            assert_eq!(settings["mcpServers"]["nuevo"]["command"], "echo");
+        }
+
+        #[test]
+        fn remove_deletes_from_every_scope() {
+            let root = workspace("mcp-remove");
+            handle_mcp_slash_command_json(Some("add doble echo hola"), &root).expect("local add");
+            handle_mcp_slash_command_json(Some("add doble --scope project echo hola"), &root)
+                .expect("project add");
+
+            let removed =
+                handle_mcp_slash_command_json(Some("remove doble"), &root).expect("remove");
+            assert_eq!(removed["status"], "ok", "remove result: {removed}");
+            assert_eq!(
+                removed["removed_from"].as_array().map(Vec::len),
+                Some(2),
+                "should remove from both scopes: {removed}"
+            );
+            let local = read_settings(&root, "settings.local.json");
+            assert!(local["mcpServers"]["doble"].is_null());
+        }
+
+        #[test]
+        fn remove_missing_server_is_typed_error() {
+            let root = workspace("mcp-remove-missing");
+            let result =
+                handle_mcp_slash_command_json(Some("remove fantasma"), &root).expect("remove");
+            assert_eq!(result["status"], "error");
+            assert_eq!(result["error_kind"], "invalid_mcp_remove");
+        }
+
+        #[test]
+        fn invalid_json_settings_are_not_clobbered() {
+            let root = workspace("mcp-add-badjson");
+            let claw_dir = root.join(".claw");
+            fs::create_dir_all(&claw_dir).expect("claw dir");
+            fs::write(claw_dir.join("settings.local.json"), "{ not json").expect("seed");
+            let result =
+                handle_mcp_slash_command_json(Some("add x echo hola"), &root).expect("add");
+            assert_eq!(result["status"], "error", "add result: {result}");
+            let content = fs::read_to_string(claw_dir.join("settings.local.json")).expect("read");
+            assert_eq!(content, "{ not json", "broken file must stay untouched");
+        }
+
+        #[test]
+        fn text_mode_add_and_help_mention_new_verbs() {
+            let root = workspace("mcp-add-text");
+            let added =
+                handle_mcp_slash_command(Some("add memoria echo hola"), &root).expect("text add");
+            assert!(added.contains("Status           ok"), "text: {added}");
+            assert!(added.contains("stdio"), "text: {added}");
+
+            let help = handle_mcp_slash_command(Some("help"), &root).expect("help");
+            assert!(help.contains("add <name>"), "help should list add: {help}");
+            assert!(
+                help.contains("remove <name>"),
+                "help should list remove: {help}"
+            );
+        }
     }
 
     fn env_lock() -> &'static Mutex<()> {
@@ -5955,7 +6578,7 @@ mod tests {
         let action_error = parse_error_message("/mcp inspect alpha");
         assert!(action_error
             .contains("Unknown /mcp action 'inspect'. Use list, show <server>, or help."));
-        assert!(action_error.contains("  Usage            /mcp [list|show <server>|help]"));
+        assert!(action_error.contains("  Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"));
     }
 
     #[test]
@@ -5992,7 +6615,9 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(
+            help.contains("/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]")
+        );
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -6758,8 +7383,8 @@ mod tests {
         let cwd = temp_dir("mcp-usage");
 
         let help = super::handle_mcp_slash_command(Some("help"), &cwd).expect("mcp help");
-        assert!(help.contains("Usage            /mcp [list|show <server>|help]"));
-        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|help]"));
+        assert!(help.contains("Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"));
+        assert!(help.contains("Direct CLI       claw mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"));
 
         let unexpected =
             super::handle_mcp_slash_command(Some("show alpha beta"), &cwd).expect("mcp usage");
@@ -6767,12 +7392,12 @@ mod tests {
 
         let nested_help =
             super::handle_mcp_slash_command(Some("show --help"), &cwd).expect("mcp help");
-        assert!(nested_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(nested_help.contains("Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"));
         assert!(nested_help.contains("Unexpected       show"));
 
         let unknown_help =
             super::handle_mcp_slash_command(Some("inspect --help"), &cwd).expect("mcp usage");
-        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|help]"));
+        assert!(unknown_help.contains("Usage            /mcp [list|show <server>|add <name> <command|url>|remove <name>|help]"));
         assert!(unknown_help.contains("Unexpected       inspect"));
 
         let _ = fs::remove_dir_all(cwd);

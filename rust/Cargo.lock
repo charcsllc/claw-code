@@ -480,6 +480,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "claw-dashboard"
+version = "0.1.3"
+dependencies = [
+ "axum 0.8.9",
+ "clap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "telemetry",
+ "tokio",
+]
+
+[[package]]
 name = "claw-rag-service"
 version = "0.1.3"
 dependencies = [

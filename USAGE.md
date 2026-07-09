@@ -571,6 +571,31 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 
 The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `claw --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
 
+## Installing MCP servers
+
+`claw mcp add` writes the `mcpServers` entry for you — no manual JSON editing:
+
+```bash
+# stdio server: everything after the name is the command line
+claw mcp add memoria npx -y codebase-memory-mcp
+
+# remote server: a URL is auto-detected as HTTP transport (--sse for SSE)
+claw mcp add remoto https://ejemplo.com/mcp
+claw mcp add eventos https://ejemplo.com/sse --sse
+
+# options: --env K=V (stdio), --header K=V (remote),
+#          --scope local|project (default local), --force (overwrite)
+claw mcp add api npx api-mcp --env API_KEY=xyz --scope project
+
+claw mcp remove memoria     # deletes it from every settings file
+```
+
+`add` targets `.claw/settings.local.json` by default (machine-local) or
+`.claw/settings.json` with `--scope project` (shared, committable). After
+writing it re-validates the full config and rolls the file back untouched
+if the new entry does not parse. Both verbs also work as `/mcp add ...`
+inside a session and honor `--output-format json`.
+
 ## MCP server validation
 
 `claw mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:
@@ -653,6 +678,43 @@ cd rust
 cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ```
 
+## Live token & agent dashboard
+
+`claw-dashboard` serves a local web UI showing live input/output/cache token
+usage, estimated cost, and one card per active session or agent (running,
+completed, failed), scaling to any number of parallel agents. Everything is
+local: claw appends telemetry JSONL to a file and the dashboard tails it —
+no data leaves the machine.
+
+The one-command path:
+
+```bash
+claw --dashboard
+```
+
+This starts `claw-dashboard` on port 4110 (or reuses a running one), points
+`CLAW_DASHBOARD_EVENTS` at `.claw/telemetry/events.jsonl`, and opens the
+browser. The dashboard binary must sit next to `claw` (both do after
+`cargo build -p rusty-claude-cli -p claw-dashboard`).
+
+Manual setup, useful for many parallel claws sharing one dashboard:
+
+```bash
+# Terminal 1: start the dashboard (defaults to port 4110).
+# --truncate discards history from previous sessions.
+cd rust
+cargo run -p claw-dashboard -- --events /tmp/claw-events.jsonl --truncate
+
+# Terminal 2..N: run claw pointed at the same events file, one label each
+CLAW_DASHBOARD_EVENTS=/tmp/claw-events.jsonl CLAW_AGENT_LABEL="migrate tests" claw
+```
+
+Open http://127.0.0.1:4110. Each claw process appears as its own card
+(named by `CLAW_AGENT_LABEL` when set), with started/finished/failed
+lifecycle tracked automatically. Updates arrive over SSE push with a
+polling fallback. Usage is traced for Anthropic and OpenAI-compatible
+providers (OpenAI, xAI, DashScope, Ollama).
+
 ## Verification
 
 ```bash
@@ -665,6 +727,9 @@ cargo test --workspace
 Current Rust crates:
 
 - `api`
+- `claw-analog`
+- `claw-dashboard`
+- `claw-rag-service`
 - `commands`
 - `compat-harness`
 - `mock-anthropic-service`

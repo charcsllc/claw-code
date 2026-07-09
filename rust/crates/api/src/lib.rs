@@ -1,3 +1,8 @@
+// ApiError is intentionally large (it carries response bodies and retry
+// metadata); boxing every Err would ripple through all providers. The CLI
+// already allows this lint at call sites — keep the same policy crate-wide.
+#![allow(clippy::result_large_err)]
+
 mod client;
 mod error;
 mod http_client;

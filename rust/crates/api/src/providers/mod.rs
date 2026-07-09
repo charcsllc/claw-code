@@ -3,13 +3,48 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use runtime::format_usd;
 use serde::Serialize;
+use serde_json::Value;
+use telemetry::AnalyticsEvent;
 
 use crate::error::ApiError;
-use crate::types::{MessageRequest, MessageResponse};
+use crate::types::{MessageRequest, MessageResponse, Usage};
 
 pub mod anthropic;
 pub mod openai_compat;
+
+/// Builds the shared `message_usage` analytics event with the full
+/// input/output/cache token breakdown consumed by `claw-dashboard`.
+/// Used by every provider that traces usage.
+pub(crate) fn message_usage_event(
+    model: &str,
+    request_id: Option<&str>,
+    usage: &Usage,
+) -> AnalyticsEvent {
+    let cost_usd = usage.estimated_cost_usd(model).total_cost_usd();
+    AnalyticsEvent::new(telemetry::API_NAMESPACE, telemetry::MESSAGE_USAGE_ACTION)
+        .with_property("model", Value::String(model.to_string()))
+        .with_property(
+            "request_id",
+            request_id.map_or(Value::Null, |id| Value::String(id.to_string())),
+        )
+        .with_property("input_tokens", Value::from(usage.input_tokens))
+        .with_property("output_tokens", Value::from(usage.output_tokens))
+        .with_property(
+            "cache_creation_input_tokens",
+            Value::from(usage.cache_creation_input_tokens),
+        )
+        .with_property(
+            "cache_read_input_tokens",
+            Value::from(usage.cache_read_input_tokens),
+        )
+        .with_property("total_tokens", Value::from(usage.total_tokens()))
+        .with_property("estimated_cost_usd", Value::String(format_usd(cost_usd)))
+        // Full-precision cost for consumers that aggregate across many
+        // requests (the formatted string above rounds to 4 decimals).
+        .with_property("estimated_cost_usd_value", Value::from(cost_usd))
+}
 
 #[allow(dead_code)]
 pub type ProviderFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ApiError>> + Send + 'a>>;

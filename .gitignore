@@ -13,3 +13,5 @@ archive/
 status-help.txt
 # Legacy Python port session scratch artifacts
 .port_sessions/
+# Local codebase-memory index cache
+.codebase-memory/

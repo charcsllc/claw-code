@@ -139,6 +139,14 @@ pub struct AnalyticsEvent {
     pub properties: Map<String, Value>,
 }
 
+/// Shared analytics vocabulary consumed by `claw-dashboard`.
+pub const API_NAMESPACE: &str = "api";
+pub const MESSAGE_USAGE_ACTION: &str = "message_usage";
+pub const AGENT_NAMESPACE: &str = "agent";
+pub const AGENT_STARTED_ACTION: &str = "started";
+pub const AGENT_FINISHED_ACTION: &str = "finished";
+pub const AGENT_FAILED_ACTION: &str = "failed";
+
 impl AnalyticsEvent {
     #[must_use]
     pub fn new(namespace: impl Into<String>, action: impl Into<String>) -> Self {
@@ -153,6 +161,26 @@ impl AnalyticsEvent {
     pub fn with_property(mut self, key: impl Into<String>, value: Value) -> Self {
         self.properties.insert(key.into(), value);
         self
+    }
+
+    #[must_use]
+    pub fn agent_started(agent_id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self::new(AGENT_NAMESPACE, AGENT_STARTED_ACTION)
+            .with_property("agent_id", Value::String(agent_id.into()))
+            .with_property("label", Value::String(label.into()))
+    }
+
+    #[must_use]
+    pub fn agent_finished(agent_id: impl Into<String>) -> Self {
+        Self::new(AGENT_NAMESPACE, AGENT_FINISHED_ACTION)
+            .with_property("agent_id", Value::String(agent_id.into()))
+    }
+
+    #[must_use]
+    pub fn agent_failed(agent_id: impl Into<String>, error: impl Into<String>) -> Self {
+        Self::new(AGENT_NAMESPACE, AGENT_FAILED_ACTION)
+            .with_property("agent_id", Value::String(agent_id.into()))
+            .with_property("error", Value::String(error.into()))
     }
 }
 
@@ -264,14 +292,17 @@ impl JsonlTelemetrySink {
 
 impl TelemetrySink for JsonlTelemetrySink {
     fn record(&self, event: TelemetryEvent) {
-        let Ok(line) = serde_json::to_string(&event) else {
+        let Ok(mut line) = serde_json::to_string(&event) else {
             return;
         };
+        // Single write per line: with O_APPEND this keeps lines intact even
+        // when several processes share the same events file.
+        line.push('\n');
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(line.as_bytes());
         let _ = file.flush();
     }
 }

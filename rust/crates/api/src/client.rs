@@ -72,6 +72,17 @@ impl ProviderClient {
         }
     }
 
+    /// Attaches a session tracer so the provider emits `message_usage`
+    /// analytics (token breakdown) to the telemetry sink.
+    #[must_use]
+    pub fn with_session_tracer(self, session_tracer: telemetry::SessionTracer) -> Self {
+        match self {
+            Self::Anthropic(client) => Self::Anthropic(client.with_session_tracer(session_tracer)),
+            Self::Xai(client) => Self::Xai(client.with_session_tracer(session_tracer)),
+            Self::OpenAi(client) => Self::OpenAi(client.with_session_tracer(session_tracer)),
+        }
+    }
+
     #[must_use]
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
@@ -115,6 +126,7 @@ impl ProviderClient {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
