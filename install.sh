@@ -155,8 +155,9 @@ ${COLOR_DIM}---------------${COLOR_RESET}
        xcode-select --install
 
   ${COLOR_BOLD}4. Windows users${COLOR_RESET}
-     Run this script from inside a WSL distro (Ubuntu/Debian recommended).
-     Native Windows builds are not supported by this installer.
+     Native Windows: use the PowerShell installer from the repo root:
+       .\\install.ps1
+     Or run this script from inside a WSL distro (Ubuntu/Debian recommended).
 
   ${COLOR_BOLD}5. Build fails partway through${COLOR_RESET}
      Try a clean build:
@@ -220,12 +221,14 @@ case "${OS_FAMILY}" in
         ;;
     windows-shell)
         error "Detected a native Windows shell (MSYS/Cygwin/MinGW)."
-        error "Please re-run this script from inside a WSL distribution."
+        error "On native Windows, use the PowerShell installer instead:"
+        error "    .\\install.ps1"
+        error "Or re-run this script from inside a WSL distribution."
         exit 1
         ;;
     *)
         error "Unsupported or unknown OS: ${UNAME_S}"
-        error "Supported: Linux, macOS, and Windows via WSL."
+        error "Supported: Linux, macOS, Windows (native via install.ps1, or WSL)."
         exit 1
         ;;
 esac

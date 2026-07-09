@@ -26,6 +26,18 @@ cargo build --workspace
 
 ## Instalar / compilar el workspace
 
+La vía rápida son los instaladores del repo, que compilan **localmente desde este checkout** (sin descargas remotas), verifican el toolchain y hacen un smoke test:
+
+```bash
+./install.sh               # Linux / macOS / WSL (añade --release para el optimizado)
+```
+
+```powershell
+.\install.ps1              # Windows nativo, PowerShell (añade -Release)
+```
+
+O manualmente:
+
 ```bash
 cd rust
 cargo build --workspace

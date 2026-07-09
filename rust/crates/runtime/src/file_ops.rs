@@ -244,6 +244,10 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
 
     let absolute_path = normalize_path_allow_missing(path)?;
+    // Existence decides create-vs-update: an existing non-UTF-8 file makes
+    // read_to_string fail, which must not be misreported as a "create" of an
+    // empty file in the patch metadata.
+    let existed_before = absolute_path.exists();
     let original_file = fs::read_to_string(&absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
@@ -251,7 +255,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     fs::write(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
+        kind: if existed_before {
             String::from("update")
         } else {
             String::from("create")
@@ -273,16 +277,38 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
+    // An empty old_string passes `contains("")` (always true) and would then
+    // splice new_string between every character via `replace`, destroying
+    // the file.
+    if old_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty",
+        ));
+    }
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    let occurrences = original_file.matches(old_string).count();
+    if occurrences == 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "old_string not found in file",
+        ));
+    }
+    // Editing "the first match" of a non-unique string silently mutates a
+    // location the caller may not have meant; require a unique anchor or an
+    // explicit replace_all.
+    if !replace_all && occurrences > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string appears {occurrences} times in the file; include more \
+                 surrounding context to make it unique, or pass replace_all: true"
+            ),
         ));
     }
 
@@ -809,6 +835,49 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string() {
+        let path = temp_path("edit-empty.txt");
+        write_file(path.to_string_lossy().as_ref(), "abc").expect("write");
+        // `"abc".contains("")` is true; without the guard, replace_all would
+        // splice new_string between every character.
+        let error = edit_file(path.to_string_lossy().as_ref(), "", "X", true)
+            .expect_err("empty old_string must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "abc",
+            "file must be untouched"
+        );
+    }
+
+    #[test]
+    fn edit_requires_unique_match_without_replace_all() {
+        let path = temp_path("edit-unique.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha").expect("write");
+        let error = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", false)
+            .expect_err("ambiguous old_string must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("2 times"));
+        // A unique anchor still works without replace_all.
+        let output = edit_file(path.to_string_lossy().as_ref(), "beta", "gamma", false)
+            .expect("unique edit succeeds");
+        assert!(!output.replace_all);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha gamma alpha"
+        );
+    }
+
+    #[test]
+    fn write_over_non_utf8_file_reports_update() {
+        let path = temp_path("overwrite-binary.txt");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00]).expect("seed binary");
+        let output =
+            write_file(path.to_string_lossy().as_ref(), "clean text").expect("overwrite succeeds");
+        assert_eq!(output.kind, "update", "existing file is an update");
     }
 
     #[test]

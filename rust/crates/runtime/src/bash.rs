@@ -176,15 +176,15 @@ async fn execute_bash_async(
 
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
+    // A command with no explicit timeout must still not hang the turn
+    // forever; apply the tool's documented default.
+    let timeout_ms = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
+    let output_result =
         if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
             (result?, false)
         } else {
             return Ok(timeout_output(&input, timeout_ms, sandbox_status));
-        }
-    } else {
-        (command.output().await?, false)
-    };
+        };
 
     let (output, interrupted) = output_result;
     let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
@@ -348,6 +348,10 @@ fn prepare_tokio_command(
 
     prepared.current_dir(cwd);
     prepared.stdin(Stdio::null());
+    // On timeout the output() future is dropped; without kill_on_drop the
+    // child would keep running as an orphan after the tool reports
+    // "interrupted".
+    prepared.kill_on_drop(true);
     prepared
 }
 
@@ -448,6 +452,11 @@ mod tests {
 
 /// Maximum output bytes before truncation (16 KiB, matching upstream).
 const MAX_OUTPUT_BYTES: usize = 16_384;
+
+/// Applied when the caller omits `timeout`: matches the tool's documented
+/// default (120s) so an unattended `sleep`/hung build cannot stall a turn
+/// indefinitely.
+const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {

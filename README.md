@@ -126,6 +126,20 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 > ```
 > Este repo (`charcsllc/claw-code`) es **solo build desde código fuente** — sigue los pasos de abajo.
 
+**Instalación en un comando** (compila localmente desde este checkout — sin descargas remotas):
+
+```bash
+# Linux / macOS / WSL
+./install.sh              # build de debug; añade --release para el optimizado
+```
+
+```powershell
+# Windows nativo (PowerShell)
+.\install.ps1             # build de debug; añade -Release para el optimizado
+```
+
+Ambos detectan el entorno, verifican el toolchain de Rust, compilan el workspace `rust/` local y hacen un smoke test del binario. O manualmente:
+
 ```bash
 # 1. Clona y compila
 git clone https://github.com/charcsllc/claw-code
