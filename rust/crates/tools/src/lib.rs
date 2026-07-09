@@ -2835,6 +2835,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    /// Module isolation: restrict file-writing tools to these path prefixes.
+    allowed_write_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3223,6 +3225,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    allowed_write_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4169,6 +4172,12 @@ where
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        allowed_write_paths: input
+            .allowed_write_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -4231,7 +4240,8 @@ fn build_agent_runtime(
     }
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
+        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()))
+        .with_write_scope(job.allowed_write_paths.clone());
     let mut runtime = ConversationRuntime::new(
         Session::new(),
         api_client,
@@ -5381,13 +5391,21 @@ async fn stream_with_provider(
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    /// Module isolation: when set, file-writing tools may only target paths
+    /// under these prefixes (multi-agent builds pass each task's module
+    /// files so parallel agents can never clobber each other).
+    write_scope: Option<Vec<PathBuf>>,
 }
+
+/// Tools whose `path`-like argument mutates the filesystem.
+const WRITE_SCOPED_TOOLS: &[&str] = &["write_file", "edit_file", "NotebookEdit"];
 
 impl SubagentToolExecutor {
     fn new(allowed_tools: BTreeSet<String>) -> Self {
         Self {
             allowed_tools,
             enforcer: None,
+            write_scope: None,
         }
     }
 
@@ -5395,6 +5413,65 @@ impl SubagentToolExecutor {
         self.enforcer = Some(enforcer);
         self
     }
+
+    fn with_write_scope(mut self, scope: Vec<PathBuf>) -> Self {
+        if !scope.is_empty() {
+            self.write_scope = Some(scope);
+        }
+        self
+    }
+
+    /// Rejects writes outside the module scope. Reads stay workspace-wide
+    /// (agents legitimately inspect other modules' interfaces).
+    fn enforce_write_scope(&self, tool_name: &str, input: &Value) -> Result<(), ToolError> {
+        let Some(scope) = &self.write_scope else {
+            return Ok(());
+        };
+        if !WRITE_SCOPED_TOOLS.contains(&canonical_allowed_tool_name(tool_name).as_str()) {
+            return Ok(());
+        }
+        let raw_path = ["path", "file_path", "notebook_path"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str));
+        let Some(raw_path) = raw_path else {
+            return Ok(());
+        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        let target = normalize_scope_path(&cwd, Path::new(raw_path));
+        let in_scope = scope.iter().any(|prefix| {
+            let prefix = normalize_scope_path(&cwd, prefix);
+            target == prefix || target.starts_with(&prefix)
+        });
+        if in_scope {
+            Ok(())
+        } else {
+            Err(ToolError::new(format!(
+                "write to `{raw_path}` escapes this agent's module scope; \
+                 only files under its TaskSpec may be modified"
+            )))
+        }
+    }
+}
+
+/// Lexically normalizes a path against `cwd` (no filesystem access, so it
+/// also works for files the agent is about to create).
+fn normalize_scope_path(cwd: &Path, path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 impl ToolExecutor for SubagentToolExecutor {
@@ -5409,6 +5486,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        self.enforce_write_scope(tool_name, &value)?;
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
@@ -8760,6 +8838,60 @@ mod tests {
     }
 
     #[test]
+    fn write_scope_blocks_writes_outside_module() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        std::fs::create_dir_all(workspace.join("src/cart")).expect("dirs");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([
+            "write_file".to_string(),
+            "read_file".to_string(),
+        ]))
+        .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        let inside = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/login.ts", "content": "ok"}).to_string(),
+        );
+        assert!(inside.is_ok(), "in-scope write should pass: {inside:?}");
+
+        let outside = executor.execute(
+            "write_file",
+            &json!({"path": "src/cart/cart.ts", "content": "nope"}).to_string(),
+        );
+        let error = outside.expect_err("out-of-scope write must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "error should mention scope: {error}"
+        );
+
+        let traversal = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/../cart/hack.ts", "content": "nope"}).to_string(),
+        );
+        assert!(
+            traversal.is_err(),
+            "path traversal must not escape the scope"
+        );
+
+        // Reads anywhere in the workspace remain allowed.
+        std::fs::write(workspace.join("src/cart/cart.ts"), "existing").expect("seed");
+        let read = executor.execute(
+            "read_file",
+            &json!({"path": "src/cart/cart.ts"}).to_string(),
+        );
+        assert!(read.is_ok(), "reads stay workspace-wide: {read:?}");
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn agent_emits_dashboard_lifecycle_events() {
         let _guard = env_lock()
             .lock()
@@ -8777,6 +8909,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("traced-agent".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |_job| Ok(()),
         )
@@ -8830,6 +8963,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -8911,6 +9045,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8968,6 +9103,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9015,6 +9151,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9060,6 +9197,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9108,6 +9246,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9148,6 +9287,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9194,6 +9334,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9264,6 +9405,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9305,6 +9447,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |_| Err(String::from("thread creation failed")),
         )

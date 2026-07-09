@@ -7,9 +7,11 @@ use std::time::Duration;
 
 use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
 
-const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--parallel N] [--output <dir>]\n\
-                            /app <prompt> [--dry-run] [--parallel N] [--output <dir>]\n\
-                     Tip: start with --dry-run to review the plan before building.";
+const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--parallel N] [--output <dir>] \
+[--resume] [--max-cost-usd X] [--build-cmd <cmd|off>]\n\
+                            /app <prompt> [same options]\n\
+                     Tip: start with --dry-run to review the plan before building.\n\
+                     --max-cost-usd is OFF by default (subscription accounts).";
 
 /// Parses the slash-command arguments and runs the build. The working
 /// directory and agent store are restored afterwards so the REPL session
@@ -26,13 +28,17 @@ pub(crate) fn run_multiagent_build(
 
     let mut prompt_words: Vec<&str> = Vec::new();
     let mut dry_run = false;
+    let mut resume = false;
     let mut parallel = 4_usize;
     let mut output = PathBuf::from("./multiagent-project");
+    let mut max_cost_usd: Option<f64> = None;
+    let mut build_cmd: Option<String> = None;
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
         match tokens[index] {
             "--dry-run" => dry_run = true,
+            "--resume" => resume = true,
             "--parallel" => {
                 index += 1;
                 parallel = tokens
@@ -43,6 +49,24 @@ pub(crate) fn run_multiagent_build(
             "--output" => {
                 index += 1;
                 output = PathBuf::from(*tokens.get(index).ok_or("--output expects a directory")?);
+            }
+            "--max-cost-usd" => {
+                index += 1;
+                max_cost_usd = Some(
+                    tokens
+                        .get(index)
+                        .and_then(|value| value.parse().ok())
+                        .ok_or("--max-cost-usd expects a number (USD)")?,
+                );
+            }
+            "--build-cmd" => {
+                index += 1;
+                build_cmd = Some(
+                    (*tokens
+                        .get(index)
+                        .ok_or("--build-cmd expects a command or 'off'")?)
+                    .to_string(),
+                );
             }
             word => prompt_words.push(word),
         }
@@ -78,6 +102,9 @@ pub(crate) fn run_multiagent_build(
         parallel,
         dry_run,
         agent_timeout: Duration::from_secs(1800),
+        resume,
+        max_cost_usd,
+        build_command: build_cmd,
     });
 
     // Restore REPL environment regardless of the outcome.

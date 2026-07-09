@@ -45,18 +45,20 @@ pub fn spawn_agent(
     subagent_type: &str,
     system_context: &str,
     prompt: &str,
+    allowed_write_paths: &[String],
 ) -> Result<AgentHandle, String> {
     let full_prompt = format!("{system_context}\n\n---\n\n{prompt}");
-    let raw = tools::execute_tool(
-        "Agent",
-        &json!({
-            "name": name,
-            "description": description,
-            "prompt": full_prompt,
-            "subagent_type": subagent_type,
-            "model": model,
-        }),
-    )?;
+    let mut input = json!({
+        "name": name,
+        "description": description,
+        "prompt": full_prompt,
+        "subagent_type": subagent_type,
+        "model": model,
+    });
+    if !allowed_write_paths.is_empty() {
+        input["allowed_write_paths"] = json!(allowed_write_paths);
+    }
+    let raw = tools::execute_tool("Agent", &input)?;
     let manifest: Value =
         serde_json::from_str(&raw).map_err(|error| format!("invalid agent manifest: {error}"))?;
     let manifest_file = manifest["manifestFile"]

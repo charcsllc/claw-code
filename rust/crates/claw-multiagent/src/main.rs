@@ -68,6 +68,23 @@ struct CommonArgs {
     /// agent and the workflow phase live.
     #[arg(long)]
     dashboard: bool,
+
+    /// Resume an interrupted build: reuse the saved plan/designs/backlog
+    /// and skip tasks already completed.
+    #[arg(long)]
+    resume: bool,
+
+    /// Cost ceiling in USD. DISABLED by default (subscription accounts
+    /// don't bill per token); pass a value to enable enforcement — the
+    /// build aborts cleanly between waves when spend exceeds it.
+    /// Requires telemetry (--dashboard or CLAW_DASHBOARD_EVENTS).
+    #[arg(long)]
+    max_cost_usd: Option<f64>,
+
+    /// Build-gate command run after each wave (auto-detected from
+    /// package.json/Cargo.toml when omitted; pass "off" to disable).
+    #[arg(long)]
+    build_cmd: Option<String>,
 }
 
 const DASHBOARD_PORT: u16 = 4110;
@@ -212,6 +229,9 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
         parallel: common.parallel,
         dry_run: common.dry_run,
         agent_timeout: Duration::from_secs(common.agent_timeout_secs),
+        resume: common.resume,
+        max_cost_usd: common.max_cost_usd,
+        build_command: common.build_cmd,
     })?;
 
     println!("\n[multiagent] === resumen ===");
@@ -225,6 +245,12 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
         println!("  completadas:   {}", summary.completed);
         println!("  fallidas:      {}", summary.failed);
         println!("  issues de supervisión: {}", summary.supervision_issues);
+        if summary.resumed_tasks > 0 {
+            println!("  reanudadas (omitidas): {}", summary.resumed_tasks);
+        }
+        if summary.budget_aborted {
+            println!("  ⚠ abortado por presupuesto (--max-cost-usd)");
+        }
     }
     Ok(())
 }
