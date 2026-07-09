@@ -5397,8 +5397,15 @@ struct SubagentToolExecutor {
     write_scope: Option<Vec<PathBuf>>,
 }
 
-/// Tools whose `path`-like argument mutates the filesystem.
-const WRITE_SCOPED_TOOLS: &[&str] = &["write_file", "edit_file", "NotebookEdit"];
+/// Tools whose `path`-like argument mutates the filesystem, by canonical
+/// name (`canonical_allowed_tool_name` output — "NotebookEdit" would never
+/// match, since the membership test compares canonical names).
+const WRITE_SCOPED_TOOLS: &[&str] = &["write_file", "edit_file", "notebook_edit"];
+
+/// Shell tools can write anywhere (`echo x > file`), so lexical path
+/// checks cannot scope them: under a module write-scope they are refused
+/// outright rather than silently bypassing the isolation.
+const SHELL_TOOLS: &[&str] = &["bash", "power_shell", "repl"];
 
 impl SubagentToolExecutor {
     fn new(allowed_tools: BTreeSet<String>) -> Self {
@@ -5422,12 +5429,23 @@ impl SubagentToolExecutor {
     }
 
     /// Rejects writes outside the module scope. Reads stay workspace-wide
-    /// (agents legitimately inspect other modules' interfaces).
+    /// (agents legitimately inspect other modules' interfaces). Symlinks
+    /// inside the scope are not resolved (normalization is lexical), but
+    /// the separate workspace-boundary check still contains any write to
+    /// the workspace itself.
     fn enforce_write_scope(&self, tool_name: &str, input: &Value) -> Result<(), ToolError> {
         let Some(scope) = &self.write_scope else {
             return Ok(());
         };
-        if !WRITE_SCOPED_TOOLS.contains(&canonical_allowed_tool_name(tool_name).as_str()) {
+        let canonical = canonical_allowed_tool_name(tool_name);
+        if SHELL_TOOLS.contains(&canonical.as_str()) {
+            return Err(ToolError::new(format!(
+                "`{tool_name}` is disabled for module-scoped agents (a shell \
+                 can write outside the module); use read/write/edit tools \
+                 within the TaskSpec's files instead"
+            )));
+        }
+        if !WRITE_SCOPED_TOOLS.contains(&canonical.as_str()) {
             return Ok(());
         }
         let raw_path = ["path", "file_path", "notebook_path"]
@@ -8886,6 +8904,55 @@ mod tests {
             &json!({"path": "src/cart/cart.ts"}).to_string(),
         );
         assert!(read.is_ok(), "reads stay workspace-wide: {read:?}");
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn write_scope_closes_shell_and_notebook_bypasses() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope-bypass");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([
+            "bash".to_string(),
+            "power_shell".to_string(),
+            "repl".to_string(),
+            "notebook_edit".to_string(),
+        ]))
+        .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        // Shell tools would write anywhere (`echo x > src/cart/x.ts`), so a
+        // scoped agent must not get them at all.
+        for shell in ["bash", "PowerShell", "REPL"] {
+            let result = executor.execute(shell, &json!({"command": "echo hi"}).to_string());
+            let error = result.expect_err("shells must be refused under scope");
+            assert!(
+                error.to_string().contains("module-scoped"),
+                "{shell}: {error}"
+            );
+        }
+
+        // NotebookEdit is matched by canonical name ("notebook_edit"): an
+        // out-of-scope notebook write must be rejected, not silently allowed.
+        let notebook = executor.execute(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": "src/cart/evil.ipynb",
+                "new_source": "x"
+            })
+            .to_string(),
+        );
+        let error = notebook.expect_err("out-of-scope notebook edit must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "notebook error should mention scope: {error}"
+        );
 
         std::env::set_current_dir(original_cwd).expect("restore cwd");
         let _ = std::fs::remove_dir_all(workspace);

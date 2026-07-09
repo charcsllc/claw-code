@@ -85,7 +85,7 @@ impl ModelCatalog {
         let mut missing: Vec<String> = Vec::new();
         for model in self.all_models() {
             let provider = provider_for_model(model);
-            if !provider_credentials_present(provider) {
+            if !credentials_present_for_model(model, provider) {
                 missing.push(format!(
                     "{model} → {} (set {})",
                     provider_label(provider),
@@ -122,20 +122,65 @@ fn env_non_empty(key: &str) -> bool {
     std::env::var(key).is_ok_and(|value| !value.trim().is_empty())
 }
 
-/// A provider is usable with an API key, a subscription token, or (for the
+/// Saved subscription login: the runtime keeps OAuth credentials under the
+/// user config home (`CLAW_CONFIG_HOME` or `~/.claw`) in `settings.json`.
+/// This crate must not depend on `runtime`, so probe the same file directly.
+fn anthropic_saved_auth_present() -> bool {
+    let config_home = std::env::var_os("CLAW_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".claw"))
+        });
+    let Some(config_home) = config_home else {
+        return false;
+    };
+    std::fs::read_to_string(config_home.join("settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|settings| {
+            settings.get("oauth").is_some_and(|oauth| !oauth.is_null())
+                || settings.get("provider").is_some_and(|p| !p.is_null())
+        })
+}
+
+/// A provider is usable with an API key, a subscription token, saved
+/// credentials on disk (Anthropic subscription login), or (for the
 /// OpenAI-compatible family) a local Ollama host / DashScope key.
 #[must_use]
 pub fn provider_credentials_present(kind: ProviderKind) -> bool {
+    credentials_present_for_model("", kind)
+}
+
+/// Like [`provider_credentials_present`], but within the OpenAI-compatible
+/// family it matches the credential to the concrete model: a DashScope key
+/// must not "validate" a `gpt-*` tier that would then die mid-build.
+#[must_use]
+pub fn credentials_present_for_model(model: &str, kind: ProviderKind) -> bool {
     match kind {
         ProviderKind::Anthropic => {
-            env_non_empty("ANTHROPIC_API_KEY") || env_non_empty("ANTHROPIC_AUTH_TOKEN")
+            env_non_empty("ANTHROPIC_API_KEY")
+                || env_non_empty("ANTHROPIC_AUTH_TOKEN")
+                // Subscription accounts log in once and keep credentials on
+                // disk (`~/.claw/settings.json`, `oauth` section) with no env
+                // var set — refusing them here would block exactly the users
+                // the cost-ceiling docs target.
+                || anthropic_saved_auth_present()
         }
         ProviderKind::Xai => env_non_empty("XAI_API_KEY"),
         ProviderKind::OpenAi => {
-            env_non_empty("OPENAI_API_KEY")
-                || env_non_empty("DASHSCOPE_API_KEY")
-                || env_non_empty("OLLAMA_HOST")
-                || env_non_empty("OPENAI_BASE_URL")
+            // A custom endpoint routes any model in the family.
+            if env_non_empty("OPENAI_BASE_URL") || env_non_empty("OLLAMA_HOST") {
+                return true;
+            }
+            let lower = model.to_ascii_lowercase();
+            if lower.starts_with("qwen") || lower.contains("dashscope") {
+                env_non_empty("DASHSCOPE_API_KEY")
+            } else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3")
+            {
+                env_non_empty("OPENAI_API_KEY")
+            } else {
+                env_non_empty("OPENAI_API_KEY") || env_non_empty("DASHSCOPE_API_KEY")
+            }
         }
     }
 }

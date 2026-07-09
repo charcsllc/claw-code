@@ -599,7 +599,9 @@ fn spawn_developer(
 }
 
 /// Directories a developer agent may write to, derived from its TaskSpec.
-/// Empty (no enforcement) when the spec lists no files.
+/// Empty would mean no enforcement, but `validate_backlog` rejects tasks
+/// with no files before any developer is spawned, so a developer's scope is
+/// always non-empty in practice.
 #[must_use]
 pub fn write_scope_for(task: &TaskSpec) -> Vec<String> {
     let mut scope: BTreeSet<String> = BTreeSet::new();
@@ -733,6 +735,10 @@ fn load_planning_artifacts(docs: &Path) -> Result<(Plan, Vec<TaskSpec>), String>
 pub struct Budget {
     ceiling: Option<f64>,
     events_path: Option<PathBuf>,
+    /// Spend already present in the events file when this run started: the
+    /// file persists across runs of the same project, so without a baseline
+    /// the ceiling would compare against *lifetime* spend, not this run's.
+    baseline: f64,
 }
 
 impl Budget {
@@ -750,9 +756,14 @@ impl Budget {
                  el tope no se aplicará"
             );
         }
+        let baseline = match (&ceiling, &events_path) {
+            (Some(_), Some(path)) => sum_cost_from_events(path),
+            _ => 0.0,
+        };
         Self {
             ceiling,
             events_path,
+            baseline,
         }
     }
 
@@ -761,12 +772,12 @@ impl Budget {
         self.ceiling.is_some() && self.events_path.is_some()
     }
 
-    /// Returns the spend when it exceeds the ceiling.
+    /// Returns this run's spend when it exceeds the ceiling.
     #[must_use]
     pub fn exceeded(&self) -> Option<f64> {
         let ceiling = self.ceiling?;
         let path = self.events_path.as_ref()?;
-        let spent = sum_cost_from_events(path);
+        let spent = (sum_cost_from_events(path) - self.baseline).max(0.0);
         (spent > ceiling).then_some(spent)
     }
 }
@@ -944,9 +955,25 @@ fn supervise_delivery(
             delivery.status,
         ),
     )?;
-    let verdict: SupervisionVerdict = extract_json(&supervisor.report)
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
+    let Some(verdict) = extract_json(&supervisor.report)
+        .and_then(|value| serde_json::from_value::<SupervisionVerdict>(value).ok())
+    else {
+        // An unreadable verdict must not pass as "no issues": that would
+        // silently neutralize the review gate.
+        workflow.phase(&format!(
+            "  supervisor de {}: veredicto ilegible — se registra como issue",
+            task.id
+        ));
+        append_file(
+            supervision_md,
+            &format!(
+                "\n## Task {} — {}\n\n- Status: {}\n- Approved: false\n\
+                 - Summary: unreadable supervisor verdict (JSON missing/invalid)\n",
+                task.id, task.module, delivery.status
+            ),
+        )?;
+        return Ok(1);
+    };
 
     // Registro a registro: append the verdict to SUPERVISION.md.
     let mut entry = format!(
@@ -1010,8 +1037,18 @@ fn run_single(
     )?;
     let mut results = wait_all(vec![handle], options.agent_timeout, |_| {});
     let result = results.pop().ok_or("agent produced no result")?;
-    if result.status == "timeout" {
-        return Err(format!("{} timed out", role.title()));
+    // "failed" must not flow downstream as a report: a provider error or
+    // agent panic would otherwise be saved/parsed as a real deliverable.
+    if !result.succeeded() {
+        return Err(format!(
+            "{} {}: {}",
+            role.title(),
+            result.status,
+            result
+                .error
+                .clone()
+                .unwrap_or_else(|| "no error detail".to_string())
+        ));
     }
     Ok(result)
 }
@@ -1158,12 +1195,19 @@ fn parse_backlog(report: &str) -> Result<Vec<TaskSpec>, String> {
 }
 
 /// Structural sanity checks on the backlog before spending developer runs.
+/// Also rejects broken dependency graphs (duplicates, unknown/self deps,
+/// cycles): `schedule_waves` degrades instead of hanging on them, but they
+/// always indicate a Subdirector error worth a repair round.
 fn validate_backlog(tasks: &[TaskSpec]) -> Result<(), String> {
     let mut issues = Vec::new();
     if tasks.is_empty() {
         issues.push("the backlog is empty".to_string());
     }
+    let mut seen_ids = BTreeSet::new();
     for task in tasks {
+        if !seen_ids.insert(task.id.as_str()) {
+            issues.push(format!("{}: duplicate task id", task.id));
+        }
         if task.files_to_create.is_empty() && task.files_to_modify.is_empty() {
             issues.push(format!(
                 "{}: no files to create or modify (orphan task)",
@@ -1180,11 +1224,64 @@ fn validate_backlog(tasks: &[TaskSpec]) -> Result<(), String> {
                 task.files_to_create.len() + task.files_to_modify.len()
             ));
         }
+        for dep_id in &task.depends_on {
+            if dep_id == &task.id {
+                issues.push(format!("{}: depends on itself", task.id));
+            } else if !tasks.iter().any(|t| &t.id == dep_id) {
+                issues.push(format!(
+                    "{}: depends on unknown task \"{dep_id}\" (typo or missing task)",
+                    task.id
+                ));
+            }
+        }
+    }
+    if let Some(cycle_id) = find_dependency_cycle(tasks) {
+        issues.push(format!(
+            "dependency cycle involving \"{cycle_id}\" — depends_on must form a DAG"
+        ));
     }
     if !issues.is_empty() {
         return Err(format!("Backlog validation failed:\n{}", issues.join("\n")));
     }
     Ok(())
+}
+
+/// Kahn's algorithm: returns a task id inside a `depends_on` cycle, if any.
+/// Self-dependencies and unknown ids are excluded (flagged separately) and
+/// duplicate edges/ids are tolerated without underflow.
+fn find_dependency_cycle(tasks: &[TaskSpec]) -> Option<String> {
+    let exists = |id: &str| tasks.iter().any(|t| t.id == id);
+    let mut in_degree = vec![0_usize; tasks.len()];
+    for (index, task) in tasks.iter().enumerate() {
+        for dep_id in &task.depends_on {
+            if dep_id != &task.id && exists(dep_id) {
+                in_degree[index] += 1;
+            }
+        }
+    }
+    let mut queue: Vec<usize> = (0..tasks.len()).filter(|&i| in_degree[i] == 0).collect();
+    let mut visited = 0_usize;
+    while let Some(done) = queue.pop() {
+        visited += 1;
+        for (index, task) in tasks.iter().enumerate() {
+            for dep_id in &task.depends_on {
+                if dep_id == &tasks[done].id && dep_id != &task.id && in_degree[index] > 0 {
+                    in_degree[index] -= 1;
+                    if in_degree[index] == 0 {
+                        queue.push(index);
+                    }
+                }
+            }
+        }
+    }
+    if visited >= tasks.len() {
+        return None;
+    }
+    in_degree
+        .iter()
+        .enumerate()
+        .find(|(_, degree)| **degree > 0)
+        .map(|(index, _)| tasks[index].id.clone())
 }
 
 fn run_tests_for_qa(project_dir: &Path, build_cmd: &Option<String>) -> Result<String, String> {
@@ -1341,9 +1438,42 @@ mod tests {
         let budget = Budget {
             ceiling: None,
             events_path: Some(PathBuf::from("/nonexistent")),
+            baseline: 0.0,
         };
         assert!(!budget.enabled());
         assert!(budget.exceeded().is_none());
+    }
+
+    #[test]
+    fn budget_ignores_spend_from_previous_runs() {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-baseline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let events = dir.join("events.jsonl");
+        let event = |cost: f64| {
+            format!(
+                r#"{{"type":"session_trace","session_id":"x","sequence":0,"name":"analytics","timestamp_ms":1,"attributes":{{"namespace":"api","action":"message_usage","estimated_cost_usd_value":{cost}}}}}"#
+            )
+        };
+        // 5 USD already spent by earlier runs before this Budget exists.
+        std::fs::write(&events, format!("{}\n", event(5.0))).expect("events");
+        let budget = Budget {
+            ceiling: Some(1.0),
+            events_path: Some(events.clone()),
+            baseline: sum_cost_from_events(&events),
+        };
+        assert!(budget.exceeded().is_none(), "old spend must not count");
+        // This run spends 1.5 USD → over the 1.0 ceiling.
+        let mut content = std::fs::read_to_string(&events).expect("read");
+        content.push_str(&format!("{}\n", event(1.5)));
+        std::fs::write(&events, content).expect("append");
+        assert!(budget.exceeded().is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

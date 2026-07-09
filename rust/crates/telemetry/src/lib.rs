@@ -302,8 +302,21 @@ impl TelemetrySink for JsonlTelemetrySink {
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = file.write_all(line.as_bytes());
-        let _ = file.flush();
+        let outcome = file.write_all(line.as_bytes()).and_then(|()| file.flush());
+        if let Err(error) = outcome {
+            // Telemetry must never break the caller, but a persistent write
+            // failure (disk full, revoked fd) silently freezes the dashboard
+            // and disables cost-ceiling enforcement — say so, once.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[telemetry] warning: could not append to {}: {error}; \
+                     further telemetry may be lost (this warning prints once)",
+                    self.path.display()
+                );
+            }
+        }
     }
 }
 

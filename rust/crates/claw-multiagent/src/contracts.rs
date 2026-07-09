@@ -188,26 +188,33 @@ impl TaskSpec {
 pub fn schedule_waves(tasks: &[TaskSpec]) -> Vec<Vec<usize>> {
     let mut assigned_wave: Vec<u32> = tasks.iter().map(|task| task.wave).collect();
 
-    // Dependencies force later waves.
-    let mut moved = true;
-    while moved {
-        moved = false;
+    // Both constraints interact: deferring a file-conflicting task can land
+    // it in the same wave as one of its dependents, so iterate the two
+    // passes together until a fixpoint. The pass count is bounded because a
+    // dependency cycle in LLM-produced `depends_on` would otherwise loop
+    // forever (each pass keeps bumping waves); backlogs with cycles are
+    // rejected upstream by the orchestrator's validation, so hitting the
+    // bound here only means degraded (but terminating) scheduling.
+    let max_passes = 2 * tasks.len() * tasks.len() + 2;
+    for _ in 0..max_passes {
+        let mut changed = false;
+
+        // Dependencies force later waves.
         for (index, task) in tasks.iter().enumerate() {
             for dep_id in &task.depends_on {
+                if *dep_id == task.id {
+                    continue; // self-dependency: unsatisfiable, skip
+                }
                 if let Some(dep_index) = tasks.iter().position(|t| &t.id == dep_id) {
                     if assigned_wave[index] <= assigned_wave[dep_index] {
-                        assigned_wave[index] = assigned_wave[dep_index] + 1;
-                        moved = true;
+                        assigned_wave[index] = assigned_wave[dep_index].saturating_add(1);
+                        changed = true;
                     }
                 }
             }
         }
-    }
 
-    // Same-wave file conflicts: defer the lower-priority task.
-    let mut conflict = true;
-    while conflict {
-        conflict = false;
+        // Same-wave file conflicts: defer the lower-priority task.
         for a in 0..tasks.len() {
             for b in (a + 1)..tasks.len() {
                 if assigned_wave[a] != assigned_wave[b] {
@@ -221,10 +228,14 @@ pub fn schedule_waves(tasks: &[TaskSpec]) -> Vec<Vec<usize>> {
                     } else {
                         a
                     };
-                    assigned_wave[defer] += 1;
-                    conflict = true;
+                    assigned_wave[defer] = assigned_wave[defer].saturating_add(1);
+                    changed = true;
                 }
             }
+        }
+
+        if !changed {
+            break;
         }
     }
 

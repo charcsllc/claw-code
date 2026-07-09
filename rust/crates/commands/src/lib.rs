@@ -5077,11 +5077,46 @@ fn parse_key_value_pair(raw: &str, flag: &str) -> Result<(String, String), Strin
         .ok_or_else(|| format!("{flag} expects KEY=VALUE, got '{raw}'"))
 }
 
+/// Shell-like tokenizer: splits on whitespace but keeps single- or
+/// double-quoted segments together and strips the quotes, so
+/// `--env TOKEN="a b"` reaches the config as one intact value instead of
+/// being split into `TOKEN="a` plus a stray `b"` argument.
+fn tokenize_mcp_args(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut in_token = false;
+    for ch in raw.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                in_token = true;
+            }
+            None if ch.is_whitespace() => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Parses and applies `mcp add`. Errors are user-facing messages.
 fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
-    let tokens: Vec<&str> = rest.split_whitespace().collect();
-    let mut name: Option<&str> = None;
-    let mut positionals: Vec<&str> = Vec::new();
+    let tokens: Vec<String> = tokenize_mcp_args(rest);
+    let mut name: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
     let mut scope: &'static str = "local";
     let mut env_pairs: Vec<(String, String)> = Vec::new();
     let mut header_pairs: Vec<(String, String)> = Vec::new();
@@ -5090,24 +5125,24 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
 
     let mut index = 0;
     while index < tokens.len() {
-        let token = tokens[index];
+        let token = tokens[index].as_str();
         match token {
             "--" => {
                 // Everything after `--` is the literal command line.
-                positionals.extend(&tokens[index + 1..]);
+                positionals.extend(tokens[index + 1..].iter().cloned());
                 break;
             }
             "--force" => force = true,
             "--sse" => sse = true,
             "--scope" => {
                 index += 1;
-                scope = match tokens.get(index) {
-                    Some(&"local") => "local",
-                    Some(&"project") => "project",
+                scope = match tokens.get(index).map(String::as_str) {
+                    Some("local") => "local",
+                    Some("project") => "project",
                     other => {
                         return Err(format!(
                             "--scope expects 'local' or 'project', got '{}'",
-                            other.copied().unwrap_or("<missing>")
+                            other.unwrap_or("<missing>")
                         ))
                     }
                 };
@@ -5129,20 +5164,22 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
             flag if flag.starts_with("--") && name.is_none() => {
                 return Err(format!("unknown option '{flag}' before the server name"));
             }
-            _ if name.is_none() => name = Some(token),
-            _ => positionals.push(token),
+            _ if name.is_none() => name = Some(token.to_string()),
+            _ => positionals.push(token.to_string()),
         }
         index += 1;
     }
 
     let name = name.ok_or_else(|| "missing server name".to_string())?;
+    let name = name.as_str();
     if !valid_mcp_server_name(name) {
         return Err(format!(
             "invalid server name '{name}' (allowed: letters, digits, '-', '_', '.')"
         ));
     }
-    let first = *positionals
+    let first = positionals
         .first()
+        .cloned()
         .ok_or_else(|| "missing command or URL after the server name".to_string())?;
 
     // URL positional → remote server; anything else → stdio command line.
@@ -5199,6 +5236,20 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
+    // Snapshot which names are already invalid before we touch anything:
+    // `invalid_servers()` spans every settings file, so a pre-existing
+    // invalid entry with this name (e.g. in the project file) must not be
+    // blamed on — and roll back — a perfectly valid add in another scope.
+    let invalid_before: bool = ConfigLoader::default_for(cwd)
+        .load()
+        .map(|runtime_config| {
+            runtime_config
+                .mcp()
+                .invalid_servers()
+                .iter()
+                .any(|invalid| invalid.name == name)
+        })
+        .unwrap_or(false);
     let mut root: Value = match &original {
         Some(content) if !content.trim().is_empty() => serde_json::from_str(content)
             .map_err(|error| {
@@ -5240,15 +5291,23 @@ fn apply_mcp_add(cwd: &Path, rest: &str) -> Result<McpAddOutcome, String> {
         .map_err(|error| format!("could not write {}: {error}", path.display()))?;
 
     // Safety net: reload the full config; if the new entry does not validate,
-    // restore the file exactly as it was and report why.
+    // restore the file exactly as it was and report why. Names that were
+    // already invalid before this write are skipped — that invalidity lives
+    // in another file and is not caused by this add.
     let loader = ConfigLoader::default_for(cwd);
     let validation_error = match loader.load() {
-        Ok(runtime_config) => runtime_config
-            .mcp()
-            .invalid_servers()
-            .iter()
-            .find(|invalid| invalid.name == name)
-            .map(|invalid| format!("{} ({})", invalid.reason, invalid.error_field)),
+        Ok(runtime_config) => {
+            if invalid_before {
+                None
+            } else {
+                runtime_config
+                    .mcp()
+                    .invalid_servers()
+                    .iter()
+                    .find(|invalid| invalid.name == name)
+                    .map(|invalid| format!("{} ({})", invalid.reason, invalid.error_field))
+            }
+        }
         Err(error) => Some(error.to_string()),
     };
     if let Some(reason) = validation_error {
@@ -5882,14 +5941,15 @@ pub fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_skills_slash_command, handle_agents_slash_command_json,
+        apply_mcp_add, classify_skills_slash_command, handle_agents_slash_command_json,
         handle_plugins_slash_command, handle_skills_slash_command_json, handle_slash_command,
         load_agents_from_roots, load_skills_from_roots, render_agents_report,
         render_agents_report_json, render_mcp_report_json_for, render_plugins_report,
         render_plugins_report_with_failures, render_skills_report, render_slash_command_help,
         render_slash_command_help_detail, resolve_skill_path, resume_supported_slash_commands,
-        slash_command_specs, suggest_slash_commands, validate_slash_command_input, AgentCollection,
-        DefinitionSource, SkillOrigin, SkillRoot, SkillSlashDispatch, SlashCommand,
+        slash_command_specs, suggest_slash_commands, tokenize_mcp_args,
+        validate_slash_command_input, AgentCollection, DefinitionSource, SkillOrigin, SkillRoot,
+        SkillSlashDispatch, SlashCommand,
     };
     use plugins::{
         PluginError, PluginKind, PluginLifecycle, PluginLoadFailure, PluginManager,
@@ -7848,5 +7908,39 @@ mod tests {
 
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(bundled_root);
+    }
+
+    #[test]
+    fn mcp_tokenizer_preserves_quoted_values() {
+        assert_eq!(
+            tokenize_mcp_args(r#"gh npx -y srv --env TOKEN="a b""#),
+            vec!["gh", "npx", "-y", "srv", "--env", "TOKEN=a b"]
+        );
+        assert_eq!(
+            tokenize_mcp_args("api 'my command' plain"),
+            vec!["api", "my command", "plain"]
+        );
+        // Empty quoted value survives as an empty-value pair.
+        assert_eq!(tokenize_mcp_args(r#"--env KEY="""#), vec!["--env", "KEY="]);
+        // Unbalanced quote: lenient, rest of the line is one token.
+        assert_eq!(tokenize_mcp_args(r#"a "b c"#), vec!["a", "b c"]);
+        assert!(tokenize_mcp_args("   ").is_empty());
+    }
+
+    #[test]
+    fn mcp_add_stores_quoted_env_value_intact() {
+        let cwd = temp_dir("mcp-quoted-env");
+        let outcome =
+            apply_mcp_add(&cwd, r#"srv npx -y pkg --env TOKEN="a b""#).expect("add should succeed");
+        assert_eq!(outcome.name, "srv");
+        let raw = fs::read_to_string(cwd.join(".claw").join("settings.local.json"))
+            .expect("settings written");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        let server = &parsed["mcpServers"]["srv"];
+        assert_eq!(server["env"]["TOKEN"], "a b");
+        // The stray-token corruption would have left `b"` in args.
+        let args: Vec<String> = serde_json::from_value(server["args"].clone()).expect("args array");
+        assert_eq!(args, vec!["-y", "pkg"]);
+        let _ = fs::remove_dir_all(cwd);
     }
 }

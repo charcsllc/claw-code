@@ -100,10 +100,13 @@ fn async_stream(state: AppState) -> impl Stream<Item = Result<Event, Infallible>
 }
 
 /// Polls the events file, feeding appended lines to the aggregator. Handles
-/// the file not existing yet (waits) and truncation (resets and re-reads).
+/// the file not existing yet (waits), truncation, and rename-replacement
+/// (resets and re-reads).
 pub async fn tail_events(path: PathBuf, aggregator: Arc<Mutex<Aggregator>>) {
     let mut offset: u64 = 0;
-    let mut partial_line = String::new();
+    let mut partial: Vec<u8> = Vec::new();
+    #[cfg(unix)]
+    let mut file_identity: Option<(u64, u64)> = None;
     let mut interval = tokio::time::interval(TAIL_INTERVAL);
 
     loop {
@@ -112,11 +115,23 @@ pub async fn tail_events(path: PathBuf, aggregator: Arc<Mutex<Aggregator>>) {
         let Ok(metadata) = std::fs::metadata(&path) else {
             continue;
         };
+        let mut reset = false;
+        #[cfg(unix)]
+        {
+            // Length-only detection misses a rename-replace with an
+            // equal-or-longer file; the (device, inode) pair does not.
+            use std::os::unix::fs::MetadataExt;
+            let identity = (metadata.dev(), metadata.ino());
+            if file_identity != Some(identity) {
+                reset = file_identity.is_some();
+                file_identity = Some(identity);
+            }
+        }
         let length = metadata.len();
-        if length < offset {
+        if length < offset || reset {
             // Truncated or replaced: start over.
             offset = 0;
-            partial_line.clear();
+            partial.clear();
             aggregator
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -132,20 +147,35 @@ pub async fn tail_events(path: PathBuf, aggregator: Arc<Mutex<Aggregator>>) {
         if file.seek(SeekFrom::Start(offset)).is_err() {
             continue;
         }
-        let mut chunk = String::new();
-        let Ok(read) = file.read_to_string(&mut chunk) else {
-            // Partial UTF-8 at the tail; retry on the next tick.
+        // Raw bytes, not `read_to_string`: one invalid UTF-8 byte (e.g. a
+        // writer killed mid-append) would otherwise fail the read forever
+        // without ever advancing the offset, silently freezing the tail.
+        let mut chunk = Vec::new();
+        let Ok(read) = file.read_to_end(&mut chunk) else {
             continue;
         };
+        if read == 0 {
+            continue;
+        }
         offset += read as u64;
+        partial.extend_from_slice(&chunk);
 
-        partial_line.push_str(&chunk);
+        // Consume only up to the last newline: the remainder may be a line
+        // still being appended (possibly splitting a multi-byte character),
+        // so it stays buffered for the next tick.
+        let Some(last_newline) = partial.iter().rposition(|&byte| byte == b'\n') else {
+            continue;
+        };
+        let complete: Vec<u8> = partial.drain(..=last_newline).collect();
+        let text = String::from_utf8_lossy(&complete);
+        // Single pass over the drained buffer (the previous per-line
+        // `drain(..=newline)` memmoved the tail once per line — quadratic on
+        // large histories) and one lock scope per tick.
         let mut aggregator = aggregator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some(newline) = partial_line.find('\n') {
-            let line: String = partial_line.drain(..=newline).collect();
-            aggregator.ingest_line(&line);
+        for line in text.lines() {
+            aggregator.ingest_line(line);
         }
     }
 }

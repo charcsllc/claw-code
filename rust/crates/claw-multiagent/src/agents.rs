@@ -88,13 +88,29 @@ fn read_status(handle: &AgentHandle) -> (String, Option<String>) {
     (status, error)
 }
 
+/// The Agent tool's output file echoes the full prompt (`## Prompt`) before
+/// appending the terminal sections; everything before the last
+/// `### Final response` marker is the echo, not the agent's answer. Parsing
+/// the whole file would extract JSON embedded in the prompt (e.g. the plan
+/// fed to the Subdirector) instead of the response.
+fn response_section(full_output: &str) -> &str {
+    const MARKER: &str = "### Final response";
+    full_output
+        .rfind(MARKER)
+        .map_or(full_output, |index| &full_output[index + MARKER.len()..])
+}
+
+fn read_report(handle: &AgentHandle) -> String {
+    let full = std::fs::read_to_string(&handle.output_file).unwrap_or_default();
+    response_section(&full).trim().to_string()
+}
+
 fn collect_result(handle: &AgentHandle) -> AgentResult {
     let (status, error) = read_status(handle);
-    let report = std::fs::read_to_string(&handle.output_file).unwrap_or_default();
     AgentResult {
         name: handle.name.clone(),
         status,
-        report,
+        report: read_report(handle),
         error,
     }
 }
@@ -132,7 +148,7 @@ pub fn wait_all(
                 let result = AgentResult {
                     name: handle.name.clone(),
                     status: "timeout".to_string(),
-                    report: std::fs::read_to_string(&handle.output_file).unwrap_or_default(),
+                    report: read_report(&handle),
                     error: Some(format!("agent timed out after {}s", timeout.as_secs())),
                 };
                 on_complete(&result);
@@ -186,6 +202,18 @@ mod tests {
     #[test]
     fn extract_json_returns_none_without_object() {
         assert!(extract_json("no json here").is_none());
+    }
+
+    #[test]
+    fn response_section_skips_the_prompt_echo() {
+        let output = "# Agent Task\n\n## Prompt\n\nPlan:\n```json\n{\"from\": \"prompt\"}\n```\n\
+                      \n## Result\n\n- status: completed\n\n### Final response\n\n\
+                      Done.\n```json\n{\"from\": \"response\"}\n```\n";
+        let value = extract_json(response_section(output)).expect("response json");
+        assert_eq!(value["from"], "response");
+        // Files without the marker (e.g. a crash before the terminal append)
+        // fall back to the full content.
+        assert_eq!(response_section("raw text"), "raw text");
     }
 
     #[test]
