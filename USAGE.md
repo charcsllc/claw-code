@@ -1,41 +1,41 @@
-# Claw Code Usage
+# Uso de Claw Code
 
-This guide covers the current Rust workspace under `rust/` and the `claw` CLI binary. If you are brand new, make the doctor health check your first run: start `claw`, then run `/doctor`.
+Esta guía cubre el workspace de Rust actual bajo `rust/` y el binario CLI `claw`. Si acabas de llegar, haz que la comprobación de salud del doctor sea tu primera ejecución: inicia `claw` y luego ejecuta `/doctor`.
 
-## Quick-start health check
+## Comprobación rápida de salud
 
-Run this before prompts, sessions, or automation:
+Ejecuta esto antes de prompts, sesiones o automatización:
 
 ```bash
 cd rust
 cargo build --workspace
 ./target/debug/claw
-# first command inside the REPL
+# primer comando dentro del REPL
 /doctor
 ```
 
-`/doctor` is the built-in setup and preflight diagnostic. Once you have a saved session, you can rerun it with `./target/debug/claw --resume latest /doctor`.
+`/doctor` es el diagnóstico integrado de configuración y verificación previa. Una vez que tengas una sesión guardada, puedes volver a ejecutarlo con `./target/debug/claw --resume latest /doctor`.
 
-## Prerequisites
+## Requisitos previos
 
-- Rust toolchain with `cargo`
-- One of:
-  - `ANTHROPIC_API_KEY` for direct API access
-  - `ANTHROPIC_AUTH_TOKEN` for bearer-token auth
-- Optional: `ANTHROPIC_BASE_URL` when targeting a proxy or local service
+- Toolchain de Rust con `cargo`
+- Una de estas opciones:
+  - `ANTHROPIC_API_KEY` para acceso directo a la API
+  - `ANTHROPIC_AUTH_TOKEN` para autenticación con token bearer
+- Opcional: `ANTHROPIC_BASE_URL` cuando apuntes a un proxy o a un servicio local
 
-## Install / build the workspace
+## Instalar / compilar el workspace
 
 ```bash
 cd rust
 cargo build --workspace
 ```
 
-The CLI binary is available at `rust/target/debug/claw` after a debug build (`rust\target\debug\claw.exe` on Windows). Make the doctor check above your first post-build step. For PowerShell-first install, release ZIP, PATH, provider-switching, and Windows/WSL notification examples, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
+El binario CLI queda disponible en `rust/target/debug/claw` tras un build de debug (`rust\target\debug\claw.exe` en Windows). Haz que la comprobación del doctor de arriba sea tu primer paso tras el build. Para la instalación orientada a PowerShell, el ZIP de release, el PATH, el cambio de proveedor y ejemplos de notificaciones en Windows/WSL, consulta [`docs/windows-install-release.md`](./docs/windows-install-release.md).
 
-## Quick start
+## Inicio rápido
 
-### First-run doctor check
+### Comprobación del doctor en la primera ejecución
 
 ```bash
 cd rust
@@ -43,93 +43,93 @@ cd rust
 /doctor
 ```
 
-Or run doctor directly with JSON output for scripting:
+O ejecuta doctor directamente con salida JSON para scripting:
 
 ```bash
 cd rust
 ./target/debug/claw doctor --output-format json
 ```
 
-**Note:** Diagnostic verbs (`doctor`, `status`, `sandbox`, `version`) support `--output-format json` for machine-readable output. Invalid suffix arguments (e.g., `--json`) are now rejected at parse time rather than falling through to prompt dispatch.
-`version --output-format json` reports structured build provenance including full `git_sha`, derived `git_sha_short`, `is_dirty`, `branch`, `commit_date`, `commit_timestamp`, `rustc_version`, runtime `executable_path`, and `binary_provenance`; JSON keeps the prose report in `human_readable` instead of duplicating it under `message`. `status --output-format json` exposes `workspace.memory_files[]` with `path`, `source`, `origin`, `scope_path`, `outside_project`, `chars`, and `contributes` for every loaded project memory file.
+**Nota:** Los verbos de diagnóstico (`doctor`, `status`, `sandbox`, `version`) admiten `--output-format json` para salida legible por máquina. Los argumentos de sufijo inválidos (p. ej., `--json`) ahora se rechazan en tiempo de parseo en lugar de colarse en el despacho de prompts.
+`version --output-format json` informa de la procedencia estructurada del build, incluyendo el `git_sha` completo, el `git_sha_short` derivado, `is_dirty`, `branch`, `commit_date`, `commit_timestamp`, `rustc_version`, el `executable_path` en tiempo de ejecución y `binary_provenance`; el JSON mantiene el informe en prosa en `human_readable` en lugar de duplicarlo bajo `message`. `status --output-format json` expone `workspace.memory_files[]` con `path`, `source`, `origin`, `scope_path`, `outside_project`, `chars` y `contributes` para cada archivo de memoria de proyecto cargado.
 
-### Initialize a repository
+### Inicializar un repositorio
 
-Set up a new repository with `.claw/settings.json`, `.claw.json`, `.gitignore` entries, and a `CLAUDE.md` guidance file:
+Configura un repositorio nuevo con `.claw/settings.json`, `.claw.json`, entradas de `.gitignore` y un archivo de guía `CLAUDE.md`:
 
 ```bash
 cd /path/to/your/repo
 ./target/debug/claw init
 ```
 
-Text mode (human-readable) shows artifact creation summary with project path and next steps. Idempotent — running multiple times in the same repo marks already-created files as "skipped", reports `.claw/` as "partial" when missing sub-files are materialized, and keeps `.claw/sessions/` deferred until the first successful session save.
+El modo texto (legible por humanos) muestra un resumen de la creación de artefactos con la ruta del proyecto y los siguientes pasos. Es idempotente: ejecutarlo varias veces en el mismo repo marca los archivos ya creados como "skipped", informa de `.claw/` como "partial" cuando se materializan sub-archivos que faltaban, y mantiene `.claw/sessions/` en diferido hasta el primer guardado de sesión exitoso.
 
-JSON mode for scripting:
+Modo JSON para scripting:
 ```bash
 ./target/debug/claw init --output-format json
 ```
 
-Returns structured output with `project_path`, `created[]`, `updated[]`, `partial[]`, `deferred[]`, and `skipped[]` arrays (one per artifact status), and `artifacts[]` carrying each file's `name` and machine-stable `status` tag. The legacy `message` field preserves backward compatibility.
+Devuelve una salida estructurada con los arrays `project_path`, `created[]`, `updated[]`, `partial[]`, `deferred[]` y `skipped[]` (uno por estado de artefacto), y `artifacts[]` que lleva el `name` de cada archivo y su etiqueta `status` estable para máquinas. El campo legado `message` conserva la compatibilidad hacia atrás.
 
-**Why structured fields matter:** Claws can detect per-artifact state (`created`, `updated`, `partial`, `deferred`, or `skipped`) without substring-matching human prose. Use the status arrays for conditional follow-up logic (e.g., only commit if files were actually created, not just updated).
+**Por qué importan los campos estructurados:** los claws pueden detectar el estado por artefacto (`created`, `updated`, `partial`, `deferred` o `skipped`) sin hacer matching de subcadenas sobre prosa humana. Usa los arrays de estado para lógica condicional posterior (p. ej., hacer commit solo si los archivos se crearon realmente, no si solo se actualizaron).
 
-### Interactive REPL
+### REPL interactivo
 
 ```bash
 cd rust
 ./target/debug/claw
 ```
 
-### One-shot prompt
+### Prompt de una sola ejecución
 
 ```bash
 cd rust
 ./target/debug/claw prompt "summarize this repository"
 ```
 
-Pipe prompt text through stdin when automation already produces the prompt body:
+Envía el texto del prompt por stdin cuando la automatización ya produce el cuerpo del prompt:
 
 ```bash
 printf 'summarize this repository\n' | ./target/debug/claw prompt --output-format json
 ```
 
-### Shorthand prompt mode
+### Modo de prompt abreviado
 
 ```bash
 cd rust
 ./target/debug/claw "explain rust/crates/runtime/src/lib.rs"
 ```
 
-Use the POSIX `--` end-of-flags separator when the shorthand prompt itself begins with `-` or `--`:
+Usa el separador POSIX `--` de fin de flags cuando el propio prompt abreviado empiece con `-` o `--`:
 
 ```bash
 ./target/debug/claw -- "-summarize this dash-prefixed text"
 ```
 
-### JSON output for scripting
+### Salida JSON para scripting
 
 ```bash
 cd rust
 ./target/debug/claw --output-format json prompt "status"
 ```
 
-### Inspect worker state
+### Inspeccionar el estado del worker
 
-The `claw state` command reads `.claw/worker-state.json`, which is written by the interactive REPL or a one-shot prompt when a worker executes a task. This file contains the worker ID, session reference, model, and permission mode.
+El comando `claw state` lee `.claw/worker-state.json`, que es escrito por el REPL interactivo o por un prompt de una sola ejecución cuando un worker ejecuta una tarea. Este archivo contiene el ID del worker, la referencia de sesión, el modelo y el modo de permisos.
 
-Prerequisite: You must run `claw` (interactive REPL) or `claw prompt <text>` at least once in the repository to produce the worker state file.
+Requisito previo: debes ejecutar `claw` (REPL interactivo) o `claw prompt <text>` al menos una vez en el repositorio para producir el archivo de estado del worker.
 
 ```bash
 cd rust
 ./target/debug/claw state
 ```
 
-JSON mode:
+Modo JSON:
 ```bash
 ./target/debug/claw state --output-format json
 ```
 
-If you run `claw state` before any worker has executed, you will see a helpful error:
+Si ejecutas `claw state` antes de que ningún worker se haya ejecutado, verás un error orientativo:
 ```
 error: no worker state file found at .claw/worker-state.json
   Hint: worker state is written by the interactive REPL or a non-interactive prompt.
@@ -138,61 +138,61 @@ error: no worker state file found at .claw/worker-state.json
   Then rerun: claw state [--output-format json]
 ```
 
-## Advanced slash commands (Interactive REPL only)
+## Comandos slash avanzados (solo REPL interactivo)
 
-These commands are available inside the interactive REPL (`claw` with no args). They extend the assistant with workspace analysis, planning, and navigation features.
+Estos comandos están disponibles dentro del REPL interactivo (`claw` sin argumentos). Extienden el asistente con funciones de análisis del workspace, planificación y navegación.
 
-### `/ultraplan` — Deep planning with multi-step reasoning
+### `/ultraplan` — Planificación profunda con razonamiento en varios pasos
 
-**Purpose:** Break down a complex task into steps using extended reasoning.
+**Propósito:** descomponer una tarea compleja en pasos usando razonamiento extendido.
 
 ```bash
-# Start the REPL
+# Iniciar el REPL
 claw
 
-# Inside the REPL
+# Dentro del REPL
 /ultraplan refactor the auth module to use async/await
 /ultraplan design a caching layer for database queries
 /ultraplan analyze this module for performance bottlenecks
 ```
 
-Output: A structured plan with numbered steps, reasoning for each step, and expected outcomes. Use this when you want the assistant to think through a problem in detail before coding.
+Salida: un plan estructurado con pasos numerados, el razonamiento de cada paso y los resultados esperados. Úsalo cuando quieras que el asistente piense un problema en detalle antes de programar.
 
-### `/teleport` — Jump to a file or symbol
+### `/teleport` — Saltar a un archivo o símbolo
 
-**Purpose:** Quickly navigate to a file, function, class, or struct by name.
+**Propósito:** navegar rápidamente a un archivo, función, clase o struct por nombre.
 
 ```bash
-# Jump to a symbol
+# Saltar a un símbolo
 /teleport UserService
 /teleport authenticate_user
 /teleport RequestHandler
 
-# Jump to a file
+# Saltar a un archivo
 /teleport src/auth.rs
 /teleport crates/runtime/lib.rs
 /teleport ./ARCHITECTURE.md
 ```
 
-Output: The file content, with the requested symbol highlighted or the file fully loaded. Useful for exploring the codebase without manually navigating directories. If multiple matches exist, the assistant shows the top candidates.
+Salida: el contenido del archivo, con el símbolo solicitado resaltado o el archivo cargado por completo. Útil para explorar el código sin navegar manualmente por directorios. Si hay varias coincidencias, el asistente muestra los mejores candidatos.
 
-### `/bughunter` — Scan for likely bugs and issues
+### `/bughunter` — Buscar bugs y problemas probables
 
-**Purpose:** Analyze code for common pitfalls, anti-patterns, and potential bugs.
+**Propósito:** analizar el código en busca de errores comunes, antipatrones y bugs potenciales.
 
 ```bash
-# Scan the entire workspace
+# Analizar todo el workspace
 /bughunter
 
-# Scan a specific directory or file
+# Analizar un directorio o archivo concreto
 /bughunter src/handlers
 /bughunter rust/crates/runtime
 /bughunter src/auth.rs
 ```
 
-Output: A list of suspicious patterns with explanations (e.g., "unchecked unwrap()", "potential race condition", "missing error handling"). Each finding includes the file, line number, and suggested fix. Use this as a first pass before a full code review.
+Salida: una lista de patrones sospechosos con explicaciones (p. ej., "unwrap() sin comprobar", "posible condición de carrera", "falta gestión de errores"). Cada hallazgo incluye el archivo, el número de línea y una corrección sugerida. Úsalo como primera pasada antes de una revisión de código completa.
 
-## Model and permission controls
+## Controles de modelo y permisos
 
 ```bash
 cd rust
@@ -203,27 +203,27 @@ cd rust
 ./target/debug/claw --cwd ../other-workspace status --output-format json
 ```
 
-Global workspace override flags: `--cwd PATH`, `-C PATH`, and `--directory PATH` are accepted before any subcommand. They are validated before command dispatch and take precedence over the process `$PWD`; invalid paths return typed `invalid_cwd` JSON errors in JSON mode.
+Flags globales de sobrescritura del workspace: `--cwd PATH`, `-C PATH` y `--directory PATH` se aceptan antes de cualquier subcomando. Se validan antes del despacho del comando y tienen prioridad sobre el `$PWD` del proceso; las rutas inválidas devuelven errores JSON tipados `invalid_cwd` en modo JSON.
 
-`--allowedTools` accepts canonical snake_case tool names (for example `read_file`, `glob_search`, `web_fetch`) plus documented aliases such as `read`, `glob`, `Read`, and `WebFetch`. `claw status --output-format json` exposes `allowed_tools.available` and `allowed_tools.aliases`, and invalid values return typed `invalid_tool_name` JSON with `tool_name`, `available`, and `tool_aliases`. A missing value before a subcommand or another flag returns `missing_argument` with `argument:"--allowedTools"`.
+`--allowedTools` acepta nombres canónicos de herramientas en snake_case (por ejemplo `read_file`, `glob_search`, `web_fetch`) además de alias documentados como `read`, `glob`, `Read` y `WebFetch`. `claw status --output-format json` expone `allowed_tools.available` y `allowed_tools.aliases`, y los valores inválidos devuelven JSON tipado `invalid_tool_name` con `tool_name`, `available` y `tool_aliases`. Un valor ausente antes de un subcomando o de otro flag devuelve `missing_argument` con `argument:"--allowedTools"`.
 
-`--output-format` accepts `text` or `json` case-insensitively and normalizes to the canonical lowercase modes. `CLAW_OUTPUT_FORMAT=json` sets the default output format for scripts, while an explicit `--output-format` flag takes precedence. Repeating the flag emits a stderr warning and JSON status envelopes expose `format_source`, `format_raw`, and `format_overridden` so composed flag arrays are auditable; invalid values return typed `invalid_output_format` JSON with `value` and `expected:["text","json"]`.
+`--output-format` acepta `text` o `json` sin distinguir mayúsculas y normaliza a los modos canónicos en minúsculas. `CLAW_OUTPUT_FORMAT=json` establece el formato de salida por defecto para scripts, mientras que un flag `--output-format` explícito tiene prioridad. Repetir el flag emite una advertencia por stderr y los sobres de estado JSON exponen `format_source`, `format_raw` y `format_overridden` para que los arrays de flags compuestos sean auditables; los valores inválidos devuelven JSON tipado `invalid_output_format` con `value` y `expected:["text","json"]`.
 
-Supported permission modes (default: `workspace-write`):
+Modos de permisos admitidos (por defecto: `workspace-write`):
 
-- `read-only` allows inspection-only local tools such as file reads, glob/grep searches, local skills, and status-style reporting. It does not allow workspace mutation, network-fetch/search tools, or arbitrary command execution.
-- `workspace-write` is the safe default. It allows reads plus direct file-editing tools inside the current workspace, including write/edit/notebook/config/plan-mode updates, while still gating network-fetch/search tools, arbitrary shell execution, subagent launches, REPL subprocesses, and other full-access tools behind an explicit escalation.
-- `danger-full-access` allows every registered tool requirement, including arbitrary command execution, web fetch/search, subagent launches, subprocess REPLs, and unrestricted tool access. Select it only with an explicit `--permission-mode danger-full-access`, `--dangerously-skip-permissions`, `--skip-permissions`, env, or config opt-in.
+- `read-only` permite solo herramientas locales de inspección, como lecturas de archivos, búsquedas glob/grep, skills locales e informes de tipo status. No permite mutar el workspace, herramientas de fetch/búsqueda en red ni la ejecución arbitraria de comandos.
+- `workspace-write` es el valor por defecto seguro. Permite lecturas más herramientas de edición directa de archivos dentro del workspace actual, incluidas actualizaciones de write/edit/notebook/config/modo plan, mientras sigue condicionando a una escalada explícita las herramientas de fetch/búsqueda en red, la ejecución arbitraria de shell, el lanzamiento de subagentes, los subprocesos del REPL y otras herramientas de acceso total.
+- `danger-full-access` permite todos los requisitos de herramientas registrados, incluida la ejecución arbitraria de comandos, fetch/búsqueda web, lanzamiento de subagentes, REPLs en subproceso y acceso sin restricciones a herramientas. Selecciónalo únicamente con un opt-in explícito mediante `--permission-mode danger-full-access`, `--dangerously-skip-permissions`, `--skip-permissions`, variable de entorno o configuración.
 
-Model aliases currently supported by the CLI:
+Alias de modelo admitidos actualmente por el CLI:
 
 - `opus` → `claude-opus-4-7`
 - `sonnet` → `claude-sonnet-4-6`
 - `haiku` → `claude-haiku-4-5-20251213`
 
-## Authentication
+## Autenticación
 
-### API key
+### Clave de API
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -236,54 +236,54 @@ cd rust
 export ANTHROPIC_AUTH_TOKEN="anthropic-oauth-or-proxy-bearer-token"
 ```
 
-### Which env var goes where
+### Qué variable de entorno va en cada sitio
 
-`claw` accepts two Anthropic credential env vars and they are **not interchangeable** — the HTTP header Anthropic expects differs per credential shape. Putting the wrong value in the wrong slot is the most common 401 we see.
+`claw` acepta dos variables de entorno de credenciales de Anthropic y **no son intercambiables**: la cabecera HTTP que Anthropic espera difiere según la forma de la credencial. Poner el valor incorrecto en la ranura incorrecta es el 401 más común que vemos.
 
-| Credential shape | Env var | HTTP header | Typical source |
+| Forma de la credencial | Variable de entorno | Cabecera HTTP | Origen típico |
 |---|---|---|---|
-| `sk-ant-*` API key | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
-| OAuth access token (opaque) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | an Anthropic-compatible proxy or OAuth flow that mints bearer tokens |
-| OpenRouter key (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
-| Ollama local instance | `OLLAMA_HOST` | no auth header (Ollama requires none) | local Ollama server at `http://127.0.0.1:11434` |
+| Clave de API `sk-ant-*` | `ANTHROPIC_API_KEY` | `x-api-key: sk-ant-...` | [console.anthropic.com](https://console.anthropic.com) |
+| Token de acceso OAuth (opaco) | `ANTHROPIC_AUTH_TOKEN` | `Authorization: Bearer ...` | un proxy compatible con Anthropic o un flujo OAuth que emite tokens bearer |
+| Clave de OpenRouter (`sk-or-v1-*`) | `OPENAI_API_KEY` + `OPENAI_BASE_URL=https://openrouter.ai/api/v1` | `Authorization: Bearer ...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| Instancia local de Ollama | `OLLAMA_HOST` | sin cabecera de autenticación (Ollama no requiere ninguna) | servidor Ollama local en `http://127.0.0.1:11434` |
 
-**Why this matters:** if you paste an `sk-ant-*` key into `ANTHROPIC_AUTH_TOKEN`, Anthropic's API will return `401 Invalid bearer token` because `sk-ant-*` keys are rejected over the Bearer header. The fix is a one-line env var swap — move the key to `ANTHROPIC_API_KEY`. Recent `claw` builds detect this exact shape (401 + `sk-ant-*` in the Bearer slot) and append a hint to the error message pointing at the fix.
+**Por qué importa:** si pegas una clave `sk-ant-*` en `ANTHROPIC_AUTH_TOKEN`, la API de Anthropic devolverá `401 Invalid bearer token` porque las claves `sk-ant-*` se rechazan sobre la cabecera Bearer. La solución es un intercambio de variable de entorno de una línea: mueve la clave a `ANTHROPIC_API_KEY`. Los builds recientes de `claw` detectan exactamente esta forma (401 + `sk-ant-*` en la ranura Bearer) y añaden al mensaje de error una pista que apunta a la solución.
 
-**If you meant a different provider:** if `claw` reports missing Anthropic credentials but you already have `OPENAI_API_KEY`, `XAI_API_KEY`, or `DASHSCOPE_API_KEY` exported, you most likely forgot to prefix the model name with the provider's routing prefix. Use `--model openai/gpt-4.1-mini` (OpenAI-compat / OpenRouter / Ollama), `--model grok` (xAI), or `--model qwen-plus` (DashScope) and the prefix router will select the right backend regardless of the ambient credentials. The error message now includes a hint that names the detected env var.
+**Si te referías a otro proveedor:** si `claw` informa de que faltan credenciales de Anthropic pero ya tienes exportadas `OPENAI_API_KEY`, `XAI_API_KEY` o `DASHSCOPE_API_KEY`, lo más probable es que hayas olvidado prefijar el nombre del modelo con el prefijo de enrutado del proveedor. Usa `--model openai/gpt-4.1-mini` (compatible con OpenAI / OpenRouter / Ollama), `--model grok` (xAI) o `--model qwen-plus` (DashScope) y el enrutador por prefijos seleccionará el backend correcto independientemente de las credenciales del entorno. El mensaje de error ahora incluye una pista que nombra la variable de entorno detectada.
 
 
-### Windows PowerShell provider switching
+### Cambio de proveedor en Windows PowerShell
 
-The same provider rules work in PowerShell. Use placeholder values in docs and tests; put real keys only in your private environment. Remove unrelated provider env vars when validating a switch so failures are easy to diagnose.
+Las mismas reglas de proveedor funcionan en PowerShell. Usa valores de relleno en documentación y tests; pon claves reales solo en tu entorno privado. Elimina las variables de entorno de proveedores no relacionados cuando valides un cambio, para que los fallos sean fáciles de diagnosticar.
 
-`CLAUDE_CODE_PROVIDER` is not required for normal Claw routing; prefer explicit model prefixes such as `openai/` and provider-specific env vars so PowerShell examples stay portable.
+`CLAUDE_CODE_PROVIDER` no es necesaria para el enrutado normal de Claw; prefiere prefijos de modelo explícitos como `openai/` y variables de entorno específicas de cada proveedor para que los ejemplos de PowerShell sigan siendo portables.
 
 ```powershell
-# Anthropic direct
+# Anthropic directo
 $env:ANTHROPIC_API_KEY = "sk-ant-REPLACE_ME"
 Remove-Item Env:\OPENAI_BASE_URL -ErrorAction SilentlyContinue
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 .\target\debug\claw.exe --model "sonnet" prompt "reply with ready"
 
-# OpenAI-compatible gateway / OpenRouter
+# Gateway compatible con OpenAI / OpenRouter
 Remove-Item Env:\ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
 $env:OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
 $env:OPENAI_API_KEY = "sk-or-v1-REPLACE_ME"
 .\target\debug\claw.exe --model "openai/gpt-4.1-mini" prompt "reply with ready"
 
-# Local OpenAI-compatible server
+# Servidor local compatible con OpenAI
 $env:OPENAI_BASE_URL = "http://127.0.0.1:11434/v1"
 Remove-Item Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
 .\target\debug\claw.exe --model "llama3.2" prompt "reply with ready"
 ```
 
-See the full [Windows install and release quickstart](./docs/windows-install-release.md) for release artifact setup, persistent `setx` usage, and WSL notes.
+Consulta el [quickstart completo de instalación y release en Windows](./docs/windows-install-release.md) para la configuración de artefactos de release, el uso persistente de `setx` y notas sobre WSL.
 
-## Local Models
+## Modelos locales
 
-`claw` can talk to local servers and provider gateways through either Anthropic-compatible or OpenAI-compatible endpoints. Use `ANTHROPIC_BASE_URL` with `ANTHROPIC_AUTH_TOKEN` for Anthropic-compatible services, or `OPENAI_BASE_URL` with `OPENAI_API_KEY` for OpenAI-compatible services. For copyable Ollama, llama.cpp, vLLM, raw `/v1/chat/completions`, and local skills install examples, see [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md).
+`claw` puede hablar con servidores locales y gateways de proveedores a través de endpoints compatibles con Anthropic o compatibles con OpenAI. Usa `ANTHROPIC_BASE_URL` con `ANTHROPIC_AUTH_TOKEN` para servicios compatibles con Anthropic, o `OPENAI_BASE_URL` con `OPENAI_API_KEY` para servicios compatibles con OpenAI. Para ejemplos copiables de Ollama, llama.cpp, vLLM, `/v1/chat/completions` en crudo e instalación de skills locales, consulta [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md).
 
-### Anthropic-compatible endpoint
+### Endpoint compatible con Anthropic
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8080"
@@ -293,7 +293,7 @@ cd rust
 ./target/debug/claw --model "claude-sonnet-4-6" prompt "reply with the word ready"
 ```
 
-### OpenAI-compatible endpoint
+### Endpoint compatible con OpenAI
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
@@ -312,9 +312,9 @@ cd rust
 ./target/debug/claw --model "llama3.2" prompt "summarize this repository in one sentence"
 ```
 
-`OLLAMA_HOST` is the preferred env var. Claw routes all models to the local Ollama endpoint automatically, and no API key is needed. The older `OPENAI_BASE_URL` + `OPENAI_API_KEY` workaround is also supported.
+`OLLAMA_HOST` es la variable de entorno preferida. Claw enruta automáticamente todos los modelos al endpoint local de Ollama y no se necesita ninguna clave de API. La solución antigua con `OPENAI_BASE_URL` + `OPENAI_API_KEY` también sigue soportada.
 
-For Ollama tags with punctuation (for example `qwen2.5-coder:7b`), both approaches work:
+Para tags de Ollama con puntuación (por ejemplo `qwen2.5-coder:7b`), ambos enfoques funcionan:
 
 ```bash
 export OLLAMA_HOST="http://127.0.0.1:11434"
@@ -323,7 +323,7 @@ cd rust
 ./target/debug/claw --model "qwen2.5-coder:7b" prompt "reply with ready"
 ```
 
-If the local server exposes a slash-containing model ID, prefix it with `local/` so Claw selects the OpenAI-compatible transport while sending the remainder verbatim on the wire: `--model "local/Qwen/Qwen3.6-27B-FP8"`.
+Si el servidor local expone un ID de modelo que contiene barras, prefíjalo con `local/` para que Claw seleccione el transporte compatible con OpenAI mientras envía el resto textualmente por el cable: `--model "local/Qwen/Qwen3.6-27B-FP8"`.
 
 ### OpenRouter
 
@@ -337,43 +337,43 @@ cd rust
 
 ### Alibaba DashScope (Qwen)
 
-For Qwen models via Alibaba's native DashScope API (higher rate limits than OpenRouter):
+Para modelos Qwen a través de la API nativa DashScope de Alibaba (límites de tasa más altos que OpenRouter):
 
 ```bash
 export DASHSCOPE_API_KEY="sk-..."
 
 cd rust
 ./target/debug/claw --model "qwen/qwen-max" prompt "hello"
-# or bare:
+# o sin prefijo:
 ./target/debug/claw --model "qwen-plus" prompt "hello"
 ```
 
-Model names starting with `qwen/` or `qwen-` are automatically routed to the DashScope compatible-mode endpoint (`https://dashscope.aliyuncs.com/compatible-mode/v1`). You do **not** need to set `OPENAI_BASE_URL` or unset `ANTHROPIC_API_KEY` — the model prefix wins over the ambient credential sniffer.
+Los nombres de modelo que empiezan por `qwen/` o `qwen-` se enrutan automáticamente al endpoint de modo compatible de DashScope (`https://dashscope.aliyuncs.com/compatible-mode/v1`). **No** necesitas establecer `OPENAI_BASE_URL` ni eliminar `ANTHROPIC_API_KEY`: el prefijo del modelo gana sobre el detector de credenciales del entorno.
 
-Reasoning variants (`qwen-qwq-*`, `qwq-*`, `*-thinking`) automatically strip `temperature`/`top_p`/`frequency_penalty`/`presence_penalty` before the request hits the wire (these params are rejected by reasoning models).
+Las variantes de razonamiento (`qwen-qwq-*`, `qwq-*`, `*-thinking`) eliminan automáticamente `temperature`/`top_p`/`frequency_penalty`/`presence_penalty` antes de que la petición salga por el cable (estos parámetros son rechazados por los modelos de razonamiento).
 
-## Supported Providers & Models
+## Proveedores y modelos soportados
 
-`claw` has three built-in provider backends. The provider is selected automatically based on the model name, falling back to whichever credential is present in the environment.
+`claw` tiene tres backends de proveedor integrados. El proveedor se selecciona automáticamente según el nombre del modelo, con fallback a la credencial que esté presente en el entorno.
 
-### Provider matrix
+### Matriz de proveedores
 
-| Provider | Protocol | Auth env var(s) | Base URL env var | Default base URL |
+| Proveedor | Protocolo | Variable(s) de entorno de auth | Variable de entorno de base URL | Base URL por defecto |
 |---|---|---|---|---|
-| **Anthropic** (direct) | Anthropic Messages API | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
-| **xAI** | OpenAI-compatible | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
-| **OpenAI-compatible** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
-| **DashScope** (Alibaba) | OpenAI-compatible | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| **Anthropic** (directo) | Anthropic Messages API | `ANTHROPIC_API_KEY` o `ANTHROPIC_AUTH_TOKEN` | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` |
+| **xAI** | Compatible con OpenAI | `XAI_API_KEY` | `XAI_BASE_URL` | `https://api.x.ai/v1` |
+| **Compatible con OpenAI** | OpenAI Chat Completions | `OPENAI_API_KEY` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
+| **DashScope** (Alibaba) | Compatible con OpenAI | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
 
-The OpenAI-compatible backend also serves as the gateway for **OpenRouter**, **Ollama**, and any other service that speaks the OpenAI `/v1/chat/completions` wire format — just point `OPENAI_BASE_URL` at the service.
+El backend compatible con OpenAI también sirve como gateway para **OpenRouter**, **Ollama** y cualquier otro servicio que hable el formato de cable `/v1/chat/completions` de OpenAI: basta con apuntar `OPENAI_BASE_URL` al servicio.
 
-**Model-name prefix routing:** If a model name starts with `openai/`, `local/`, `gpt-`, `qwen/`, `qwen-`, `kimi/`, or `kimi-`, the provider is selected by the prefix regardless of which env vars are set. This prevents accidental misrouting to Anthropic when multiple credentials exist in the environment. For the default OpenAI API and local/private OpenAI-compatible endpoints, `openai/` is a routing prefix and is stripped before the request hits the wire. For non-local custom `OPENAI_BASE_URL` gateways, slash-containing OpenAI-compatible slugs (for example OpenRouter-style `openai/gpt-4.1-mini`) are preserved so the gateway receives the model ID it expects. The `local/` prefix is an explicit escape hatch for local slash-containing model IDs: it is stripped while the rest of the model ID is sent verbatim.
+**Enrutado por prefijo del nombre de modelo:** si un nombre de modelo empieza por `openai/`, `local/`, `gpt-`, `qwen/`, `qwen-`, `kimi/` o `kimi-`, el proveedor se selecciona por el prefijo independientemente de qué variables de entorno estén definidas. Esto evita enrutados accidentales hacia Anthropic cuando existen varias credenciales en el entorno. Para la API de OpenAI por defecto y los endpoints locales/privados compatibles con OpenAI, `openai/` es un prefijo de enrutado y se elimina antes de que la petición salga por el cable. Para gateways personalizados no locales con `OPENAI_BASE_URL`, los slugs compatibles con OpenAI que contienen barras (por ejemplo, al estilo OpenRouter `openai/gpt-4.1-mini`) se conservan para que el gateway reciba el ID de modelo que espera. El prefijo `local/` es una vía de escape explícita para IDs de modelo locales con barras: se elimina mientras el resto del ID de modelo se envía textualmente.
 
-### Tested models and aliases
+### Modelos probados y alias
 
-These are the models registered in the built-in alias table with known token limits:
+Estos son los modelos registrados en la tabla de alias integrada con límites de tokens conocidos:
 
-| Alias | Resolved model name | Provider | Max output tokens | Context window |
+| Alias | Nombre de modelo resuelto | Proveedor | Máx. tokens de salida | Ventana de contexto |
 |---|---|---|---|---|
 | `opus` | `claude-opus-4-7` | Anthropic | 32 000 | 200 000 |
 | `sonnet` | `claude-sonnet-4-6` | Anthropic | 64 000 | 200 000 |
@@ -384,14 +384,14 @@ These are the models registered in the built-in alias table with known token lim
 | `kimi` | `kimi-k2.5` | DashScope | 16 384 | 256 000 |
 | `qwen-max` | `qwen-max` | DashScope | 8 192 | 131 072 |
 | `qwen-plus` | `qwen-plus` | DashScope | 8 192 | 131 072 |
-| `gpt-4.1` / `gpt-4.1-mini` / `gpt-4.1-nano` | same | OpenAI-compatible | 32 768 | 1 047 576 |
-| `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` | same | OpenAI-compatible | 128 000 | 1 000 000 / 400 000 |
+| `gpt-4.1` / `gpt-4.1-mini` / `gpt-4.1-nano` | el mismo | Compatible con OpenAI | 32 768 | 1 047 576 |
+| `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.4-nano` | el mismo | Compatible con OpenAI | 128 000 | 1 000 000 / 400 000 |
 
-Any model name that does not match an alias is passed through verbatim after provider routing is resolved. This is how you use OpenRouter model slugs (`openai/gpt-4.1-mini` with a custom `OPENAI_BASE_URL`), Ollama tags (`llama3.2` or `qwen2.5-coder:7b`), slash-containing local IDs (`local/Qwen/Qwen3.6-27B-FP8`), or full Anthropic model IDs (`claude-sonnet-4-20250514`).
+Cualquier nombre de modelo que no coincida con un alias se pasa textualmente una vez resuelto el enrutado de proveedor. Así es como usas slugs de modelo de OpenRouter (`openai/gpt-4.1-mini` con un `OPENAI_BASE_URL` personalizado), tags de Ollama (`llama3.2` o `qwen2.5-coder:7b`), IDs locales con barras (`local/Qwen/Qwen3.6-27B-FP8`) o IDs de modelo completos de Anthropic (`claude-sonnet-4-20250514`).
 
-### User-defined aliases
+### Alias definidos por el usuario
 
-You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw/settings.json`, or `.claw/settings.local.json`):
+Puedes añadir alias personalizados en cualquier archivo de configuración (`~/.claw/settings.json`, `.claw/settings.json` o `.claw/settings.local.json`):
 
 ```json
 {
@@ -403,77 +403,77 @@ You can add custom aliases in any settings file (`~/.claw/settings.json`, `.claw
 }
 ```
 
-Local project settings override user-level settings. Aliases resolve through the built-in table, so `"fast": "haiku"` also works.
+La configuración local del proyecto sobrescribe la configuración a nivel de usuario. Los alias se resuelven a través de la tabla integrada, así que `"fast": "haiku"` también funciona.
 
-Model selection precedence is CLI flag, environment, config, then default. The environment model slot accepts `CLAW_MODEL`, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_MODEL` in that order; aliases from those variables are resolved and validated before provider startup. `claw --output-format json status` exposes `model_raw`, `model_alias_resolved_to`, and `model_env_var` so automation can see the winning value.
+La precedencia de selección de modelo es: flag del CLI, entorno, configuración y, por último, el valor por defecto. La ranura de modelo del entorno acepta `CLAW_MODEL`, `ANTHROPIC_MODEL` y `ANTHROPIC_DEFAULT_MODEL` en ese orden; los alias procedentes de esas variables se resuelven y validan antes del arranque del proveedor. `claw --output-format json status` expone `model_raw`, `model_alias_resolved_to` y `model_env_var` para que la automatización pueda ver el valor ganador.
 
-### How provider detection works
+### Cómo funciona la detección de proveedor
 
-1. If the resolved model name starts with `claude` → Anthropic.
-2. If it starts with `grok` → xAI.
-3. If it starts with `openai/`, `local/`, or `gpt-` → OpenAI-compatible.
-4. If it starts with `qwen/`, `qwen-`, `kimi/`, or `kimi-` → DashScope-compatible OpenAI wire format.
-5. If `OPENAI_BASE_URL` is set, local-looking unknown model names such as `llama3.2` or `qwen2.5-coder:7b` route to the OpenAI-compatible client for local/gateway servers.
-6. Otherwise, `claw` checks which credential is set: Anthropic first, then OpenAI, then xAI. If only `OPENAI_BASE_URL` is set, it still routes to OpenAI-compatible for authless local servers.
-7. If nothing matches, it defaults to Anthropic.
+1. Si el nombre de modelo resuelto empieza por `claude` → Anthropic.
+2. Si empieza por `grok` → xAI.
+3. Si empieza por `openai/`, `local/` o `gpt-` → compatible con OpenAI.
+4. Si empieza por `qwen/`, `qwen-`, `kimi/` o `kimi-` → formato de cable OpenAI compatible con DashScope.
+5. Si `OPENAI_BASE_URL` está definida, los nombres de modelo desconocidos con aspecto local, como `llama3.2` o `qwen2.5-coder:7b`, se enrutan al cliente compatible con OpenAI para servidores locales/gateway.
+6. En caso contrario, `claw` comprueba qué credencial está definida: primero Anthropic, luego OpenAI y después xAI. Si solo `OPENAI_BASE_URL` está definida, sigue enrutando a compatible con OpenAI para servidores locales sin autenticación.
+7. Si nada coincide, usa Anthropic por defecto.
 
 
-### Provider diagnostics and custom OpenAI-compatible parameters
+### Diagnósticos de proveedor y parámetros personalizados compatibles con OpenAI
 
-The API layer exposes a provider diagnostics snapshot via `api::provider_diagnostics_for_model(model)`. It reports the resolved provider, auth/base-url environment variables, default base URL, whether the provider uses the OpenAI-compatible wire format, whether reasoning tuning parameters are stripped, whether DeepSeek V4 reasoning history is preserved, proxy support, extra-body support, and whether slash-containing model IDs are preserved for custom OpenAI-compatible gateways.
+La capa de API expone una instantánea de diagnósticos de proveedor mediante `api::provider_diagnostics_for_model(model)`. Informa del proveedor resuelto, las variables de entorno de auth/base-url, la base URL por defecto, si el proveedor usa el formato de cable compatible con OpenAI, si se eliminan los parámetros de ajuste de razonamiento, si se conserva el historial de razonamiento de DeepSeek V4, el soporte de proxy, el soporte de extra-body y si los IDs de modelo con barras se conservan para gateways personalizados compatibles con OpenAI.
 
-For gateway features that are not first-class request fields yet, `MessageRequest::extra_body` passes through provider-specific JSON parameters such as `web_search_options` or `parallel_tool_calls`. Core protocol fields (`model`, `messages`, `stream`, `tools`, `tool_choice`, `max_tokens`, and `max_completion_tokens`) are protected and cannot be overridden through `extra_body`.
+Para funciones de gateway que aún no son campos de primera clase en la petición, `MessageRequest::extra_body` pasa parámetros JSON específicos del proveedor, como `web_search_options` o `parallel_tool_calls`. Los campos centrales del protocolo (`model`, `messages`, `stream`, `tools`, `tool_choice`, `max_tokens` y `max_completion_tokens`) están protegidos y no se pueden sobrescribir a través de `extra_body`.
 
-## File context and navigation
+## Contexto de archivos y navegación
 
-Use `@path/to/file` in prompts to submit repository files as context, for example `Read @src/app.ts and explain the bug`, `Compare @old.md and @new.md`, or `Use @logs/error.txt as context and suggest a fix`. Prompt history, `Ctrl-r`, and long-output scrolling come from your shell, terminal, or tmux rather than from Claw itself. See [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) for scrollback, attachment, and secret-redaction guidance.
+Usa `@path/to/file` en los prompts para enviar archivos del repositorio como contexto, por ejemplo `Read @src/app.ts and explain the bug`, `Compare @old.md and @new.md` o `Use @logs/error.txt as context and suggest a fix`. El historial de prompts, `Ctrl-r` y el desplazamiento en salidas largas provienen de tu shell, terminal o tmux, no de Claw. Consulta [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) para orientación sobre scrollback, adjuntos y redacción de secretos.
 
 ## FAQ
 
-### Is Claw Code Claude-only?
+### ¿Claw Code es solo para Claude?
 
-No. Claw Code is a Claude-Code-shaped workflow/runtime, not a Claude-only product. It can target Anthropic and OpenAI-compatible/provider-routed/local models depending on config. Non-Claude providers may require stricter response-shape and tool-call compatibility, so some workflows can be rougher than first-party Anthropic/OpenAI paths; provider-specific identity leaks are bugs, not product intent. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) for local provider examples.
+No. Claw Code es un workflow/runtime con la forma de Claude Code, no un producto exclusivo de Claude. Puede apuntar a modelos de Anthropic y a modelos compatibles con OpenAI, enrutados por proveedor o locales, según la configuración. Los proveedores no-Claude pueden requerir una compatibilidad más estricta en la forma de las respuestas y en las llamadas a herramientas, por lo que algunos workflows pueden ser más ásperos que las rutas de primera parte de Anthropic/OpenAI; las fugas de identidad específicas de un proveedor son bugs, no intención del producto. Consulta [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) para ejemplos de proveedores locales.
 
-### What about Codex?
+### ¿Y qué hay de Codex?
 
-The name "codex" appears in the Claw Code ecosystem but it does **not** refer to OpenAI Codex (the code-generation model). Here is what it means in this project:
+El nombre "codex" aparece en el ecosistema de Claw Code pero **no** se refiere a OpenAI Codex (el modelo de generación de código). Esto es lo que significa en este proyecto:
 
-- **`oh-my-codex` (OmX)** is the workflow and plugin layer that sits on top of `claw`. It provides planning modes, parallel multi-agent execution, notification routing, and other automation features. See [PHILOSOPHY.md](./PHILOSOPHY.md) and the [oh-my-codex repo](https://github.com/Yeachan-Heo/oh-my-codex).
-- **`.codex/` directories** (e.g. `.codex/skills`, `.codex/agents`, `.codex/commands`) are legacy lookup paths that `claw` still scans alongside the primary `.claw/` directories.
-- **`CODEX_HOME`** is an optional environment variable that points to a custom root for user-level skill and command lookups.
+- **`oh-my-codex` (OmX)** es la capa de workflow y plugins que se apoya sobre `claw`. Proporciona modos de planificación, ejecución multiagente en paralelo, enrutado de notificaciones y otras funciones de automatización. Consulta [PHILOSOPHY.md](./PHILOSOPHY.md) y el [repo de oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex).
+- Los **directorios `.codex/`** (p. ej. `.codex/skills`, `.codex/agents`, `.codex/commands`) son rutas de búsqueda legadas que `claw` sigue escaneando junto a los directorios primarios `.claw/`.
+- **`CODEX_HOME`** es una variable de entorno opcional que apunta a una raíz personalizada para las búsquedas de skills y comandos a nivel de usuario.
 
-`claw` does **not** support OpenAI Codex sessions, the Codex CLI, or Codex session import/export. If you need to use OpenAI models (like GPT-4.1), configure the OpenAI-compatible provider as shown above in the [OpenAI-compatible endpoint](#openai-compatible-endpoint) and [OpenRouter](#openrouter) sections.
+`claw` **no** soporta sesiones de OpenAI Codex, el Codex CLI ni la importación/exportación de sesiones de Codex. Si necesitas usar modelos de OpenAI (como GPT-4.1), configura el proveedor compatible con OpenAI como se muestra arriba en las secciones [Endpoint compatible con OpenAI](#openai-compatible-endpoint) y [OpenRouter](#openrouter).
 
-## HTTP proxy support
+## Soporte de proxy HTTP
 
-`claw` honours the standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables (both upper- and lower-case spellings are accepted) when issuing outbound requests to Anthropic, OpenAI-, and xAI-compatible endpoints. Set them before launching the CLI and the underlying `reqwest` client will be configured automatically.
+`claw` respeta las variables de entorno estándar `HTTP_PROXY`, `HTTPS_PROXY` y `NO_PROXY` (se aceptan tanto en mayúsculas como en minúsculas) al emitir peticiones salientes hacia endpoints compatibles con Anthropic, OpenAI y xAI. Defínelas antes de lanzar el CLI y el cliente `reqwest` subyacente se configurará automáticamente.
 
-### Environment variables
+### Variables de entorno
 
 ```bash
 export HTTPS_PROXY="http://proxy.corp.example:3128"
 export HTTP_PROXY="http://proxy.corp.example:3128"
 export NO_PROXY="localhost,127.0.0.1,.corp.example"
-export CLAW_OUTPUT_FORMAT="json"   # default non-interactive output format; flags override it
-export CLAW_LOG="debug"             # claw-specific log level selector surfaced by help/doctor
-export RUST_LOG="claw=debug"        # Rust logging convention surfaced by help/doctor
+export CLAW_OUTPUT_FORMAT="json"   # formato de salida no interactivo por defecto; los flags lo sobrescriben
+export CLAW_LOG="debug"             # selector de nivel de log específico de claw expuesto por help/doctor
+export RUST_LOG="claw=debug"        # convención de logging de Rust expuesta por help/doctor
 
 cd rust
 ./target/debug/claw prompt "hello via the corporate proxy"
 ```
 
-### Programmatic `proxy_url` config option
+### Opción de configuración programática `proxy_url`
 
-As an alternative to per-scheme environment variables, the `ProxyConfig` type exposes a `proxy_url` field that acts as a single catch-all proxy for both HTTP and HTTPS traffic. When `proxy_url` is set it takes precedence over the separate `http_proxy` and `https_proxy` fields.
+Como alternativa a las variables de entorno por esquema, el tipo `ProxyConfig` expone un campo `proxy_url` que actúa como proxy único para todo el tráfico HTTP y HTTPS. Cuando `proxy_url` está definido, tiene prioridad sobre los campos separados `http_proxy` y `https_proxy`.
 
 ```rust
 use api::{build_http_client_with, ProxyConfig};
 
-// From a single unified URL (config file, CLI flag, etc.)
+// Desde una única URL unificada (archivo de configuración, flag del CLI, etc.)
 let config = ProxyConfig::from_proxy_url("http://proxy.corp.example:3128");
 let client = build_http_client_with(&config).expect("proxy client");
 
-// Or set the field directly alongside NO_PROXY
+// O define el campo directamente junto a NO_PROXY
 let config = ProxyConfig {
     proxy_url: Some("http://proxy.corp.example:3128".to_string()),
     no_proxy: Some("localhost,127.0.0.1".to_string()),
@@ -482,17 +482,17 @@ let config = ProxyConfig {
 let client = build_http_client_with(&config).expect("proxy client");
 ```
 
-### Notes
+### Notas
 
-- When both `HTTPS_PROXY` and `HTTP_PROXY` are set, the secure proxy applies to `https://` URLs and the plain proxy applies to `http://` URLs.
-- `proxy_url` is a unified alternative: when set, it applies to both `http://` and `https://` destinations, overriding the per-scheme fields.
-- `NO_PROXY` accepts a comma-separated list of host suffixes (for example `.corp.example`) and IP literals.
-- Empty values are treated as unset, so leaving `HTTPS_PROXY=""` in your shell will not enable a proxy.
-- If a proxy URL cannot be parsed, `claw` falls back to a direct (no-proxy) client so existing workflows keep working; double-check the URL if you expected the request to be tunnelled.
+- Cuando tanto `HTTPS_PROXY` como `HTTP_PROXY` están definidas, el proxy seguro se aplica a las URLs `https://` y el proxy plano a las URLs `http://`.
+- `proxy_url` es una alternativa unificada: cuando está definido, se aplica tanto a destinos `http://` como `https://`, sobrescribiendo los campos por esquema.
+- `NO_PROXY` acepta una lista separada por comas de sufijos de host (por ejemplo `.corp.example`) y literales IP.
+- Los valores vacíos se tratan como no definidos, así que dejar `HTTPS_PROXY=""` en tu shell no activará ningún proxy.
+- Si una URL de proxy no se puede parsear, `claw` recurre a un cliente directo (sin proxy) para que los workflows existentes sigan funcionando; revisa la URL si esperabas que la petición se tunelizara.
 
 ## Skills
 
-Use `/skills list` in the interactive REPL or `claw skills --output-format json` from the direct CLI to inspect installed skills. For offline/local installs, install the directory that contains `SKILL.md`, then verify the discovered name before invoking it. `skills install`, `skills uninstall`, and `agents create` are local filesystem lifecycle commands; they do not require provider credentials.
+Usa `/skills list` en el REPL interactivo o `claw skills --output-format json` desde el CLI directo para inspeccionar las skills instaladas. Para instalaciones offline/locales, instala el directorio que contiene `SKILL.md` y luego verifica el nombre descubierto antes de invocarla. `skills install`, `skills uninstall` y `agents create` son comandos de ciclo de vida sobre el sistema de archivos local; no requieren credenciales de proveedor.
 
 ```text
 /skills install /absolute/path/to/my-skill
@@ -501,9 +501,9 @@ Use `/skills list` in the interactive REPL or `claw skills --output-format json`
 /skills my-skill
 ```
 
-If install succeeds but invocation fails with a provider HTTP error, treat provider setup separately: run `claw doctor` and a one-shot prompt smoke test before reinstalling the skill. See [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) for the full checklist.
+Si la instalación tiene éxito pero la invocación falla con un error HTTP del proveedor, trata la configuración del proveedor por separado: ejecuta `claw doctor` y una prueba rápida con un prompt de una sola ejecución antes de reinstalar la skill. Consulta [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md#local-skills-install-from-disk) para la lista de comprobación completa.
 
-## Common operational commands
+## Comandos operativos comunes
 
 ```bash
 cd rust
@@ -516,13 +516,13 @@ cd rust
 ./target/debug/claw system-prompt --cwd .. --date 2026-04-04
 ```
 
-## Install an external skill
+## Instalar una skill externa
 
-`claw skills install <path>` accepts a local skill directory that contains
-`SKILL.md` or a standalone markdown file. This is useful when a companion
-repository ships a skill prompt that should be available through `/skills`.
+`claw skills install <path>` acepta un directorio de skill local que contenga
+`SKILL.md` o un archivo markdown independiente. Esto es útil cuando un
+repositorio complementario incluye un prompt de skill que debería estar disponible a través de `/skills`.
 
-For example, install TweetClaw as an X/Twitter automation skill:
+Por ejemplo, instala TweetClaw como skill de automatización para X/Twitter:
 
 ```bash
 # From a parent directory that contains claw-code
@@ -533,23 +533,23 @@ cd claw-code/rust
 ./target/debug/claw skills uninstall tweetclaw
 ```
 
-TweetClaw gives `claw` users a local skill guide for OpenClaw/Xquik workflows
-such as tweet search, reply search, follower export, monitors, webhooks, and
-approval-gated posting. Configure any Xquik credentials outside the prompt and
-avoid pasting API keys into chat.
+TweetClaw ofrece a los usuarios de `claw` una guía de skill local para workflows de OpenClaw/Xquik
+como búsqueda de tweets, búsqueda de respuestas, exportación de seguidores, monitores, webhooks y
+publicación condicionada a aprobación. Configura cualquier credencial de Xquik fuera del prompt y
+evita pegar claves de API en el chat.
 
-## Author a local agent
+## Crear un agente local
 
-`claw agents create <name>` scaffolds a local `.claw/agents/<name>.toml` file for the current workspace. The scaffold is intentionally small so you can edit the description, model, and reasoning effort before listing or invoking agents:
+`claw agents create <name>` genera el andamiaje de un archivo local `.claw/agents/<name>.toml` para el workspace actual. El andamiaje es intencionadamente pequeño para que puedas editar la descripción, el modelo y el esfuerzo de razonamiento antes de listar o invocar agentes:
 
 ```bash
 ./target/debug/claw agents create release-checker
 ./target/debug/claw agents list
 ```
 
-## Session management
+## Gestión de sesiones
 
-REPL turns are persisted under `.claw/sessions/` in the current workspace.
+Los turnos del REPL se persisten bajo `.claw/sessions/` en el workspace actual.
 
 ```bash
 cd rust
@@ -557,11 +557,11 @@ cd rust
 ./target/debug/claw --resume latest /status /diff
 ```
 
-Useful interactive commands include `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions`, and `/export`.
+Entre los comandos interactivos útiles están `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions` y `/export`.
 
-## Config file resolution order
+## Orden de resolución de los archivos de configuración
 
-Runtime config is loaded in this order, with later entries overriding earlier ones:
+La configuración en tiempo de ejecución se carga en este orden, con las entradas posteriores sobrescribiendo a las anteriores:
 
 1. `~/.claw.json`
 2. `~/.config/claw/settings.json`
@@ -569,36 +569,36 @@ Runtime config is loaded in this order, with later entries overriding earlier on
 4. `<repo>/.claw/settings.json`
 5. `<repo>/.claw/settings.local.json`
 
-The list is also the precedence chain: project-local settings override project settings, project settings override the legacy project `.claw.json`, and project files override user files. `claw --output-format json config` includes each discovered file's `precedence_rank`, `wins_for_keys`, and `shadowed_keys` so automation can see which file controls each effective key without reimplementing the merge order.
+La lista es también la cadena de precedencia: la configuración local del proyecto sobrescribe la configuración del proyecto, la configuración del proyecto sobrescribe el `.claw.json` legado del proyecto, y los archivos del proyecto sobrescriben los archivos del usuario. `claw --output-format json config` incluye para cada archivo descubierto `precedence_rank`, `wins_for_keys` y `shadowed_keys`, de modo que la automatización pueda ver qué archivo controla cada clave efectiva sin reimplementar el orden de fusión.
 
-## Installing MCP servers
+## Instalar servidores MCP
 
-`claw mcp add` writes the `mcpServers` entry for you — no manual JSON editing:
+`claw mcp add` escribe por ti la entrada `mcpServers` — sin editar JSON a mano:
 
 ```bash
-# stdio server: everything after the name is the command line
+# servidor stdio: todo lo que sigue al nombre es la línea de comandos
 claw mcp add memoria npx -y codebase-memory-mcp
 
-# remote server: a URL is auto-detected as HTTP transport (--sse for SSE)
+# servidor remoto: una URL se detecta automáticamente como transporte HTTP (--sse para SSE)
 claw mcp add remoto https://ejemplo.com/mcp
 claw mcp add eventos https://ejemplo.com/sse --sse
 
-# options: --env K=V (stdio), --header K=V (remote),
-#          --scope local|project (default local), --force (overwrite)
+# opciones: --env K=V (stdio), --header K=V (remoto),
+#          --scope local|project (por defecto local), --force (sobrescribir)
 claw mcp add api npx api-mcp --env API_KEY=xyz --scope project
 
-claw mcp remove memoria     # deletes it from every settings file
+claw mcp remove memoria     # lo elimina de todos los archivos de configuración
 ```
 
-`add` targets `.claw/settings.local.json` by default (machine-local) or
-`.claw/settings.json` with `--scope project` (shared, committable). After
-writing it re-validates the full config and rolls the file back untouched
-if the new entry does not parse. Both verbs also work as `/mcp add ...`
-inside a session and honor `--output-format json`.
+`add` apunta por defecto a `.claw/settings.local.json` (local a la máquina) o a
+`.claw/settings.json` con `--scope project` (compartido, apto para commit). Tras
+escribir, revalida la configuración completa y revierte el archivo intacto
+si la nueva entrada no parsea. Ambos verbos también funcionan como `/mcp add ...`
+dentro de una sesión y respetan `--output-format json`.
 
-## MCP server validation
+## Validación de servidores MCP
 
-`claw mcp --output-format json` loads valid `mcpServers` entries even when sibling entries are malformed. The JSON list envelope distinguishes the total configured entries from the valid and invalid subsets:
+`claw mcp --output-format json` carga las entradas `mcpServers` válidas incluso cuando entradas hermanas están malformadas. El sobre JSON de la lista distingue el total de entradas configuradas de los subconjuntos válidos e inválidos:
 
 ```json
 {
@@ -618,11 +618,11 @@ inside a session and honor `--output-format json`.
 }
 ```
 
-`status --output-format json` mirrors this under `mcp_validation`, and `doctor --output-format json` includes an `mcp validation` check so automation can repair every rejected server entry without losing usable MCP servers.
+`status --output-format json` refleja esto bajo `mcp_validation`, y `doctor --output-format json` incluye una comprobación `mcp validation` para que la automatización pueda reparar cada entrada de servidor rechazada sin perder los servidores MCP utilizables.
 
-## Hook configuration
+## Configuración de hooks
 
-`hooks.PreToolUse`, `hooks.PostToolUse`, and `hooks.PostToolUseFailure` accept either legacy command strings or object-style entries with a `matcher` and nested command hooks:
+`hooks.PreToolUse`, `hooks.PostToolUse` y `hooks.PostToolUseFailure` aceptan tanto cadenas de comando legadas como entradas de estilo objeto con un `matcher` y hooks de comando anidados:
 
 ```json
 {
@@ -640,19 +640,19 @@ inside a session and honor `--output-format json`.
 }
 ```
 
-Object-style matchers are optional. When present, they match tool names case-insensitively and support `*` wildcards plus comma or pipe separated alternatives. Nested hook `type` may be omitted or set to `"command"`; each nested command runs in configuration order.
-Legacy bare-string hook entries still load for backward compatibility but emit deprecation warnings suggesting migration to object-style entries. Unknown hook event names (e.g. `Stop`, `Notification`) are recorded as invalid without rejecting valid hooks. `status --output-format json` mirrors partial hook validation under `hook_validation` with `valid_count`, `invalid_count`, and `invalid_hooks:[{event, index, hook_index, kind, error_field, reason, valid:false}]`. `doctor --output-format json` includes a `hook validation` check so automation can repair every rejected hook entry without losing usable hooks.
+Los matchers de estilo objeto son opcionales. Cuando están presentes, hacen matching de los nombres de herramientas sin distinguir mayúsculas y admiten comodines `*` además de alternativas separadas por comas o barras verticales. El `type` del hook anidado puede omitirse o establecerse a `"command"`; cada comando anidado se ejecuta en el orden de la configuración.
+Las entradas de hook legadas de cadena simple siguen cargándose por compatibilidad hacia atrás, pero emiten advertencias de obsolescencia que sugieren migrar a entradas de estilo objeto. Los nombres de eventos de hook desconocidos (p. ej. `Stop`, `Notification`) se registran como inválidos sin rechazar los hooks válidos. `status --output-format json` refleja la validación parcial de hooks bajo `hook_validation` con `valid_count`, `invalid_count` e `invalid_hooks:[{event, index, hook_index, kind, error_field, reason, valid:false}]`. `doctor --output-format json` incluye una comprobación `hook validation` para que la automatización pueda reparar cada entrada de hook rechazada sin perder los hooks utilizables.
 
-## Project instruction rules
+## Reglas de instrucciones del proyecto
 
-In addition to root instruction files such as `CLAUDE.md`, `CLAW.md`, `AGENTS.md`, `.claw/CLAUDE.md`, `.claude/CLAUDE.md`, and `.claw/instructions.md`, `claw` loads sorted Markdown/text rule files from:
+Además de los archivos de instrucciones raíz como `CLAUDE.md`, `CLAW.md`, `AGENTS.md`, `.claw/CLAUDE.md`, `.claude/CLAUDE.md` y `.claw/instructions.md`, `claw` carga archivos de reglas Markdown/texto ordenados desde:
 
-- `<repo>/.claw/rules/` (`.md`, `.txt`, `.mdc`) for shared project rules.
-- `<repo>/.claw/rules.local/` for personal local rules; this path is gitignored.
+- `<repo>/.claw/rules/` (`.md`, `.txt`, `.mdc`) para reglas de proyecto compartidas.
+- `<repo>/.claw/rules.local/` para reglas locales personales; esta ruta está en gitignore.
 
-Root instruction-file priority is `CLAUDE.md`, then `CLAW.md`, then `AGENTS.md` for each discovered directory. Discovery is bounded to the current git root when one exists, otherwise to the current directory only, so stale parent files outside the project do not silently bleed into the prompt. All loaded files contribute to the system prompt and to `status --output-format json` as `workspace.memory_files:[{path, source, origin, scope_path, outside_project, chars, contributes}]`; `claw doctor --output-format json` includes a `memory` check so automation can detect loaded and unexpected unloaded memory-file candidates without parsing prompt text.
+La prioridad de los archivos de instrucciones raíz es `CLAUDE.md`, luego `CLAW.md` y después `AGENTS.md` para cada directorio descubierto. El descubrimiento está acotado a la raíz git actual cuando existe una, y en caso contrario solo al directorio actual, de modo que archivos padre obsoletos fuera del proyecto no se cuelen silenciosamente en el prompt. Todos los archivos cargados contribuyen al prompt del sistema y a `status --output-format json` como `workspace.memory_files:[{path, source, origin, scope_path, outside_project, chars, contributes}]`; `claw doctor --output-format json` incluye una comprobación `memory` para que la automatización pueda detectar candidatos de archivos de memoria cargados y no cargados de forma inesperada sin parsear el texto del prompt.
 
-By default, `claw` also imports detected rules from common AI coding tools such as Cursor (`.cursorrules`, `.cursor/rules/`), GitHub Copilot (`.github/copilot-instructions.md`), Windsurf, Plandex, and Crush. Control this with `rulesImport` in any settings file:
+Por defecto, `claw` también importa reglas detectadas de herramientas de programación con IA comunes, como Cursor (`.cursorrules`, `.cursor/rules/`), GitHub Copilot (`.github/copilot-instructions.md`), Windsurf, Plandex y Crush. Controla esto con `rulesImport` en cualquier archivo de configuración:
 
 ```json
 {
@@ -660,112 +660,157 @@ By default, `claw` also imports detected rules from common AI coding tools such 
 }
 ```
 
-Use `"auto"` (the default) to import every supported framework, `"none"` to load only Claw instruction/rules files, or an array such as `["cursor", "copilot"]` to import selected frameworks.
+Usa `"auto"` (el valor por defecto) para importar todos los frameworks soportados, `"none"` para cargar solo los archivos de instrucciones/reglas de Claw, o un array como `["cursor", "copilot"]` para importar frameworks seleccionados.
 
-## Mock parity harness
+## Harness de parity con mock
 
-The workspace includes a deterministic Anthropic-compatible mock service and parity harness.
+El workspace incluye un servicio mock determinista compatible con Anthropic y un harness de parity.
 
 ```bash
 cd rust
 ./scripts/run_mock_parity_harness.sh
 ```
 
-Manual mock service startup:
+Arranque manual del servicio mock:
 
 ```bash
 cd rust
 cargo run -p mock-anthropic-service -- --bind 127.0.0.1:0
 ```
 
-## Autonomous multi-agent builds (WEB / APP)
+## Builds multiagente autónomos (WEB / APP)
 
-`claw-multiagent` turns one prompt into a complete project through a
-hierarchy of specialized agents — Director General (plan, scope, stack),
-Subdirector Técnico (fully specified TaskSpecs with per-task model tier),
-Architects in parallel (software, frontend, backend, DevOps, UX/UI),
-Developer agents in parallel waves over disjoint modules, a Supervisor that
-reviews every delivery into `docs/SUPERVISION.md` and dispatches a Fixer on
-a superior model, then QA and Documentation agents:
+`claw-multiagent` convierte un solo prompt en un proyecto completo mediante una
+jerarquía de agentes especializados. El pipeline, en orden:
 
-Inside an interactive claw session, just type:
+1. **Director General** — interpreta el prompt, crea el plan (visión, alcance,
+   stack) y resuelve él mismo cualquier pregunta abierta, documentando cada
+   decisión en `docs/decisions.md`.
+2. **Arquitectos en paralelo** (software, frontend, backend, DevOps, UX/UI) —
+   diseñan la solución antes de que exista el backlog.
+3. **Subdirector Técnico** — convierte plan + diseños en TaskSpecs
+   completamente especificados (con validación estructural y una ronda de
+   reparación automática si el backlog no valida).
+4. **Scaffold determinista** — `create-vite` / `cargo init` / `npm init` según
+   el stack: el proyecto compila desde el minuto cero y los developers solo
+   escriben código de producto (desactívalo con `--no-scaffold`).
+5. **Contratos como código** — un arquitecto escribe los archivos reales de
+   tipos/interfaces/rutas de API (catalogados en `docs/contracts.md`); la
+   consistencia entre módulos la impone el typechecker, no la prosa.
+6. **Scheduler por grafo, sin barreras** — cada tarea arranca en cuanto sus
+   dependencias terminan y ningún agente en vuelo tiene sus archivos
+   (aislamiento duro de escritura por módulo); los fallos se reintentan una
+   vez escalando al siguiente nivel de modelo, y cada entrega pasa una
+   verificación rápida (`tsc --noEmit` / `cargo check`) al aterrizar.
+7. **Supervisor en paralelo** — revisa cada entrega en `docs/SUPERVISION.md`
+   mientras el resto sigue construyendo, y despacha un Fixer en un modelo
+   superior cuando encuentra issues. Cada tarea aprobada genera un commit de
+   git propio.
+8. **Build gate final + QA + smoke test + Documentación** — build completo
+   con reparación automática, tests reales ejecutados (y reparados si
+   fallan), arranque del dev server con petición HTTP de verificación
+   (`docs/smoke-test.md`) y README/ADRs/changelog.
+
+Dentro de una sesión interactiva de claw, simplemente escribe:
 
 ```
 /web un ecommerce para vender productos electrónicos --dry-run
 /app app de notas offline para Android [--parallel N] [--output <dir>]
 ```
 
-Or use the standalone binary:
+O usa el binario independiente:
 
 ```bash
-# Plan only (Director + Subdirector, no code written)
+# Solo plan (planificación completa, no se escribe código)
 claw-multiagent web "un ecommerce para vender productos electrónicos" --dry-run
 
-# Full autonomous build, 4 developers in parallel per wave
+# Revisar el plan y confirmar antes de gastar (recomendado la primera vez)
+claw-multiagent web "un ecommerce para vender productos electrónicos" \
+  --output ./mi-tienda --approve --dashboard
+
+# Build autónomo completo, 4 developers en paralelo
 claw-multiagent web "un ecommerce para vender productos electrónicos" \
   --output ./mi-tienda --parallel 4
 
-# Apps: desktop/mobile (Electron/Tauri/Flutter/React Native/MAUI/Kotlin/Swift)
+# Reanudar un build interrumpido (Ctrl+C guarda el estado; el segundo
+# Ctrl+C fuerza la salida)
+claw-multiagent web "..." --output ./mi-tienda --resume
+
+# Apps: escritorio/móvil (Electron/Tauri/Flutter/React Native/MAUI/Kotlin/Swift)
 claw-multiagent app "app de notas offline para Android y escritorio"
 ```
 
-Model tiers map task complexity to any provider with credentials configured
-(Anthropic, OpenAI, xAI, DashScope, Ollama) — override per run
-(`--simple-model qwen-turbo --complex-model gpt-4o`) or persistently in
-`.claw/multiagent.json`. The run fails fast listing any missing credential.
-The Director leaves per-model instruction files (`CLAUDE.md`, `AGENTS.md`,
-`GROK.md`) in the project describing each role. Set `CLAW_DASHBOARD_EVENTS`
-(or run under `claw --dashboard`) to watch every agent live, and
-`CLAW_MULTIAGENT_REINDEX_CMD` to reindex codebase-memory after each
-supervised delivery.
+Flags principales (mismos nombres en `/web` y `/app` del REPL):
 
-## Live token & agent dashboard
+| Flag | Efecto |
+| --- | --- |
+| `--dry-run` | Solo planificación; guarda `docs/plan.json` y `docs/backlog.json` y para. |
+| `--approve` | Pausa tras la planificación y pide confirmación (`s/N`) antes de construir. |
+| `--parallel N` | Developers simultáneos (por defecto 4). |
+| `--resume` | Reutiliza plan/diseños/backlog guardados y omite tareas completadas. |
+| `--no-scaffold` | Sin plantilla determinista; los agentes generan todos los archivos. |
+| `--build-cmd <cmd\|off>` | Comando del build gate (autodetectado si se omite). |
+| `--max-cost-usd X` | Tope de gasto (APAGADO por defecto: las suscripciones no facturan por token). Requiere telemetría activa. |
+| `--dashboard` | Arranca `claw-dashboard`, apunta la telemetría al build y abre el navegador. |
 
-`claw-dashboard` serves a local web UI showing live input/output/cache token
-usage, estimated cost, and one card per active session or agent (running,
-completed, failed), scaling to any number of parallel agents. Everything is
-local: claw appends telemetry JSONL to a file and the dashboard tails it —
-no data leaves the machine.
+Los niveles de modelo asignan la complejidad de cada tarea a cualquier proveedor con credenciales configuradas
+(Anthropic, OpenAI, xAI, DashScope, Ollama) — puedes sobrescribirlos por ejecución
+(`--simple-model qwen-turbo --complex-model gpt-4o`) o de forma persistente en
+`.claw/multiagent.json`. La ejecución falla rápido listando cualquier credencial que falte
+(la autenticación guardada de una suscripción de Anthropic también cuenta).
+El Director deja archivos de instrucciones por modelo (`CLAUDE.md`, `AGENTS.md`,
+`GROK.md`) en el proyecto describiendo cada rol. Define `CLAW_DASHBOARD_EVENTS`
+(o usa `--dashboard`) para observar cada agente en vivo, y
+`CLAW_MULTIAGENT_REINDEX_CMD` para reindexar codebase-memory tras cada
+entrega supervisada.
 
-The one-command path:
+## Dashboard en vivo de tokens y agentes
+
+`claw-dashboard` sirve una UI web local que muestra en vivo el uso de tokens de
+entrada/salida/cache, el coste estimado y una tarjeta por cada sesión o agente activo (en ejecución,
+completado, fallido), escalando a cualquier número de agentes en paralelo. Todo es
+local: claw añade telemetría JSONL a un archivo y el dashboard lo sigue en cola —
+ningún dato sale de la máquina.
+
+La vía de un solo comando:
 
 ```bash
 claw --dashboard
 ```
 
-This starts `claw-dashboard` on port 4110 (or reuses a running one), points
-`CLAW_DASHBOARD_EVENTS` at `.claw/telemetry/events.jsonl`, and opens the
-browser. The dashboard binary must sit next to `claw` (both do after
+Esto inicia `claw-dashboard` en el puerto 4110 (o reutiliza uno en ejecución), apunta
+`CLAW_DASHBOARD_EVENTS` a `.claw/telemetry/events.jsonl` y abre el
+navegador. El binario del dashboard debe estar junto a `claw` (ambos lo están tras
 `cargo build -p rusty-claude-cli -p claw-dashboard`).
 
-Manual setup, useful for many parallel claws sharing one dashboard:
+Configuración manual, útil para muchos claws en paralelo compartiendo un dashboard:
 
 ```bash
-# Terminal 1: start the dashboard (defaults to port 4110).
-# --truncate discards history from previous sessions.
+# Terminal 1: inicia el dashboard (por defecto en el puerto 4110).
+# --truncate descarta el historial de sesiones anteriores.
 cd rust
 cargo run -p claw-dashboard -- --events /tmp/claw-events.jsonl --truncate
 
-# Terminal 2..N: run claw pointed at the same events file, one label each
+# Terminal 2..N: ejecuta claw apuntando al mismo archivo de eventos, una etiqueta cada uno
 CLAW_DASHBOARD_EVENTS=/tmp/claw-events.jsonl CLAW_AGENT_LABEL="migrate tests" claw
 ```
 
-Open http://127.0.0.1:4110. Each claw process appears as its own card
-(named by `CLAW_AGENT_LABEL` when set), with started/finished/failed
-lifecycle tracked automatically. Updates arrive over SSE push with a
-polling fallback. Usage is traced for Anthropic and OpenAI-compatible
-providers (OpenAI, xAI, DashScope, Ollama).
+Abre http://127.0.0.1:4110. Cada proceso claw aparece como su propia tarjeta
+(nombrada por `CLAW_AGENT_LABEL` cuando está definida), con el ciclo de vida
+iniciado/terminado/fallido rastreado automáticamente. Las actualizaciones llegan por push SSE con un
+fallback de polling. El uso se rastrea para Anthropic y para proveedores compatibles con OpenAI
+(OpenAI, xAI, DashScope, Ollama).
 
-## Verification
+## Verificación
 
 ```bash
 cd rust
 cargo test --workspace
 ```
 
-## Workspace overview
+## Visión general del workspace
 
-Current Rust crates:
+Crates de Rust actuales:
 
 - `api`
 - `claw-analog`
