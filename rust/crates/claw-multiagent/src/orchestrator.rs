@@ -473,7 +473,42 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
             Err(test_error) => {
                 workflow.event("qa_tests_failed", &[("error", test_error.clone())]);
-                workflow.phase(&format!("⚠ QA tests fallaron:\n{}", test_error));
+                workflow.phase(&format!(
+                    "⚠ QA tests fallaron, dispatch Fixer: {}",
+                    test_error
+                ));
+
+                // Dispatch Fixer to repair test failures.
+                let fixer_report = run_single(
+                    Role::Fixer,
+                    &options.catalog.supervisor,
+                    options,
+                    &format!(
+                        "The generated tests are failing:\n\n```\n{}\n```\n\n\
+                         Analyze the failures, fix the source code or tests to make them pass, \
+                         and report what you changed.",
+                        test_error
+                    ),
+                )?;
+                save_doc(&docs, "fixer-qa-report.md", &fixer_report.report)?;
+                let _ = git_commit(&options.project_dir, "fix: repair test failures (Fixer)");
+
+                // Retry tests after fixes.
+                workflow.phase("Reintentando tests después de fixes del Fixer");
+                match run_tests_for_qa(&options.project_dir, &options.build_command) {
+                    Ok(test_output) => {
+                        workflow.event("qa_tests_fixed", &[("output", test_output)]);
+                        let _ =
+                            git_commit(&options.project_dir, "qa: all tests passed (after fixes)");
+                    }
+                    Err(retry_error) => {
+                        workflow.event("qa_tests_still_failing", &[("error", retry_error.clone())]);
+                        workflow.phase(&format!(
+                            "✗ Tests aún fallan después de fixes:\n{}",
+                            retry_error
+                        ));
+                    }
+                }
             }
         }
 
