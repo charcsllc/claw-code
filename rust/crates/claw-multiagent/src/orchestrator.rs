@@ -197,6 +197,17 @@ impl Drop for BuildGuard {
 pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     options.catalog.validate_credentials()?;
 
+    // In Improve mode the project must already have code: refuse an empty
+    // directory (the user wants /web there, not /improve). Checked BEFORE any
+    // side effect so a rejected target is not left with docs/ or a new .git/.
+    if options.mode.is_improve() && !project_has_sources(&options.project_dir) {
+        return Err(format!(
+            "improve target `{}` has no source files to improve; create a project \
+             first with a web/app build",
+            options.project_dir.display()
+        ));
+    }
+
     let abort_guard = BuildGuard::new();
 
     let workflow = WorkflowLog::new();
@@ -224,15 +235,6 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         ));
     }
 
-    // In Improve mode the project must already have code: refuse an empty
-    // directory (the user wants /web there, not /improve).
-    if options.mode.is_improve() && !project_has_sources(&options.project_dir) {
-        return Err(format!(
-            "--improve target `{}` has no source files to improve; use a web/app \
-             build to create a project first",
-            options.project_dir.display()
-        ));
-    }
     // For Improve, a bounded snapshot of the existing repo (tree + manifests)
     // grounds every planning agent in what already exists. Developers still
     // read individual files themselves via their tools.
@@ -427,8 +429,13 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     };
 
     // Instruction files per model family (CLAUDE.md / AGENTS.md / GROK.md).
-    let instruction_files =
-        write_role_instruction_files(&options.project_dir, &options.catalog, options.kind)?;
+    // In Improve mode, never overwrite the user's existing files.
+    let instruction_files = write_role_instruction_files(
+        &options.project_dir,
+        &options.catalog,
+        options.kind,
+        options.mode.is_improve(),
+    )?;
     workflow.phase(&format!(
         "Archivos de rol por modelo escritos: {}",
         instruction_files.join(", ")
@@ -1382,13 +1389,13 @@ pub fn repo_digest(project_dir: &Path) -> String {
     let mut pending = vec![project_dir.to_path_buf()];
     let mut budget = 4_000_usize;
 
-    while let Some(dir) = pending.pop() {
+    'walk: while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
             if budget == 0 || files.len() >= 400 {
-                break;
+                break 'walk;
             }
             budget -= 1;
             let path = entry.path();

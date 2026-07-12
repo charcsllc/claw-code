@@ -170,10 +170,15 @@ pub fn instruction_filename_for_model(model: &str) -> &'static str {
 /// Writes one instruction file per model family used in this run, listing
 /// each role, the model that executes it, and its responsibility — the spec
 /// requires the Director/Subdirector to leave these files in the project.
+///
+/// When `preserve_existing` is set (Improve mode over an existing repo), a
+/// file that already exists is left untouched — the user's own `CLAUDE.md`
+/// (their project instructions) must never be overwritten.
 pub fn write_role_instruction_files(
     project_dir: &Path,
     catalog: &ModelCatalog,
     kind: ProjectKind,
+    preserve_existing: bool,
 ) -> Result<Vec<String>, String> {
     let assignments: Vec<(Role, &str)> = vec![
         (Role::Director, catalog.director.as_str()),
@@ -221,6 +226,12 @@ pub fn write_role_instruction_files(
              TaskSpec exactly; justify any decision the spec does not cover.\n",
         );
         let path = project_dir.join(filename);
+        if preserve_existing && path.exists() {
+            // The user's own instruction file stays; our role table is
+            // supplementary (each agent also gets its role via its system
+            // prompt).
+            continue;
+        }
         std::fs::write(&path, body).map_err(|error| error.to_string())?;
         written.push(filename.to_string());
     }
@@ -265,7 +276,7 @@ mod tests {
             ..ModelCatalog::default()
         };
 
-        let files = write_role_instruction_files(&dir, &catalog, ProjectKind::Web)
+        let files = write_role_instruction_files(&dir, &catalog, ProjectKind::Web, false)
             .expect("instruction files");
         assert!(files.contains(&"CLAUDE.md".to_string()));
         assert!(files.contains(&"AGENTS.md".to_string()));
@@ -275,6 +286,31 @@ mod tests {
         let agents = std::fs::read_to_string(dir.join("AGENTS.md")).expect("agents md");
         assert!(agents.contains("Documentación"));
         assert!(agents.contains("qwen-turbo"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preserve_existing_keeps_the_users_instruction_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "roles-preserve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("CLAUDE.md"), "USER PROJECT INSTRUCTIONS").expect("seed");
+
+        let catalog = ModelCatalog::default();
+        let written = write_role_instruction_files(&dir, &catalog, ProjectKind::Web, true)
+            .expect("instruction files");
+
+        // The user's CLAUDE.md is untouched and not reported as written.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("CLAUDE.md")).expect("claude"),
+            "USER PROJECT INSTRUCTIONS"
+        );
+        assert!(!written.contains(&"CLAUDE.md".to_string()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
