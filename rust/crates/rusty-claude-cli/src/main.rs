@@ -6892,6 +6892,7 @@ fn run_resume_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Web { .. }
         | SlashCommand::App { .. }
+        | SlashCommand::Improve { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -8150,6 +8151,7 @@ impl LiveCli {
             SlashCommand::Web { prompt } => {
                 multiagent_build::run_multiagent_build(
                     claw_multiagent::ProjectKind::Web,
+                    claw_multiagent::BuildMode::Greenfield,
                     prompt.as_deref(),
                 )?;
                 false
@@ -8157,6 +8159,15 @@ impl LiveCli {
             SlashCommand::App { prompt } => {
                 multiagent_build::run_multiagent_build(
                     claw_multiagent::ProjectKind::App,
+                    claw_multiagent::BuildMode::Greenfield,
+                    prompt.as_deref(),
+                )?;
+                false
+            }
+            SlashCommand::Improve { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::Web,
+                    claw_multiagent::BuildMode::Improve,
                     prompt.as_deref(),
                 )?;
                 false

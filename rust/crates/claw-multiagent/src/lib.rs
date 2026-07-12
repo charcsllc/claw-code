@@ -29,5 +29,5 @@ pub mod orchestrator;
 pub mod roles;
 
 pub use catalog::ModelCatalog;
-pub use contracts::{ProjectKind, TaskSpec};
+pub use contracts::{BuildMode, ProjectKind, TaskSpec};
 pub use orchestrator::{run, RunOptions, RunSummary};

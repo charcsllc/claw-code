@@ -728,6 +728,23 @@ Dentro de una sesión interactiva de claw, simplemente escribe:
 ```
 /web un ecommerce para vender productos electrónicos --dry-run
 /app app de notas offline para Android [--parallel N] [--output <dir>]
+/improve añade un carrito con Stripe   # sobre el proyecto del directorio actual
+```
+
+**Modo `/improve` (proyecto existente).** Mismo pipeline, pero en vez de crear
+un proyecto desde cero, opera sobre uno que ya existe: analiza el repo (árbol de
+archivos + manifiestos), el Director planifica **solo el cambio pedido** (sin
+re-planificar el producto), y las olas de developers lo implementan respetando el
+stack y las convenciones detectadas — prefiriendo modificar archivos existentes
+antes que crear nuevos. Se saltan las fases de andamiaje greenfield (scaffold,
+contratos, design system, seed data, pack de deploy) porque el proyecto ya las
+tiene; se mantienen el build gate, la verificación por entrega, la supervisión, los
+tests y un commit de git por tarea. Por defecto trabaja sobre el **directorio
+actual** (`--output .`); apúntalo a otro con `--output <dir>`. Requiere que el
+directorio ya contenga código (si está vacío, usa `/web` o `/app`).
+
+```
+/improve migra los componentes de clase a hooks --output ./mi-app --approve
 ```
 
 O usa el binario independiente:

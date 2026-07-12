@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 
-use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
+use claw_multiagent::{run, BuildMode, ModelCatalog, ProjectKind, RunOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +24,8 @@ enum Aplicativo {
     Web(CommonArgs),
     /// Build an application (Windows/Linux/macOS/Android/iOS/tablets).
     App(CommonArgs),
+    /// Improve an EXISTING project: add a feature or fix, in place.
+    Improve(CommonArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -221,18 +223,21 @@ fn launch_dashboard(project_dir: &std::path::Path) {
 
 fn main() {
     let args = Args::parse();
-    let (kind, common) = match args.aplicativo {
-        Aplicativo::Web(common) => (ProjectKind::Web, common),
-        Aplicativo::App(common) => (ProjectKind::App, common),
+    let (kind, mode, common) = match args.aplicativo {
+        Aplicativo::Web(common) => (ProjectKind::Web, BuildMode::Greenfield, common),
+        Aplicativo::App(common) => (ProjectKind::App, BuildMode::Greenfield, common),
+        // Improve keeps the Web role set (architects/UX), but runs the
+        // existing-project pipeline; the stack is detected from the repo.
+        Aplicativo::Improve(common) => (ProjectKind::Web, BuildMode::Improve, common),
     };
 
-    if let Err(error) = execute(kind, common) {
+    if let Err(error) = execute(kind, mode, common) {
         eprintln!("error: {error}");
         std::process::exit(1);
     }
 }
 
-fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
+fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(), String> {
     std::fs::create_dir_all(&common.output).map_err(|error| error.to_string())?;
     let project_dir = common
         .output
@@ -276,6 +281,7 @@ fn execute(kind: ProjectKind, common: CommonArgs) -> Result<(), String> {
 
     let summary = run(&RunOptions {
         kind,
+        mode,
         prompt: common.prompt,
         project_dir,
         catalog,

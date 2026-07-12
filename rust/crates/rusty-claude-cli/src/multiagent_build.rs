@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use claw_multiagent::{run, ModelCatalog, ProjectKind, RunOptions};
+use claw_multiagent::{run, BuildMode, ModelCatalog, ProjectKind, RunOptions};
 
 /// Restores the REPL's working directory and `CLAWD_AGENT_STORE` when
 /// dropped, so a build that errors, `?`s, or panics after mutating them
@@ -46,6 +46,7 @@ const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N]
 /// continues where it was.
 pub(crate) fn run_multiagent_build(
     kind: ProjectKind,
+    mode: BuildMode,
     raw: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let raw = raw.unwrap_or("").trim();
@@ -60,7 +61,13 @@ pub(crate) fn run_multiagent_build(
     let mut scaffold = true;
     let mut approve = false;
     let mut parallel = 4_usize;
-    let mut output = PathBuf::from("./multiagent-project");
+    // Improve works on the project you are already in; greenfield builds
+    // scaffold into a fresh subdirectory.
+    let mut output = if mode.is_improve() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from("./multiagent-project")
+    };
     let mut max_cost_usd: Option<f64> = None;
     let mut build_cmd: Option<String> = None;
     let tokens: Vec<&str> = raw.split_whitespace().collect();
@@ -133,6 +140,7 @@ pub(crate) fn run_multiagent_build(
 
     let result = run(&RunOptions {
         kind,
+        mode,
         prompt,
         project_dir,
         catalog,

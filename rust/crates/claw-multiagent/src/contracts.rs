@@ -29,6 +29,24 @@ impl ProjectKind {
     }
 }
 
+/// Greenfield build (create a project from scratch) vs. improving an
+/// existing codebase in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildMode {
+    /// Create a new project from a single prompt (`/web`, `/app`).
+    #[default]
+    Greenfield,
+    /// Add a feature or fix to an existing project in place (`/improve`).
+    Improve,
+}
+
+impl BuildMode {
+    #[must_use]
+    pub const fn is_improve(self) -> bool {
+        matches!(self, Self::Improve)
+    }
+}
+
 /// Task complexity drives the model tier that executes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

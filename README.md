@@ -112,7 +112,7 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 
 ## Novedades destacadas
 
-- **Plataforma multiagente (`/web` y `/app`)** — a partir de un solo prompt, una jerarquía de agentes (Director → Arquitectos → Subdirector → developers en paralelo → Supervisor → Técnico → QA → Docs) construye un proyecto web o una aplicación completa: scaffold determinista, contratos de tipos compartidos, scheduler por grafo sin barreras, verificación por entrega, build gate, tests reales, smoke test del servidor y un commit de git por tarea. Detalles y flags en [`USAGE.md`](./USAGE.md).
+- **Plataforma multiagente (`/web`, `/app` y `/improve`)** — a partir de un solo prompt, una jerarquía de agentes (Director → Arquitectos → Subdirector → developers en paralelo → Supervisor → Técnico → QA → Docs) construye un proyecto web o una aplicación completa: scaffold determinista, contratos de tipos compartidos, scheduler por grafo sin barreras, verificación por entrega, build gate, tests reales, smoke test del servidor y un commit de git por tarea. Con **`/improve`** el mismo pipeline opera sobre un **proyecto ya existente**: analiza el repo, planifica solo el cambio y lo implementa respetando el stack y las convenciones actuales. Detalles y flags en [`USAGE.md`](./USAGE.md).
 - **Dashboard local (`claw-dashboard`)** — telemetría en vivo en el navegador: tokens de entrada/salida por sesión, coste estimado, y el workflow multiagente con cada agente en ejecución/terminado en tiempo real. 100 % local (lee un JSONL; nada sale de tu máquina).
 - **`claw mcp add` / `claw mcp remove`** — instalación de servidores MCP en un comando (stdio, HTTP, SSE), con validación y rollback seguro de la configuración.
 

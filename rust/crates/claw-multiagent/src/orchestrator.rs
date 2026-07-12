@@ -19,7 +19,7 @@ use crate::agents::{
 };
 use crate::catalog::ModelCatalog;
 use crate::contracts::{
-    schedule_waves, Complexity, Plan, ProjectKind, SupervisionVerdict, TaskSpec,
+    schedule_waves, BuildMode, Complexity, Plan, ProjectKind, SupervisionVerdict, TaskSpec,
 };
 use crate::roles::{system_prompt, write_role_instruction_files, Role};
 
@@ -63,6 +63,8 @@ impl WorkflowLog {
 
 pub struct RunOptions {
     pub kind: ProjectKind,
+    /// Greenfield (create) vs. Improve (modify an existing project in place).
+    pub mode: BuildMode,
     pub prompt: String,
     pub project_dir: PathBuf,
     pub catalog: ModelCatalog,
@@ -222,6 +224,29 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         ));
     }
 
+    // In Improve mode the project must already have code: refuse an empty
+    // directory (the user wants /web there, not /improve).
+    if options.mode.is_improve() && !project_has_sources(&options.project_dir) {
+        return Err(format!(
+            "--improve target `{}` has no source files to improve; use a web/app \
+             build to create a project first",
+            options.project_dir.display()
+        ));
+    }
+    // For Improve, a bounded snapshot of the existing repo (tree + manifests)
+    // grounds every planning agent in what already exists. Developers still
+    // read individual files themselves via their tools.
+    let repo_context = if options.mode.is_improve() {
+        workflow.phase("Analizando el proyecto existente");
+        let digest = repo_digest(&options.project_dir);
+        format!(
+            "\n\n## Existing project (the codebase you are improving)\n{digest}\n\
+             Respect its existing stack, structure and conventions."
+        )
+    } else {
+        String::new()
+    };
+
     // ---- Planning (Director → open questions → Architects → Subdirector),
     //      or reuse from disk when resuming. ----
     let (plan, tasks) = if options.resume && planning_artifacts_exist(&docs) {
@@ -229,15 +254,33 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         load_planning_artifacts(&docs)?
     } else {
         // Phase 1: Director General.
-        workflow.phase("Director General: interpretando el prompt y creando el plan");
+        let director_task = if options.mode.is_improve() {
+            format!(
+                "You are improving an EXISTING project.{repo_context}\n\nRequested \
+                 change:\n{}\n\nProduce a FOCUSED plan for THIS CHANGE ONLY — do not \
+                 re-plan or rewrite the whole product. `vision` describes the change; \
+                 `scope` lists exactly what will be touched; `stack` must reflect the \
+                 EXISTING stack you detected from the files (do not switch \
+                 frameworks). Keep the change minimal and consistent with the \
+                 codebase.\n{}",
+                options.prompt, DIRECTOR_JSON_SCHEMA
+            )
+        } else {
+            format!(
+                "User prompt:\n{}\n\nProduce the complete product plan.\n{}",
+                options.prompt, DIRECTOR_JSON_SCHEMA
+            )
+        };
+        workflow.phase(if options.mode.is_improve() {
+            "Director: planificando el cambio sobre el proyecto existente"
+        } else {
+            "Director General: interpretando el prompt y creando el plan"
+        });
         let director_report = run_single(
             Role::Director,
             &options.catalog.director,
             options,
-            &format!(
-                "User prompt:\n{}\n\nProduce the complete product plan.\n{}",
-                options.prompt, DIRECTOR_JSON_SCHEMA
-            ),
+            &director_task,
         )?;
         let plan: Plan = retry_parse_json_with_feedback(
             &director_report,
@@ -293,8 +336,15 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 role.subagent_type(),
                 &system_prompt(*role, options.kind),
                 &format!(
-                    "Plan:\n```json\n{plan_json}\n```{decisions}\n\nDeliver your \
-                     complete design document in Markdown, justifying every decision."
+                    "Plan:\n```json\n{plan_json}\n```{decisions}{repo_context}\n\n\
+                     Deliver your complete design document in Markdown, justifying \
+                     every decision.{}",
+                    if options.mode.is_improve() {
+                        " Design the change to fit the EXISTING architecture; read \
+                         the relevant existing files and reuse their patterns."
+                    } else {
+                        ""
+                    }
                 ),
                 &[],
             )?;
@@ -316,10 +366,22 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         // Phase 3: Subdirector turns plan + designs into the backlog.
         workflow.phase("Subdirector Técnico: creando el backlog desde los diseños");
         let subdirector_prompt = format!(
-            "Approved plan:\n```json\n{plan_json}\n```{decisions}\n\nArchitect \
-             designs (authoritative):{designs_digest}\n\nBreak the project into \
+            "Approved plan:\n```json\n{plan_json}\n```{decisions}{repo_context}\n\n\
+             Architect designs (authoritative):{designs_digest}\n\nBreak {} into \
              fully specified, parallelizable TaskSpecs that implement these \
-             designs.\n{SUBDIRECTOR_JSON_SCHEMA}"
+             designs.{}\n{SUBDIRECTOR_JSON_SCHEMA}",
+            if options.mode.is_improve() {
+                "the change"
+            } else {
+                "the project"
+            },
+            if options.mode.is_improve() {
+                " Prefer `files_to_modify` for existing files; only list \
+                 `files_to_create` for genuinely new files. Every task must follow \
+                 the existing conventions and must NOT rewrite unrelated code."
+            } else {
+                ""
+            }
         );
         let subdirector_report = run_single(
             Role::Subdirector,
@@ -404,10 +466,15 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         });
     }
 
+    // Scaffold, contracts and the design system establish a NEW project's
+    // foundation; an existing project already has all three, so Improve mode
+    // skips straight to the developer waves.
+    let greenfield = !options.mode.is_improve();
+
     // ---- Deterministic scaffold: generated boilerplate is the most
     //      failure-prone and most token-expensive part of a build, and the
     //      part an LLM adds no value to. ----
-    if options.scaffold {
+    if greenfield && options.scaffold {
         scaffold_project(options, &plan, &workflow);
     }
 
@@ -415,7 +482,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     //      real project structure). Cross-module consistency is then
     //      enforced by the typechecker at the build gate instead of by
     //      every developer correctly reading a truncated prose digest. ----
-    if !docs.join("contracts.md").exists() {
+    if greenfield && !docs.join("contracts.md").exists() {
         workflow.phase("Contratos: generando interfaces compartidas como código");
         match run_single(
             Role::SoftwareArchitect,
@@ -447,7 +514,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // ---- Design system: tokens and base components as real files, so
     //      every developer composes over the same visual foundation
     //      instead of writing ad-hoc CSS. ----
-    if options.project_dir.join("package.json").exists() && !docs.join("design-system.md").exists()
+    if greenfield
+        && options.project_dir.join("package.json").exists()
+        && !docs.join("design-system.md").exists()
     {
         workflow.phase("Design system: tokens y componentes base");
         match run_single(
@@ -708,8 +777,8 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         run_performance_gate(options, &workflow, &supervision_md)?;
 
         // ---- Seed data: the first impression must never be an empty
-        //      table and a spinner ----
-        if !docs.join("seed-data.md").exists() {
+        //      table and a spinner (greenfield only) ----
+        if greenfield && !docs.join("seed-data.md").exists() {
             workflow.phase("Seed data: poblando la app con datos de demostración");
             match run_single(
                 Role::Developer,
@@ -839,7 +908,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
 
         // ---- Deploy pack: real files, not prose ----
-        if !options.project_dir.join("Dockerfile").exists() {
+        if greenfield && !options.project_dir.join("Dockerfile").exists() {
             workflow.phase("Pack de deploy: Dockerfile, CI y config de plataforma");
             match run_single(
                 Role::DevOpsArchitect,
@@ -1216,6 +1285,148 @@ fn copy_dir_recursive(from: &Path, to: &Path) {
             let _ = std::fs::copy(&source, &target);
         }
     }
+}
+
+// ---------- Improve mode (existing-project analysis) ----------
+
+/// Directories never worth showing the planner (deps, build output, VCS,
+/// our own artifacts).
+const REPO_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".svelte-kit",
+    ".multiagent",
+    ".scaffold",
+    "docs",
+    "vendor",
+    ".venv",
+    "__pycache__",
+];
+
+/// Manifest/config files whose full contents anchor the planner in the
+/// project's real stack.
+const REPO_MANIFEST_FILES: &[&str] = &[
+    "package.json",
+    "Cargo.toml",
+    "tsconfig.json",
+    "pyproject.toml",
+    "go.mod",
+    "requirements.txt",
+    "vite.config.ts",
+    "vite.config.js",
+    "next.config.js",
+    "svelte.config.js",
+    "tailwind.config.js",
+    "tailwind.config.ts",
+];
+
+/// True when the directory contains at least one source file worth
+/// improving (used to reject `/improve` on an empty target).
+#[must_use]
+pub fn project_has_sources(project_dir: &Path) -> bool {
+    let mut pending = vec![project_dir.to_path_buf()];
+    let mut budget = 2_000_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !REPO_SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
+                    pending.push(path);
+                }
+            } else if REPO_MANIFEST_FILES.contains(&name.as_str())
+                || matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some(
+                        "ts" | "tsx"
+                            | "js"
+                            | "jsx"
+                            | "rs"
+                            | "py"
+                            | "go"
+                            | "vue"
+                            | "svelte"
+                            | "html"
+                            | "css"
+                    )
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A bounded snapshot of an existing repo for the planning agents: a file
+/// tree (capped) plus the full text of the key manifest files. Developers
+/// read individual source files themselves via their tools, so the digest
+/// stays small regardless of repo size.
+#[must_use]
+pub fn repo_digest(project_dir: &Path) -> String {
+    let mut files: Vec<(String, u64)> = Vec::new();
+    let mut manifests: Vec<(String, String)> = Vec::new();
+    let mut pending = vec![project_dir.to_path_buf()];
+    let mut budget = 4_000_usize;
+
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 || files.len() >= 400 {
+                break;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !REPO_SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let rel = path
+                .strip_prefix(project_dir)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if REPO_MANIFEST_FILES.contains(&name.as_str()) && manifests.len() < 12 {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    manifests.push((rel.clone(), truncate_chars(&content, 3_000)));
+                }
+            }
+            files.push((rel, size));
+        }
+    }
+
+    files.sort();
+    let mut out = String::from("### File tree\n```\n");
+    for (rel, size) in files.iter().take(400) {
+        let _ = writeln!(out, "{rel} ({size} B)");
+    }
+    if files.len() >= 400 {
+        out.push_str("… (tree truncated)\n");
+    }
+    out.push_str("```\n");
+    for (rel, content) in &manifests {
+        let _ = write!(out, "\n### {rel}\n```\n{content}\n```\n");
+    }
+    out
 }
 
 // ---------- Security gate ----------
@@ -2476,6 +2687,68 @@ fn run_tests_for_qa(project_dir: &Path, build_cmd: &Option<String>) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn improve_temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-improve-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    #[test]
+    fn project_has_sources_detects_code_and_rejects_empty() {
+        let empty = improve_temp_dir("empty");
+        assert!(!project_has_sources(&empty));
+        // A dir with only node_modules/docs is still "empty" for improve.
+        std::fs::create_dir_all(empty.join("node_modules")).expect("nm");
+        std::fs::write(empty.join("node_modules/x.js"), "ignored").expect("w");
+        assert!(!project_has_sources(&empty));
+
+        let project = improve_temp_dir("withcode");
+        std::fs::create_dir_all(project.join("src")).expect("src");
+        std::fs::write(project.join("src/main.ts"), "export const x = 1;").expect("w");
+        assert!(project_has_sources(&project));
+
+        let _ = std::fs::remove_dir_all(empty);
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn repo_digest_lists_tree_and_inlines_manifests() {
+        let project = improve_temp_dir("digest");
+        std::fs::create_dir_all(project.join("src/auth")).expect("dirs");
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"name":"demo","dependencies":{"react":"19"}}"#,
+        )
+        .expect("pkg");
+        std::fs::write(project.join("src/auth/login.ts"), "// login").expect("w");
+        // Skipped dirs must not appear in the digest.
+        std::fs::create_dir_all(project.join("node_modules/dep")).expect("nm");
+        std::fs::write(project.join("node_modules/dep/index.js"), "big").expect("w");
+
+        let digest = repo_digest(&project);
+        assert!(digest.contains("src/auth/login.ts"), "tree lists sources");
+        assert!(digest.contains("package.json"), "manifest listed");
+        assert!(digest.contains("\"react\""), "manifest contents inlined");
+        assert!(
+            !digest.contains("node_modules"),
+            "dependency dir must be skipped: {digest}"
+        );
+        let _ = std::fs::remove_dir_all(project);
+    }
+
+    #[test]
+    fn build_mode_is_improve() {
+        assert!(BuildMode::Improve.is_improve());
+        assert!(!BuildMode::Greenfield.is_improve());
+        assert!(!BuildMode::default().is_improve());
+    }
 
     #[test]
     fn simple_web_stack_skips_backend_architect() {

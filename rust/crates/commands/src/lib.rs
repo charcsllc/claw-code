@@ -259,6 +259,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "improve",
+        aliases: &[],
+        summary: "Improve an EXISTING project: add a feature or fix, in place (multi-agent)",
+        argument_hint: Some("<change> [--output <dir>] [--dry-run] [--approve] [--parallel N]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1127,6 +1134,10 @@ pub enum SlashCommand {
     App {
         prompt: Option<String>,
     },
+    /// Autonomous multi-agent improvement of an EXISTING project.
+    Improve {
+        prompt: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1318,6 +1329,7 @@ impl SlashCommand {
             Self::Export { .. } => "/export",
             Self::Web { .. } => "/web",
             Self::App { .. } => "/app",
+            Self::Improve { .. } => "/improve",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1420,6 +1432,7 @@ pub fn validate_slash_command_input(
         },
         "web" => SlashCommand::Web { prompt: remainder },
         "app" => SlashCommand::App { prompt: remainder },
+        "improve" => SlashCommand::Improve { prompt: remainder },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -5899,6 +5912,7 @@ pub fn handle_slash_command(
         | SlashCommand::Sandbox
         | SlashCommand::Web { .. }
         | SlashCommand::App { .. }
+        | SlashCommand::Improve { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
@@ -6765,7 +6779,8 @@ mod tests {
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
-        assert_eq!(slash_command_specs().len(), 142);
+        assert!(help.contains("/improve"));
+        assert_eq!(slash_command_specs().len(), 143);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 
