@@ -6,15 +6,21 @@ const PROVIDERS: &[(&str, &str, &str)] = &[
     ("1", "Anthropic", "anthropic"),
     ("2", "xAI / Grok", "xai"),
     ("3", "OpenAI", "openai"),
-    ("4", "DashScope (Qwen/Kimi)", "dashscope"),
-    ("5", "Custom (OpenAI-compat)", "openai"),
+    ("4", "DashScope (Qwen)", "dashscope"),
+    ("5", "Zhipu / Z.ai (GLM, coding plan)", "zhipu"),
+    ("6", "Moonshot / Kimi", "kimi"),
+    ("7", "DeepSeek", "deepseek"),
+    ("8", "Custom (OpenAI-compat)", "openai"),
 ];
 
 const PROVIDER_MODELS: &[(&str, &[&str])] = &[
     ("anthropic", &["opus", "sonnet", "haiku"]),
     ("xai", &["grok", "grok-mini", "grok-2"]),
     ("openai", &["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"]),
-    ("dashscope", &["qwen-plus", "qwen-max", "kimi"]),
+    ("dashscope", &["qwen-plus", "qwen-max", "qwen3-coder"]),
+    ("zhipu", &["glm-4.6", "glm-4.5-air"]),
+    ("kimi", &["kimi-k2-0905-preview", "kimi-k2-turbo-preview"]),
+    ("deepseek", &["deepseek-chat", "deepseek-reasoner"]),
 ];
 
 const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
@@ -25,6 +31,11 @@ const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
         "dashscope",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ),
+    // Anthropic-protocol endpoints of the Chinese coding providers: their
+    // tokens ride ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL.
+    ("zhipu", "https://api.z.ai/api/anthropic"),
+    ("kimi", "https://api.moonshot.ai/anthropic"),
+    ("deepseek", "https://api.deepseek.com"),
 ];
 
 const API_KEY_ENV_VARS: &[(&str, &str)] = &[
@@ -32,6 +43,9 @@ const API_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("xai", "XAI_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("dashscope", "DASHSCOPE_API_KEY"),
+    ("zhipu", "ANTHROPIC_AUTH_TOKEN"),
+    ("kimi", "ANTHROPIC_AUTH_TOKEN"),
+    ("deepseek", "OPENAI_API_KEY"),
 ];
 
 pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
@@ -178,9 +192,9 @@ fn prompt_base_url(
 
     // Check if the relevant env var is already set
     let env_var = match kind {
-        "anthropic" => "ANTHROPIC_BASE_URL",
+        "anthropic" | "zhipu" | "kimi" => "ANTHROPIC_BASE_URL",
         "xai" => "XAI_BASE_URL",
-        "openai" => "OPENAI_BASE_URL",
+        "openai" | "deepseek" => "OPENAI_BASE_URL",
         "dashscope" => "DASHSCOPE_BASE_URL",
         _ => "BASE_URL",
     };

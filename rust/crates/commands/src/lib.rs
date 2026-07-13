@@ -266,6 +266,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "provider",
+        aliases: &[],
+        summary: "Show or switch the AI provider (anthropic/zhipu/kimi/deepseek/qwen/ollama)",
+        argument_hint: Some("[show|list|use <provider> <api-key> [model]|clear]"),
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "skills",
         aliases: &["skill"],
         summary: "List, install, uninstall, or invoke available skills",
@@ -1138,6 +1145,10 @@ pub enum SlashCommand {
     Improve {
         prompt: Option<String>,
     },
+    /// Show or switch the configured AI provider.
+    Provider {
+        args: Option<String>,
+    },
     Skills {
         args: Option<String>,
     },
@@ -1330,6 +1341,7 @@ impl SlashCommand {
             Self::Web { .. } => "/web",
             Self::App { .. } => "/app",
             Self::Improve { .. } => "/improve",
+            Self::Provider { .. } => "/provider",
             #[allow(unreachable_patterns)]
             _ => "/unknown",
         }
@@ -1433,6 +1445,7 @@ pub fn validate_slash_command_input(
         "web" => SlashCommand::Web { prompt: remainder },
         "app" => SlashCommand::App { prompt: remainder },
         "improve" => SlashCommand::Improve { prompt: remainder },
+        "provider" => SlashCommand::Provider { args: remainder },
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
@@ -5913,6 +5926,7 @@ pub fn handle_slash_command(
         | SlashCommand::Web { .. }
         | SlashCommand::App { .. }
         | SlashCommand::Improve { .. }
+        | SlashCommand::Provider { .. }
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Clear { .. }
@@ -6780,7 +6794,8 @@ mod tests {
         assert!(!help.contains("/logout"));
         assert!(help.contains("/setup"));
         assert!(help.contains("/improve"));
-        assert_eq!(slash_command_specs().len(), 143);
+        assert!(help.contains("/provider"));
+        assert_eq!(slash_command_specs().len(), 144);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

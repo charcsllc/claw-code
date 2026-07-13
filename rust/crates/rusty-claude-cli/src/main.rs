@@ -18,6 +18,7 @@ mod dashboard;
 mod init;
 mod input;
 mod multiagent_build;
+mod provider_presets;
 mod render;
 mod setup_wizard;
 
@@ -1014,6 +1015,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
+    // Make the provider saved by /setup or /provider actually take effect:
+    // export its credentials as env vars (env always wins over the file).
+    // Runs AFTER the JSON-mode warning suppression and --cwd handling, so
+    // loading the settings here cannot leak deprecation prose into JSON
+    // surfaces and resolves against the effective working directory.
+    provider_presets::apply_saved_provider_settings();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -6893,6 +6900,7 @@ fn run_resume_command(
         | SlashCommand::Web { .. }
         | SlashCommand::App { .. }
         | SlashCommand::Improve { .. }
+        | SlashCommand::Provider { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -8170,6 +8178,13 @@ impl LiveCli {
                     claw_multiagent::BuildMode::Improve,
                     prompt.as_deref(),
                 )?;
+                false
+            }
+            SlashCommand::Provider { args } => {
+                println!(
+                    "{}",
+                    provider_presets::handle_provider_command(args.as_deref())
+                );
                 false
             }
             SlashCommand::Compact => {

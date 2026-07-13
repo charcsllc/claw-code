@@ -227,6 +227,20 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
 
     let _ = init_git_repo(&options.project_dir, &workflow);
 
+    // Improve commits one change per task; do it on a dedicated branch so
+    // the user's current branch stays exactly as they left it. They merge
+    // (or discard) the branch after reviewing.
+    if options.mode.is_improve() {
+        match create_improve_branch(&options.project_dir) {
+            Some(branch) => workflow.phase(&format!(
+                "Rama de trabajo: {branch} — tu rama original queda intacta"
+            )),
+            None => workflow.phase(
+                "Aviso: no se pudo crear una rama de trabajo; los commits irán a la rama actual",
+            ),
+        }
+    }
+
     let budget = Budget::new(options.max_cost_usd);
     if budget.enabled() {
         workflow.phase(&format!(
@@ -2477,6 +2491,25 @@ fn init_git_repo(project_dir: &Path, _workflow: &WorkflowLog) -> Result<(), Stri
         .status()
         .map_err(|error| format!("git init failed: {error}"))?;
     Ok(())
+}
+
+/// Creates and checks out a dedicated branch for an Improve run so the
+/// per-task commits never land on the user's current branch. Returns the
+/// branch name, or `None` when git is unavailable or the checkout failed.
+fn create_improve_branch(project_dir: &Path) -> Option<String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let branch = format!("multiagent/improve-{}", nanos % 1_000_000_000);
+    let status = std::process::Command::new("git")
+        .args(["checkout", "-b", &branch])
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    status.success().then_some(branch)
 }
 
 fn git_commit(project_dir: &Path, message: &str) -> Result<(), String> {

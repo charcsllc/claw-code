@@ -235,6 +235,25 @@ Alias de modelo admitidos actualmente por el CLI:
 
 ## Autenticación
 
+### `/provider` — configuración en un comando (recomendado)
+
+Dentro del REPL, un preset configura el proveedor completo (credencial, base
+URL y modelo por defecto), lo **aplica al instante** y lo **persiste** en
+`~/.claw/settings.json` (0600) para las próximas sesiones — sin tocar env vars:
+
+```
+/provider use zhipu <token-del-coding-plan>     # GLM vía endpoint Anthropic-compat
+/provider use kimi <api-key>                    # Moonshot Kimi
+/provider use deepseek <api-key>                # DeepSeek (OpenAI-compat)
+/provider use qwen <api-key>                    # Alibaba DashScope
+/provider use ollama [base-url]                 # local, sin clave
+/provider show                                  # qué hay guardado y qué env está activo
+/provider clear                                 # borra el proveedor guardado
+```
+
+Las variables de entorno siempre tienen prioridad sobre lo guardado: si
+`ANTHROPIC_API_KEY` está en tu shell, se usa esa.
+
 ### Clave de API
 
 ```bash
