@@ -1506,6 +1506,14 @@ pub fn repo_digest(project_dir: &Path) -> String {
     if let Some(log) = recent_git_log(project_dir) {
         let _ = write!(out, "### Recent commits\n```\n{log}\n```\n\n");
     }
+    // Uncommitted work is the most fragile part of the repo: planners must
+    // know about it so their tasks neither clobber nor duplicate it.
+    if let Some(status) = git_status_short(project_dir) {
+        let _ = write!(
+            out,
+            "### Uncommitted changes (work in progress — do not discard)\n```\n{status}\n```\n\n"
+        );
+    }
     out.push_str("### File tree\n```\n");
     for (rel, size) in files.iter().take(400) {
         let _ = writeln!(out, "{rel} ({size} B)");
@@ -1518,6 +1526,34 @@ pub fn repo_digest(project_dir: &Path) -> String {
         let _ = write!(out, "\n### {rel}\n```\n{content}\n```\n");
     }
     out
+}
+
+/// `git status --short` capped to 60 lines, or `None` when clean/no repo.
+fn git_status_short(project_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut shown: String = lines
+        .iter()
+        .take(60)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > 60 {
+        let _ = write!(shown, "\n… ({} more)", lines.len() - 60);
+    }
+    Some(shown)
 }
 
 /// The last 20 one-line commits, or `None` outside a repo with history.

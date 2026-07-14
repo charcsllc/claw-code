@@ -3851,8 +3851,9 @@ fn check_auth_health() -> DiagnosticCheck {
         .is_some_and(|value| !value.trim().is_empty());
     let any_auth_present = api_key_present || auth_token_present || openai_key_present;
     let prompt_ready = any_auth_present;
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
     let env_details = format!(
-        "Environment       api_key={} auth_token={} openai_key={}",
+        "Environment       api_key={} auth_token={} openai_key={}\nProvider          {provider_summary}\nProvider URL      {provider_url}",
         if api_key_present { "present" } else { "absent" },
         if auth_token_present {
             "present"
@@ -6211,21 +6212,36 @@ fn format_usage_report(tracker: &UsageTracker) -> String {
     )
 }
 
-/// `/context`: how full the session is relative to the auto-compaction
-/// trigger, so the user can `/compact` deliberately instead of being
-/// surprised mid-task.
-fn format_context_report(estimated_session_tokens: usize, cumulative_input_tokens: u32) -> String {
+/// `/context`: how full the session is — against the model's real context
+/// window and against the auto-compaction trigger — so the user can
+/// `/compact` deliberately instead of being surprised mid-task.
+fn format_context_report(
+    model: &str,
+    estimated_session_tokens: usize,
+    cumulative_input_tokens: u32,
+) -> String {
     let threshold = runtime::auto_compaction_threshold_from_env();
     let percent = cumulative_input_tokens
         .saturating_mul(100)
         .checked_div(threshold)
         .unwrap_or(0);
+    let window_lines = api::model_token_limit(&api::resolve_model_alias(model)).map_or_else(
+        || "\n  Context window   unknown for this model".to_string(),
+        |limit| {
+            let window = limit.context_window_tokens as usize;
+            let used = estimated_session_tokens
+                .saturating_mul(100)
+                .checked_div(window)
+                .unwrap_or(0);
+            format!("\n  Context window   {window} tokens\n  Window used      {used}% (session estimate)")
+        },
+    );
     format!(
         "Context
-  Session tokens   {estimated_session_tokens} (estimated from message content)
+  Session tokens   {estimated_session_tokens} (estimated from message content){window_lines}
   Cumulative input {cumulative_input_tokens}
   Auto-compact at  {threshold} cumulative input tokens
-  Utilization      {percent}%
+  Utilization      {percent}% of the auto-compact trigger
   Tip              /compact shrinks the session now; auto-compaction fires at 100%"
     )
 }
@@ -7137,6 +7153,133 @@ fn format_upgrade_report() -> String {
     )
 }
 
+/// The text of the last assistant message in the session.
+fn last_assistant_text(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The whole conversation as plain markdown (`/copy all`). Tool blocks are
+/// skipped — the transcript is for humans, not for replay.
+fn render_session_transcript(session: &Session) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for message in &session.messages {
+        let speaker = match message.role {
+            MessageRole::User => "## Usuario",
+            MessageRole::Assistant => "## Asistente",
+            MessageRole::System | MessageRole::Tool => continue,
+        };
+        let text = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let _ = write!(out, "{speaker}\n\n{text}\n\n");
+    }
+    out
+}
+
+/// Pipes text into the first available system clipboard tool. Returns the
+/// tool used, or an actionable error naming what to install.
+fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+        ("clip.exe", &[]),
+    ];
+    for (tool, args) in CANDIDATES {
+        let spawned = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            continue; // tool not installed — try the next one
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            if stdin.write_all(text.as_bytes()).is_err() {
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(tool),
+            _ => {}
+        }
+    }
+    Err(
+        "no clipboard tool found — install wl-clipboard (Wayland), xclip/xsel (X11), \
+         or use pbcopy (macOS) / clip.exe (Windows)"
+            .to_string(),
+    )
+}
+
+/// `/files`: the working tree's changed files, straight from git.
+fn format_files_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(status) = run_git_capture_in(&cwd, &["status", "--short"]) else {
+        return "Files\n  Error            not inside a git repository (or git unavailable)"
+            .to_string();
+    };
+    let lines: Vec<&str> = status.lines().collect();
+    if lines.is_empty() {
+        return "Files\n  Working tree     clean (no changes)".to_string();
+    }
+    let mut out = format!("Files ({} changed)\n", lines.len());
+    for line in lines.iter().take(100) {
+        let _ = writeln!(out, "  {line}");
+    }
+    if lines.len() > 100 {
+        let _ = write!(out, "  … and {} more (see git status)", lines.len() - 100);
+    }
+    out.trim_end().to_string()
+}
+
+/// `/keybindings`: the line editor's actual bindings (rustyline Emacs mode
+/// plus the two explicit newline bindings in input.rs).
+fn format_keybindings_report() -> String {
+    "Keybindings
+  Enter            send prompt
+  Shift+Enter      insert newline (also Ctrl+J)
+  Tab              complete slash commands
+  Up / Down        browse prompt history
+  Ctrl+R           reverse-search history
+  Ctrl+A / Ctrl+E  start / end of line
+  Ctrl+W           delete previous word
+  Ctrl+U / Ctrl+K  delete to start / end of line
+  Ctrl+L           clear screen (keeps the current line)
+  Ctrl+C           cancel current line
+  Ctrl+D           exit (on an empty line)"
+        .to_string()
+}
+
 /// One terminal line: API error strings can embed whole JSON response
 /// bodies, and a retry notice must not scroll the conversation away.
 fn truncate_retry_error(error: &str) -> String {
@@ -7272,6 +7415,10 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Stored here (not only on the runtime's api client) because every turn
+    /// builds a FRESH runtime: without re-applying, `--effort`/`/effort`
+    /// silently stopped working after the first turn.
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7804,14 +7951,45 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            reasoning_effort: None,
         };
         cli.persist_session()?;
         Ok(cli)
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort.clone_from(&effort);
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
+        }
+    }
+
+    /// Drops the last `steps` user exchanges (each user message plus
+    /// everything after it) from the live session. Returns how many
+    /// messages were removed.
+    fn rewind_exchanges(&mut self, steps: usize) -> usize {
+        let messages = &mut self.runtime.session_mut().messages;
+        let mut user_seen = 0_usize;
+        let mut cut_at = None;
+        for (index, message) in messages.iter().enumerate().rev() {
+            if message.role == MessageRole::User {
+                user_seen += 1;
+                if user_seen >= steps {
+                    cut_at = Some(index);
+                    break;
+                }
+                // Fewer exchanges than requested: cut at the earliest user
+                // message found so the command still does something sane.
+                cut_at = Some(index);
+            }
+        }
+        match cut_at {
+            Some(index) => {
+                let removed = messages.len() - index;
+                messages.truncate(index);
+                removed
+            }
+            None => 0,
         }
     }
 
@@ -7875,7 +8053,7 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
@@ -7887,6 +8065,12 @@ impl LiveCli {
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        // Re-apply the session's effort: this runtime is brand new and would
+        // otherwise silently reset to the provider default.
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut()
+                .set_reasoning_effort(self.reasoning_effort.clone());
+        }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -8295,10 +8479,20 @@ impl LiveCli {
                         .to_string();
                     println!("{}", run_provider_probe(&model));
                 } else {
-                    println!(
-                        "{}",
-                        provider_presets::handle_provider_command(args.as_deref())
-                    );
+                    let output = provider_presets::handle_provider_command(args.as_deref());
+                    println!("{output}");
+                    // After a successful `use`, verify the new credentials
+                    // with a live 1-token request so a typo'd key or wrong
+                    // base URL surfaces immediately, not on the next turn.
+                    if trimmed.starts_with("use ") && output.contains("Status           ok") {
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let model = ConfigLoader::default_for(&cwd)
+                            .load()
+                            .ok()
+                            .and_then(|config| config.provider().model().map(ToString::to_string))
+                            .unwrap_or_else(|| self.model.clone());
+                        println!("{}", run_provider_probe(&model));
+                    }
                 }
                 false
             }
@@ -8409,6 +8603,7 @@ impl LiveCli {
                 println!(
                     "{}",
                     format_context_report(
+                        &self.model,
                         self.runtime.estimated_tokens(),
                         tracker.cumulative_usage().input_tokens,
                     )
@@ -8419,12 +8614,110 @@ impl LiveCli {
                 println!("{}", format_upgrade_report());
                 false
             }
+            SlashCommand::Effort { level } => {
+                match level.as_deref().map(str::trim) {
+                    None | Some("") => println!(
+                        "Effort\n  Current          {}\n  Usage            /effort low|medium|high|off",
+                        self.reasoning_effort.as_deref().unwrap_or("(provider default)")
+                    ),
+                    Some("off" | "default") => {
+                        self.set_reasoning_effort(None);
+                        println!("Effort\n  Current          (provider default)\n  Applies          next turn onward");
+                    }
+                    Some(level @ ("low" | "medium" | "high")) => {
+                        self.set_reasoning_effort(Some(level.to_string()));
+                        println!("Effort\n  Current          {level}\n  Applies          next turn onward");
+                    }
+                    Some(other) => {
+                        eprintln!("unsupported effort '{other}'. Usage: /effort low|medium|high|off");
+                    }
+                }
+                false
+            }
+            SlashCommand::Copy { target } => {
+                let all = matches!(target.as_deref().map(str::trim), Some("all"));
+                let text = if all {
+                    render_session_transcript(self.runtime.session())
+                } else {
+                    last_assistant_text(self.runtime.session())
+                };
+                if text.trim().is_empty() {
+                    eprintln!("nothing to copy yet — no assistant response in this session");
+                } else {
+                    match copy_to_clipboard(&text) {
+                        Ok(tool) => println!(
+                            "Copy\n  Copied           {} ({} chars, via {tool})",
+                            if all {
+                                "whole conversation"
+                            } else {
+                                "last response"
+                            },
+                            text.chars().count()
+                        ),
+                        Err(error) => eprintln!("{error}"),
+                    }
+                }
+                false
+            }
+            SlashCommand::Branch { name } => {
+                let forked = self.runtime.session().fork(name);
+                let forked_id = forked.session_id.clone();
+                match create_managed_session_handle(&forked_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|handle| {
+                        forked
+                            .save_to_path(&handle.path)
+                            .map(|()| handle.path)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(path) => println!(
+                        "Branch\n  Forked to        {forked_id}\n  File             {}\n  Resume           claw --resume {forked_id}\n  Note             current session continues here unchanged",
+                        path.display()
+                    ),
+                    Err(error) => eprintln!("could not fork session: {error}"),
+                }
+                false
+            }
+            SlashCommand::Rewind { steps } => {
+                let steps = steps
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map_or(Some(1), |value| value.parse::<usize>().ok());
+                match steps {
+                    Some(steps) if steps > 0 => {
+                        let removed = self.rewind_exchanges(steps);
+                        if removed == 0 {
+                            println!("Rewind\n  Result           nothing to rewind (no user exchange in session)");
+                        } else {
+                            if let Err(error) = self.persist_session() {
+                                eprintln!("warning: could not persist session: {error}");
+                            }
+                            println!(
+                                "Rewind\n  Removed          {removed} message(s)\n  Messages left    {}\n  Note             the model will not see the removed exchange(s)",
+                                self.runtime.session().messages.len()
+                            );
+                        }
+                    }
+                    _ => {
+                        eprintln!("Usage: /rewind [n]  (n = how many exchanges to drop, default 1)")
+                    }
+                }
+                false
+            }
+            SlashCommand::Files => {
+                println!("{}", format_files_report());
+                false
+            }
+            SlashCommand::Keybindings => {
+                println!("{}", format_keybindings_report());
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Share
             | SlashCommand::Feedback
-            | SlashCommand::Files
             | SlashCommand::Fast
             | SlashCommand::Exit
             | SlashCommand::Summary
@@ -8436,7 +8729,6 @@ impl LiveCli {
             | SlashCommand::Thinkback
             | SlashCommand::ReleaseNotes
             | SlashCommand::SecurityReview
-            | SlashCommand::Keybindings
             | SlashCommand::PrivacySettings
             | SlashCommand::Plan { .. }
             | SlashCommand::Review { .. }
@@ -8444,12 +8736,8 @@ impl LiveCli {
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
-            | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
             | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
-            | SlashCommand::Branch { .. }
-            | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }

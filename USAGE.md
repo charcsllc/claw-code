@@ -596,7 +596,17 @@ cd rust
 ./target/debug/claw --resume latest /status /diff
 ```
 
-Entre los comandos interactivos útiles están `/help`, `/status`, `/cost`, `/usage`, `/context`, `/config`, `/session`, `/model`, `/permissions` y `/export`. `/status` muestra también el proveedor activo y su base URL (útil con `/provider`); `/usage` desglosa los tokens de la sesión incluyendo el último turno; `/context` indica cuán cerca estás del umbral de auto-compactación para poder ejecutar `/compact` a tiempo.
+Entre los comandos interactivos útiles están `/help`, `/status`, `/cost`, `/usage`, `/context`, `/config`, `/session`, `/model`, `/permissions` y `/export`. `/status` muestra también el proveedor activo y su base URL (útil con `/provider`); `/usage` desglosa los tokens de la sesión incluyendo el último turno; `/context` indica el % usado de la ventana de contexto del modelo y cuán cerca estás del umbral de auto-compactación para poder ejecutar `/compact` a tiempo.
+
+Más comandos de sesión y utilidad:
+
+- `/effort low|medium|high|off` — cambia el esfuerzo de razonamiento en vivo (persiste durante toda la sesión).
+- `/copy` — copia la última respuesta al portapapeles del sistema; `/copy all` copia toda la conversación en markdown (usa wl-copy/xclip/xsel/pbcopy/clip.exe, el primero disponible).
+- `/branch [nombre]` — bifurca la sesión actual a un archivo nuevo (la actual sigue intacta); retómala con `claw --resume <id>`.
+- `/rewind [n]` — descarta los últimos n intercambios (por defecto 1): el modelo deja de verlos.
+- `/files` — lista los archivos cambiados del árbol de trabajo (git status).
+- `/keybindings` — atajos reales del editor de línea (historial, búsqueda inversa, multilínea…).
+- `/upgrade` — versión, commit del binario y comandos exactos de actualización.
 
 ## Orden de resolución de los archivos de configuración
 
