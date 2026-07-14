@@ -3731,9 +3731,57 @@ fn render_doctor_report(
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
+            check_settings_permissions_health(),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
     })
+}
+
+/// Warns when files that can hold credentials or conversations are readable
+/// by other users. `claw` always writes them 0600; a loose mode means they
+/// were created or chmodded by something else.
+fn check_settings_permissions_health() -> DiagnosticCheck {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let settings_path = runtime::default_config_home().join("settings.json");
+        let Ok(metadata) = std::fs::metadata(&settings_path) else {
+            return DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Ok,
+                "no settings.json yet — nothing to protect",
+            );
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 == 0 {
+            DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Ok,
+                format!("{} is owner-only ({mode:o})", settings_path.display()),
+            )
+        } else {
+            DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Warn,
+                format!(
+                    "{} is readable by other users (mode {mode:o})",
+                    settings_path.display()
+                ),
+            )
+            .with_hint(format!(
+                "run: chmod 600 {} — it can contain your API key",
+                settings_path.display()
+            ))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        DiagnosticCheck::new(
+            "Secrets file permissions",
+            DiagnosticLevel::Ok,
+            "not applicable on this platform",
+        )
+    }
 }
 
 fn run_doctor(
@@ -6094,6 +6142,7 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
   Current model    {model}
   Session messages {message_count}
   Session turns    {turns}
+  Common aliases   opus, sonnet, haiku, glm-4.6, kimi-k2-0905-preview, deepseek-chat
 
 Usage
   Inspect current model with /model
@@ -7153,6 +7202,33 @@ fn format_upgrade_report() -> String {
     )
 }
 
+/// Pure core of `/rewind`: removes the last `steps` user exchanges (each
+/// user message and everything after it). When the session holds fewer
+/// exchanges than requested, it cuts at the earliest user message found so
+/// the command still does something sane. Returns how many messages were
+/// removed.
+fn truncate_last_exchanges(messages: &mut Vec<ConversationMessage>, steps: usize) -> usize {
+    let mut user_seen = 0_usize;
+    let mut cut_at = None;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role == MessageRole::User {
+            user_seen += 1;
+            cut_at = Some(index);
+            if user_seen >= steps {
+                break;
+            }
+        }
+    }
+    match cut_at {
+        Some(index) => {
+            let removed = messages.len() - index;
+            messages.truncate(index);
+            removed
+        }
+        None => 0,
+    }
+}
+
 /// The text of the last assistant message in the session.
 fn last_assistant_text(session: &Session) -> String {
     session
@@ -7248,11 +7324,17 @@ fn format_files_report() -> String {
         return "Files\n  Error            not inside a git repository (or git unavailable)"
             .to_string();
     };
+    let branch = run_git_capture_in(&cwd, &["branch", "--show-current"])
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "(detached)".to_string());
     let lines: Vec<&str> = status.lines().collect();
     if lines.is_empty() {
-        return "Files\n  Working tree     clean (no changes)".to_string();
+        return format!(
+            "Files\n  Branch           {branch}\n  Working tree     clean (no changes)"
+        );
     }
-    let mut out = format!("Files ({} changed)\n", lines.len());
+    let mut out = format!("Files ({} changed on {branch})\n", lines.len());
     for line in lines.iter().take(100) {
         let _ = writeln!(out, "  {line}");
     }
@@ -7260,6 +7342,65 @@ fn format_files_report() -> String {
         let _ = write!(out, "  … and {} more (see git status)", lines.len() - 100);
     }
     out.trim_end().to_string()
+}
+
+/// `/hooks`: every configured hook by event, plus config entries that
+/// failed to parse (silently-dropped hooks are debugging quicksand).
+fn format_hooks_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let hooks = match ConfigLoader::default_for(&cwd).load() {
+        Ok(config) => config.hooks().clone(),
+        Err(error) => return format!("Hooks\n  Error            could not load config: {error}"),
+    };
+    let sections: [(&str, &[runtime::RuntimeHookCommand]); 3] = [
+        ("PreToolUse", hooks.pre_tool_use_entries()),
+        ("PostToolUse", hooks.post_tool_use_entries()),
+        ("PostToolUseFailure", hooks.post_tool_use_failure_entries()),
+    ];
+    let total: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
+    if total == 0 && hooks.invalid_hooks().is_empty() {
+        return "Hooks\n  Configured       none\n  Add some         hooks.preToolUse / hooks.postToolUse in .claw.json"
+            .to_string();
+    }
+    let mut out = format!("Hooks ({total} configured)\n");
+    for (event, entries) in sections {
+        for entry in entries {
+            let matcher = entry
+                .matcher()
+                .map_or(String::new(), |matcher| format!(" [matcher: {matcher}]"));
+            let _ = writeln!(out, "  {event:<19}{}{matcher}", entry.command());
+        }
+    }
+    for invalid in hooks.invalid_hooks() {
+        let _ = writeln!(
+            out,
+            "  INVALID ({})     {} — {}",
+            invalid.event, invalid.error_field, invalid.reason
+        );
+    }
+    out.trim_end().to_string()
+}
+
+/// `/color` and `/theme`: the effective color state and how to change it.
+fn format_color_report() -> String {
+    let override_state = match render::color_override() {
+        Some(true) => "forced ON (/color on)",
+        Some(false) => "forced OFF (/color off)",
+        None => "auto (TTY + NO_COLOR detection)",
+    };
+    let no_color = if std::env::var_os("NO_COLOR").is_some() {
+        "set (colors suppressed in auto mode)"
+    } else {
+        "not set"
+    };
+    format!(
+        "Color
+  Mode             {override_state}
+  NO_COLOR         {no_color}
+  Usage            /color on|off|auto  (also /theme)
+  Note             theming follows your terminal palette; claw only decides whether to emit ANSI colors"
+    )
 }
 
 /// `/keybindings`: the line editor's actual bindings (rustyline Emacs mode
@@ -7327,6 +7468,7 @@ fn run_repl(
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
 
+    let mut exit_hint_shown = false;
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -7377,7 +7519,13 @@ fn run_repl(
                     eprintln!("{error}");
                 }
             }
-            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Cancel => {
+                // A first Ctrl+C often means "how do I leave?" — say it once.
+                if !exit_hint_shown {
+                    exit_hint_shown = true;
+                    eprintln!("(usa /exit o Ctrl+D para salir)");
+                }
+            }
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -7968,29 +8116,7 @@ impl LiveCli {
     /// everything after it) from the live session. Returns how many
     /// messages were removed.
     fn rewind_exchanges(&mut self, steps: usize) -> usize {
-        let messages = &mut self.runtime.session_mut().messages;
-        let mut user_seen = 0_usize;
-        let mut cut_at = None;
-        for (index, message) in messages.iter().enumerate().rev() {
-            if message.role == MessageRole::User {
-                user_seen += 1;
-                if user_seen >= steps {
-                    cut_at = Some(index);
-                    break;
-                }
-                // Fewer exchanges than requested: cut at the earliest user
-                // message found so the command still does something sane.
-                cut_at = Some(index);
-            }
-        }
-        match cut_at {
-            Some(index) => {
-                let removed = messages.len() - index;
-                messages.truncate(index);
-                removed
-            }
-            None => 0,
-        }
+        truncate_last_exchanges(&mut self.runtime.session_mut().messages, steps)
     }
 
     fn startup_banner(&self) -> String {
@@ -8020,6 +8146,7 @@ impl LiveCli {
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
   \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mProvider\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
@@ -8028,12 +8155,44 @@ impl LiveCli {
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
+            provider_presets::active_provider_summary().0,
             self.permission_mode.as_str(),
             git_branch,
             workspace,
             cwd,
             self.session.id,
             session_path,
+        )
+    }
+
+    /// `/summary`: the session at a glance — one block instead of stitching
+    /// together /status, /cost and /history.
+    fn format_session_summary(&self) -> String {
+        let session = self.runtime.session();
+        let tracker = UsageTracker::from_session(session);
+        let usage = tracker.cumulative_usage();
+        let last_prompt = session
+            .prompt_history
+            .last()
+            .map_or("(none)", |entry| entry.text.as_str());
+        format!(
+            "Summary
+  Model            {}
+  Session          {}
+  Messages         {}
+  Turns            {}
+  Total tokens     {}
+  Estimated cost   {}
+  Last prompt      {}
+  File             {}",
+            self.model,
+            session.session_id,
+            session.messages.len(),
+            tracker.turns(),
+            usage.total_tokens(),
+            format_usd(usage.estimate_cost_usd().total_cost_usd()),
+            truncate_retry_error(last_prompt),
+            self.session.path.display(),
         )
     }
 
@@ -8593,9 +8752,21 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
-            SlashCommand::Usage { .. } => {
+            SlashCommand::Usage { scope } => {
                 let tracker = UsageTracker::from_session(self.runtime.session());
-                println!("{}", format_usage_report(&tracker));
+                if matches!(scope.as_deref().map(str::trim), Some("last")) {
+                    let last = tracker.current_turn_usage();
+                    println!(
+                        "Usage (last turn)\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}",
+                        last.input_tokens,
+                        last.output_tokens,
+                        last.cache_creation_input_tokens,
+                        last.cache_read_input_tokens,
+                        last.total_tokens(),
+                    );
+                } else {
+                    println!("{}", format_usage_report(&tracker));
+                }
                 false
             }
             SlashCommand::Context { .. } => {
@@ -8713,14 +8884,53 @@ impl LiveCli {
                 println!("{}", format_keybindings_report());
                 false
             }
+            SlashCommand::Summary => {
+                println!("{}", self.format_session_summary());
+                false
+            }
+            SlashCommand::Hooks { .. } => {
+                println!("{}", format_hooks_report());
+                false
+            }
+            SlashCommand::Color { .. } | SlashCommand::Theme { .. } => {
+                let arg = match &command {
+                    SlashCommand::Color { scheme } => scheme.clone(),
+                    SlashCommand::Theme { name } => name.clone(),
+                    _ => None,
+                };
+                match arg.as_deref().map(str::trim) {
+                    None | Some("") => println!("{}", format_color_report()),
+                    Some("on" | "always") => {
+                        render::set_color_override(Some(true));
+                        println!("{}", format_color_report());
+                    }
+                    Some("off" | "never") => {
+                        render::set_color_override(Some(false));
+                        println!("{}", format_color_report());
+                    }
+                    Some("auto") => {
+                        render::set_color_override(None);
+                        println!("{}", format_color_report());
+                    }
+                    Some(other) => {
+                        eprintln!("unsupported mode '{other}'. Usage: /color on|off|auto");
+                    }
+                }
+                false
+            }
+            SlashCommand::Exit => {
+                // Reached when /exit carries arguments or arrives via a
+                // dispatch path that skips the REPL's literal string match.
+                self.persist_session()?;
+                println!("Session saved. Bye!");
+                std::process::exit(0);
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Fast
-            | SlashCommand::Exit
-            | SlashCommand::Summary
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
@@ -8733,11 +8943,8 @@ impl LiveCli {
             | SlashCommand::Plan { .. }
             | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
-            | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
-            | SlashCommand::Hooks { .. }
-            | SlashCommand::Color { .. }
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
@@ -8990,7 +9197,11 @@ impl LiveCli {
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
+        println!(
+            "{}\n  Turns            {}",
+            format_cost_report(cumulative),
+            self.runtime.usage().turns()
+        );
     }
 
     fn resume_session(
@@ -14867,29 +15078,31 @@ mod tests {
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
+        format_bughunter_report, format_color_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_context_report, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_keybindings_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message, format_upgrade_report,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, truncate_last_exchanges,
+        truncate_retry_error, try_resolve_bare_skill_prompt, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
         SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS, VERSION,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -18188,6 +18401,78 @@ mod tests {
         assert!(report.contains("Previous         claude-sonnet"));
         assert!(report.contains("Current          claude-opus"));
         assert!(report.contains("Preserved msgs   9"));
+    }
+
+    fn message(role: MessageRole, text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn truncate_last_exchanges_drops_whole_exchanges() {
+        let mut messages = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "answer one"),
+            message(MessageRole::User, "two"),
+            message(MessageRole::Assistant, "answer two"),
+        ];
+        // One step: the last user message and its answer disappear.
+        assert_eq!(truncate_last_exchanges(&mut messages, 1), 2);
+        assert_eq!(messages.len(), 2);
+        // More steps than exchanges: cut at the earliest user message.
+        assert_eq!(truncate_last_exchanges(&mut messages, 5), 2);
+        assert!(messages.is_empty());
+        // Nothing left to rewind.
+        assert_eq!(truncate_last_exchanges(&mut messages, 1), 0);
+    }
+
+    #[test]
+    fn truncate_retry_error_flattens_and_caps() {
+        let long = format!("line one\nline two {}", "x".repeat(300));
+        let flattened = truncate_retry_error(&long);
+        assert!(!flattened.contains('\n'));
+        assert!(flattened.chars().count() <= 141); // 140 + ellipsis
+        assert!(flattened.ends_with('…'));
+        assert_eq!(truncate_retry_error("short error"), "short error");
+    }
+
+    #[test]
+    fn context_report_shows_window_and_threshold() {
+        let report = format_context_report("claude-sonnet-4-5", 5_000, 20_000);
+        assert!(report.contains("Session tokens   5000"));
+        assert!(report.contains("Context window"));
+        assert!(report.contains("Auto-compact at"));
+        assert!(report.contains("/compact"));
+    }
+
+    #[test]
+    fn upgrade_report_names_version_and_rebuild_commands() {
+        let report = format_upgrade_report();
+        assert!(report.contains(VERSION));
+        assert!(report.contains("./install.sh"));
+        assert!(report.contains("install.ps1"));
+        assert!(report.contains("charcsllc/claw-code"));
+    }
+
+    #[test]
+    fn keybindings_report_covers_core_bindings() {
+        let report = format_keybindings_report();
+        assert!(report.contains("Shift+Enter"));
+        assert!(report.contains("Ctrl+R"));
+        assert!(report.contains("Tab"));
+    }
+
+    #[test]
+    fn color_report_names_usage_and_mode() {
+        crate::render::set_color_override(None);
+        let report = format_color_report();
+        assert!(report.contains("Mode"));
+        assert!(report.contains("/color on|off|auto"));
     }
 
     #[test]

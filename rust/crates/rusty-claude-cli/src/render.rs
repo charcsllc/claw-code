@@ -58,7 +58,10 @@ impl Default for Spinner {
     fn default() -> Self {
         Self {
             frame_index: 0,
-            enabled: io::IsTerminal::is_terminal(&io::stdout()),
+            // `/color off` also silences the spinner's cursor-control
+            // escapes; forcing color ON cannot enable it off-TTY, where
+            // the escapes would corrupt piped output.
+            enabled: color_override() != Some(false) && io::IsTerminal::is_terminal(&io::stdout()),
         }
     }
 }
@@ -955,9 +958,38 @@ fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
     Some(FenceMarker { character, length })
 }
 
+/// Session-scoped color override set by `/color on|off|auto`.
+/// 0 = auto (TTY + NO_COLOR detection), 1 = forced on, 2 = forced off.
+static COLOR_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Applies `/color`: `Some(true)` forces color, `Some(false)` disables it,
+/// `None` returns to automatic detection.
+pub fn set_color_override(mode: Option<bool>) {
+    let value = match mode {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    COLOR_OVERRIDE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current override, if any (for reporting in `/color` and `/theme`).
+#[must_use]
+pub fn color_override() -> Option<bool> {
+    match COLOR_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
 /// Colors are on only when stdout is a real terminal and `NO_COLOR` is
-/// unset (the de-facto standard honored by most CLI tools).
+/// unset (the de-facto standard honored by most CLI tools), unless the
+/// user forced a mode with `/color`.
 fn color_output_enabled() -> bool {
+    if let Some(forced) = color_override() {
+        return forced;
+    }
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }

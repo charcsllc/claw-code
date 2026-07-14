@@ -177,8 +177,9 @@ async fn execute_bash_async(
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
 
     // A command with no explicit timeout must still not hang the turn
-    // forever; apply the tool's documented default.
-    let timeout_ms = input.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_MS);
+    // forever; apply the tool's documented default (CLAW_BASH_TIMEOUT_MS
+    // overrides it for slow environments).
+    let timeout_ms = input.timeout.unwrap_or_else(default_bash_timeout_ms);
     let output_result =
         if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
             (result?, false)
@@ -457,6 +458,16 @@ const MAX_OUTPUT_BYTES: usize = 16_384;
 /// default (120s) so an unattended `sleep`/hung build cannot stall a turn
 /// indefinitely.
 const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+
+/// The default, overridable via `CLAW_BASH_TIMEOUT_MS` for environments
+/// where 120s is genuinely too short (large builds, slow CI runners).
+fn default_bash_timeout_ms() -> u64 {
+    std::env::var("CLAW_BASH_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_MS)
+}
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {

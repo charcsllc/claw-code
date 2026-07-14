@@ -676,7 +676,24 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
 
         if devs.is_empty() && sups.is_empty() {
-            break; // graph drained: nothing running, nothing ready
+            // Graph drained: anything neither completed nor failed was held
+            // back by a failed dependency — say so in the live log, not
+            // only in the final summary.
+            let blocked: Vec<&str> = tasks
+                .iter()
+                .enumerate()
+                .filter(|(index, task)| {
+                    !state.completed.contains(&task.id) && !failed_tasks.contains(index)
+                })
+                .map(|(_, task)| task.id.as_str())
+                .collect();
+            if !blocked.is_empty() {
+                workflow.phase(&format!(
+                    "Bloqueadas por dependencias fallidas (no se intentaron): {}",
+                    blocked.join(", ")
+                ));
+            }
+            break;
         }
 
         std::thread::sleep(Duration::from_millis(400));
@@ -1018,6 +1035,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             ("completed", completed.to_string()),
             ("failed", failed.to_string()),
             ("user_aborted", user_aborted.to_string()),
+            (
+                "cost_usd",
+                budget
+                    .spent()
+                    .map_or_else(|| "unknown".to_string(), |cost| format!("{cost:.2}")),
+            ),
         ],
     );
     let failed_task_ids: Vec<String> = failed_tasks
@@ -1500,6 +1523,9 @@ pub fn repo_digest(project_dir: &Path) -> String {
 
     files.sort();
     let mut out = String::new();
+    if let Some(branch) = current_git_branch(project_dir) {
+        let _ = writeln!(out, "### Current branch\n`{branch}`\n");
+    }
     // Recent history tells the planners what changed lately, the commit
     // conventions in use, and which areas are active — signal the file
     // tree alone cannot provide.
@@ -2208,7 +2234,12 @@ impl BuildState {
                 );
             }
         }
-        let _ = std::fs::write(path, format!("{payload:#}\n"));
+        // Atomic temp+rename: a crash mid-write must not corrupt the resume
+        // state — a truncated state.json would silently restart every task.
+        let temp = path.with_extension("json.tmp");
+        if std::fs::write(&temp, format!("{payload:#}\n")).is_ok() {
+            let _ = std::fs::rename(&temp, &path);
+        }
     }
 }
 
@@ -2285,8 +2316,7 @@ impl Budget {
     #[must_use]
     pub fn exceeded(&self) -> Option<f64> {
         let ceiling = self.ceiling?;
-        let path = self.events_path.as_ref()?;
-        let spent = (sum_cost_from_events(path) - self.baseline).max(0.0);
+        let spent = self.spent()?;
         (spent > ceiling).then_some(spent)
     }
 }

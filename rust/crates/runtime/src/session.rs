@@ -595,12 +595,20 @@ impl Session {
     /// The entry is appended to the in-memory history and, when a persistence
     /// path is configured, incrementally written to the JSONL session file.
     pub fn push_prompt_entry(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
+        // Long-lived sessions accumulate history without bound; cap it so
+        // the editor seed and the JSONL snapshot stay proportionate. 1000
+        // entries is far beyond what Up-arrow/Ctrl-R usefully reach.
+        const MAX_PROMPT_HISTORY: usize = 1_000;
         let timestamp_ms = current_time_millis();
         let entry = SessionPromptEntry {
             timestamp_ms,
             text: text.into(),
         };
         self.prompt_history.push(entry);
+        if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+            let excess = self.prompt_history.len() - MAX_PROMPT_HISTORY;
+            self.prompt_history.drain(..excess);
+        }
         let entry_ref = self.prompt_history.last().expect("entry was just pushed");
         self.append_persisted_prompt_entry(entry_ref)
     }
@@ -1342,6 +1350,23 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
         fs::create_dir_all(parent)?;
     }
     let temp_path = temporary_path_for(path);
+    // Sessions hold the full conversation (and whatever the user pasted
+    // into it): owner-only, set on the temp file BEFORE the rename so the
+    // content is never briefly world-readable.
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.flush()?;
+    }
+    #[cfg(not(unix))]
     fs::write(&temp_path, contents)?;
     fs::rename(temp_path, path)?;
     Ok(())

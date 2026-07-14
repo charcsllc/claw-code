@@ -75,10 +75,26 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
         save_user_settings_field("subagentModel", fast)?;
     }
 
+    // Apply to the running process too: before this, the wizard's changes
+    // only took effect after a restart (the API clients read env vars).
+    let applied_now = crate::provider_presets::preset_for(&kind)
+        .map(|preset| {
+            crate::provider_presets::apply_provider_env(
+                preset,
+                (!api_key.is_empty()).then_some(api_key.as_str()),
+                base_url.as_deref(),
+                false,
+            )
+        })
+        .is_some();
+
     println!();
     println!("  \x1b[32mProvider saved to ~/.claw/settings.json\x1b[0m");
+    if applied_now {
+        println!("  Applied to this session too — no restart needed.");
+    }
     println!(
-        "  Run \x1b[1m/model {}\x1b[0m or restart claw to activate.",
+        "  Run \x1b[1m/model {}\x1b[0m to activate the model.",
         model.as_deref().unwrap_or(&kind)
     );
     println!();

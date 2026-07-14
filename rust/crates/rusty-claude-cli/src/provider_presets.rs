@@ -256,10 +256,19 @@ fn provider_usage() -> String {
 }
 
 fn render_provider_list() -> String {
+    let saved_kind = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .and_then(|config| config.provider().kind().map(ToString::to_string));
     let mut out = String::from("Provider\n  Presets:\n");
     for preset in PROVIDER_PRESETS {
+        let marker = if saved_kind.as_deref() == Some(preset.kind) {
+            "  ← saved"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "    {:<10} {} — {}{}\n",
+            "    {:<10} {} — {}{}{marker}\n",
             preset.kind,
             preset.label,
             if preset.key_env.is_empty() {
@@ -289,6 +298,16 @@ fn render_provider_show() -> String {
             let kind = provider.kind().unwrap_or("?");
             let label = preset_for(kind).map_or(kind, |preset| preset.label);
             out.push_str(&format!("  Saved            {label} ({kind})\n"));
+            // The startup wiring never overwrites an env var the user set
+            // themselves — make that priority visible instead of implied.
+            if let Some(preset) = preset_for(kind) {
+                if !preset.key_env.is_empty() && env_is_set(preset.key_env) {
+                    out.push_str(&format!(
+                        "  Note             {} is set in your shell and takes priority over the saved key\n",
+                        preset.key_env
+                    ));
+                }
+            }
             if let Some(url) = provider.base_url() {
                 out.push_str(&format!("  Base URL         {url}\n"));
             }

@@ -604,9 +604,15 @@ Más comandos de sesión y utilidad:
 - `/copy` — copia la última respuesta al portapapeles del sistema; `/copy all` copia toda la conversación en markdown (usa wl-copy/xclip/xsel/pbcopy/clip.exe, el primero disponible).
 - `/branch [nombre]` — bifurca la sesión actual a un archivo nuevo (la actual sigue intacta); retómala con `claw --resume <id>`.
 - `/rewind [n]` — descarta los últimos n intercambios (por defecto 1): el modelo deja de verlos.
-- `/files` — lista los archivos cambiados del árbol de trabajo (git status).
+- `/files` — rama actual y archivos cambiados del árbol de trabajo (git status).
 - `/keybindings` — atajos reales del editor de línea (historial, búsqueda inversa, multilínea…).
 - `/upgrade` — versión, commit del binario y comandos exactos de actualización.
+- `/summary` — la sesión de un vistazo: modelo, mensajes, turnos, tokens, coste y último prompt.
+- `/hooks` — hooks configurados por evento, incluyendo los que no parsearon (y por qué).
+- `/color on|off|auto` (también `/theme`) — fuerza o desactiva los colores ANSI en vivo; `off` silencia también el spinner.
+- `/usage last` — tokens solo del último turno.
+
+Además: el banner de arranque y `/doctor` muestran el proveedor activo; `/doctor` avisa si `~/.claw/settings.json` quedó legible por otros usuarios; los archivos de sesión se guardan con permisos 0600; el historial de prompts se limita a 1000 entradas; y `CLAW_BASH_TIMEOUT_MS` ajusta el timeout por defecto de la herramienta bash.
 
 ## Orden de resolución de los archivos de configuración
 

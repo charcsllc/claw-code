@@ -214,12 +214,20 @@ Try it out:
   $clawBin
   /doctor
 
-Authentication (an API key is required; subscription login is not supported):
+Authentication — easiest inside the REPL (configures, verifies and persists):
+
+  /provider use zhipu <token>       # Z.ai GLM (coding plan)
+  /provider use kimi <api-key>      # Moonshot Kimi
+  /provider use deepseek <api-key>  # DeepSeek
+  /provider test                    # live 1-token connectivity check
+
+Or via environment variables (they take priority over saved settings):
 
   `$env:ANTHROPIC_API_KEY = "sk-ant-..."
-  # or a bearer token / other providers:
   `$env:ANTHROPIC_AUTH_TOKEN = "..."
   `$env:OPENAI_API_KEY = "sk-..."
+
+To update later: git pull; .\install.ps1   (check with /upgrade inside the REPL)
 
 For deeper docs, see USAGE.md and rust\README.md.
 "@ | Write-Host

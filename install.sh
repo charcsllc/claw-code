@@ -384,13 +384,22 @@ Try it out:
   ${CLAW_BIN}
   /doctor
 
-Authentication (an API key is required; subscription login is not supported):
+Authentication — easiest inside the REPL (configures, verifies and persists):
+
+  /provider use zhipu <token>       ${COLOR_DIM}# Z.ai GLM (coding plan)${COLOR_RESET}
+  /provider use kimi <api-key>      ${COLOR_DIM}# Moonshot Kimi${COLOR_RESET}
+  /provider use deepseek <api-key>  ${COLOR_DIM}# DeepSeek${COLOR_RESET}
+  /provider use ollama              ${COLOR_DIM}# local models, keyless${COLOR_RESET}
+  /provider test                    ${COLOR_DIM}# live 1-token connectivity check${COLOR_RESET}
+
+Or via environment variables (they take priority over saved settings):
 
   export ANTHROPIC_API_KEY="sk-ant-..."
-  ${COLOR_DIM}# or a bearer token / other providers:${COLOR_RESET}
   export ANTHROPIC_AUTH_TOKEN="..."      ${COLOR_DIM}# proxy/bearer auth${COLOR_RESET}
   export OPENAI_API_KEY="sk-..."         ${COLOR_DIM}# OpenAI-compatible models${COLOR_RESET}
   export OLLAMA_HOST="http://127.0.0.1:11434"  ${COLOR_DIM}# local models${COLOR_RESET}
+
+To update later: git pull && ./install.sh   (check with /upgrade inside the REPL)
 
 For deeper docs, see USAGE.md and rust/README.md.
 EOF
