@@ -374,6 +374,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         let architect_roles = architects_for(options.kind, &plan);
         let mut architect_handles = Vec::new();
         for role in &architect_roles {
+            // The graphic designer gets a structured brief (archetype art
+            // direction + the 8 sections its document must cover); the
+            // generic "deliver your design document" left it rudderless.
+            let designer_brief = if *role == Role::UxUiDesigner {
+                crate::design::designer_planning_brief(&plan)
+            } else {
+                String::new()
+            };
             let handle = spawn_agent(
                 role.slug(),
                 role.title(),
@@ -383,7 +391,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 &format!(
                     "Plan:\n```json\n{plan_json}\n```{decisions}{repo_context}\n\n\
                      Deliver your complete design document in Markdown, justifying \
-                     every decision.{}",
+                     every decision.{}{designer_brief}",
                     if options.mode.is_improve() {
                         " Design the change to fit the EXISTING architecture; read \
                          the relevant existing files and reuse their patterns."
@@ -571,30 +579,36 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
     }
 
-    // ---- Design system: tokens and base components as real files, so
-    //      every developer composes over the same visual foundation
-    //      instead of writing ad-hoc CSS. ----
+    // ---- Design system: a VALIDATED token foundation written
+    //      deterministically (contrast is computable — no LLM taste
+    //      involved), then the design agent builds archetype-directed
+    //      components on top of it. ----
     if greenfield
         && options.project_dir.join("package.json").exists()
         && !docs.join("design-system.md").exists()
     {
-        workflow.phase("Design system: tokens y componentes base");
+        let archetype = crate::design::detect_archetype(&plan);
+        workflow.phase(&format!(
+            "Design system: fundación de tokens + componentes (arquetipo: {})",
+            archetype.label()
+        ));
+        let tokens_path = match crate::design::write_design_tokens(&options.project_dir) {
+            Some(path) => {
+                workflow.phase(&format!(
+                    "  tokens validados (WCAG AA, dark mode, slots CVD-safe) → {path}"
+                ));
+                path
+            }
+            None => {
+                workflow.phase("  el proyecto ya define tokens propios; se respetan");
+                "the existing token stylesheet".to_string()
+            }
+        };
         match run_single(
             Role::UxUiDesigner,
             &options.catalog.director,
             options,
-            "Read docs/plan.json and the UX/UI design document under docs/. Build \
-             the visual foundation NOW as real files: (1) if `tailwindcss` and \
-             `@tailwindcss/vite` are in devDependencies, wire the vite plugin and \
-             add `@import \"tailwindcss\";` plus an `@theme` block to the main \
-             stylesheet; (2) define the design tokens — color palette with dark \
-             mode, typography scale, spacing — as Tailwind theme tokens or CSS \
-             variables; (3) create accessible base UI components (Button, Card, \
-             Input, a Layout/Container) under src/components/ui/ (or the \
-             stack-appropriate location); (4) write docs/design-system.md \
-             documenting every token and component. Developers will be REQUIRED \
-             to use these instead of ad-hoc styles. Verify the project still \
-             builds before finishing.",
+            &crate::design::design_system_prompt(archetype, &tokens_path),
         ) {
             Ok(design) => {
                 save_doc(&docs, "design-system-report.md", &design.report)?;
@@ -984,21 +998,20 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         //      headless Chromium is available) ----
         run_smoke_test(&options.project_dir, &docs, &workflow);
 
+        // ---- Design gate: deterministic, zero-token — WCAG contrast over
+        //      the token stylesheets and an accessibility audit of the
+        //      rendered DOM. Computable failures never reach the (paid)
+        //      visual-QA agent unfixed. ----
+        run_design_gate_phase(options, &workflow, &supervision_md, &docs)?;
+
         // ---- Visual QA: critique what actually rendered, not the source ----
         if docs.join("rendered-dom.html").exists() {
-            workflow.phase("QA visual: revisando el DOM renderizado");
+            workflow.phase("QA visual: revisando el DOM renderizado (rúbrica de 10 puntos)");
             match run_single(
                 Role::UxUiDesigner,
                 &options.catalog.supervisor,
                 options,
-                "docs/rendered-dom.html is the homepage DOM exactly as rendered \
-                 after JavaScript ran (docs/screenshots/ may hold PNGs for \
-                 humans). Review it together with the UI source code: visual \
-                 hierarchy, empty states (is real content actually showing?), \
-                 accessibility (landmarks, alt text, form labels, contrast per \
-                 the CSS), responsive classes and dead links. FIX every issue \
-                 you find directly in the repository and write docs/visual-qa.md \
-                 with what you found and fixed.",
+                &crate::design::visual_qa_prompt(),
             ) {
                 Ok(review) => {
                     save_doc(&docs, "visual-qa-report.md", &review.report)?;
@@ -1441,7 +1454,7 @@ fn copy_dir_recursive(from: &Path, to: &Path) {
 
 /// Directories never worth showing the planner (deps, build output, VCS,
 /// our own artifacts).
-const REPO_SKIP_DIRS: &[&str] = &[
+pub(crate) const REPO_SKIP_DIRS: &[&str] = &[
     "node_modules",
     ".git",
     "target",
@@ -1807,6 +1820,59 @@ fn run_security_gate(
             workflow.phase(&format!(
                 "  aviso: Fixer de seguridad no disponible ({error})"
             ));
+        }
+    }
+    Ok(())
+}
+
+// ---------- Design gate ----------
+
+/// Deterministic design audit (token contrast + rendered-DOM a11y) with the
+/// same shape as the security gate: findings go to SUPERVISION.md and one
+/// Fixer pass repairs them.
+fn run_design_gate_phase(
+    options: &RunOptions,
+    workflow: &WorkflowLog,
+    supervision_md: &Path,
+    docs: &Path,
+) -> Result<(), String> {
+    workflow.phase("Gate de diseño: contraste WCAG y accesibilidad del DOM renderizado");
+    let findings = crate::design::run_design_gate(&options.project_dir, docs);
+    if findings.is_empty() {
+        workflow.phase("  diseño: OK");
+        return Ok(());
+    }
+    workflow.phase(&format!(
+        "  diseño: {} hallazgo(s) → despachando Técnico",
+        findings.len()
+    ));
+    append_file(
+        supervision_md,
+        &format!("\n## Design gate findings\n\n- {}\n", findings.join("\n- ")),
+    )?;
+    match run_single(
+        Role::Fixer,
+        &options.catalog.supervisor,
+        options,
+        &format!(
+            "Deterministic design-gate findings (WCAG contrast over the design \
+             tokens and accessibility audit of the rendered homepage DOM):\n\n- {}\n\n\
+             Fix each one in the repository: adjust token values until every \
+             text/surface pair meets its WCAG ratio (do NOT delete the tokens), \
+             add missing lang/viewport/alt/main/title, replace dead href=\"#\" \
+             links, and remove placeholder text. Verify the project still builds. \
+             Report each fix applied.",
+            findings.join("\n- ")
+        ),
+    ) {
+        Ok(fixer) => {
+            append_file(
+                supervision_md,
+                &format!("\n### Design fixes\n\n{}\n", fixer.report),
+            )?;
+        }
+        Err(error) => {
+            workflow.phase(&format!("  aviso: Fixer de diseño no disponible ({error})"));
         }
     }
     Ok(())

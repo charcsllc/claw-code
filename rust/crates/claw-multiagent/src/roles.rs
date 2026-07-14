@@ -106,8 +106,12 @@ impl Role {
             }
             Self::DevOpsArchitect => "Diseña Docker, CI/CD, entornos, secrets y monitoring.",
             Self::UxUiDesigner => {
-                "Define branding, colores, tipografías, iconografía y \
-                 microinteracciones con justificación de usabilidad."
+                "Autoridad de diseño gráfico: dirección de arte por arquetipo de \
+                 producto, sistema de tokens (superficies, tinta, marca, estados, \
+                 slots de datos CVD-safe), jerarquía tipográfica, layout y grid, \
+                 componentes con todos sus estados (hover/focus-visible/disabled/\
+                 loading/error/empty), dark mode, movimiento y accesibilidad \
+                 WCAG AA — todo con valores concretos, nunca adjetivos."
             }
             Self::Developer => {
                 "Implementa exactamente su TaskSpec dentro de su módulo, sin tocar \
