@@ -14,6 +14,35 @@ use crate::types::{MessageRequest, MessageResponse, Usage};
 pub mod anthropic;
 pub mod openai_compat;
 
+/// A retryable request failure about to be waited out, surfaced so the CLI
+/// can tell the user why the turn is stalled (a rate-limited request can
+/// legally back off for minutes and otherwise looks like a hang).
+pub struct RetryNotice {
+    pub attempt: u32,
+    pub max_retries: u32,
+    pub delay: std::time::Duration,
+    pub error: String,
+}
+
+type RetryNotifierFn = dyn Fn(&RetryNotice) + Send + Sync;
+
+static RETRY_NOTIFIER: std::sync::OnceLock<Box<RetryNotifierFn>> = std::sync::OnceLock::new();
+
+/// Installs a process-global observer for retryable request failures.
+/// First installation wins; later calls are ignored (the CLI installs it
+/// once at interactive startup — print/JSON modes install nothing so
+/// machine-readable output stays clean).
+pub fn set_retry_notifier(notifier: impl Fn(&RetryNotice) + Send + Sync + 'static) {
+    let _ = RETRY_NOTIFIER.set(Box::new(notifier));
+}
+
+/// Called by provider retry loops right before sleeping out the backoff.
+pub(crate) fn notify_retry(notice: &RetryNotice) {
+    if let Some(notifier) = RETRY_NOTIFIER.get() {
+        notifier(notice);
+    }
+}
+
 /// Builds the shared `message_usage` analytics event with the full
 /// input/output/cache token breakdown consumed by `claw-dashboard`.
 /// Used by every provider that traces usage.

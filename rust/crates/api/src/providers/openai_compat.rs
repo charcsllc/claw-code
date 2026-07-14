@@ -345,6 +345,12 @@ impl OpenAiCompatClient {
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
             };
+            super::notify_retry(&super::RetryNotice {
+                attempt: attempts,
+                max_retries: self.max_retries,
+                delay,
+                error: retryable_error.to_string(),
+            });
             tokio::time::sleep(delay).await;
         };
 

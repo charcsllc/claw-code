@@ -7106,6 +7106,48 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// `/upgrade`: this fork installs by building locally (install.sh /
+/// install.ps1), so upgrading = pull + rebuild. Reports what's running and
+/// the exact commands, flagging when the binary already lags the checkout.
+fn format_upgrade_report() -> String {
+    let cwd = std::env::current_dir().ok();
+    let provenance = binary_provenance_for(cwd.as_deref());
+    let commit = provenance
+        .git_sha_short
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+    let dirty = if provenance.is_dirty { " (dirty)" } else { "" };
+    let sync_line = match provenance.workspace_match {
+        Some(true) => "binary matches the current checkout — pull first, then rebuild",
+        Some(false) => "binary was built from a DIFFERENT commit than this checkout — rebuild to pick up your changes",
+        None => "run /upgrade from the claw-code checkout to compare against the workspace",
+    };
+    format!(
+        "Upgrade
+  Version          {VERSION}
+  Built from       {commit}{dirty} ({})
+  Binary           {}
+  Sync             {sync_line}
+  Update (Linux/macOS)  cd <claw-code> && git pull && ./install.sh
+  Update (Windows)      cd <claw-code>; git pull; .\\install.ps1
+  Source           https://github.com/charcsllc/claw-code",
+        provenance.commit_date,
+        provenance.executable_path.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// One terminal line: API error strings can embed whole JSON response
+/// bodies, and a retry notice must not scroll the conversation away.
+fn truncate_retry_error(error: &str) -> String {
+    let flat = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(140).collect();
+    if flat.chars().count() > 140 {
+        out.push('…');
+    }
+    out
+}
+
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -7116,6 +7158,18 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
+    // Interactive-only: without this, a rate-limited turn silently backs off
+    // for up to minutes and the REPL looks frozen. Print/JSON modes never
+    // install it, so machine-readable output stays clean.
+    api::set_retry_notifier(|notice| {
+        eprintln!(
+            "⟳ error transitorio del proveedor — reintento {}/{} en {}s ({})",
+            notice.attempt,
+            notice.max_retries + 1,
+            notice.delay.as_secs().max(1),
+            truncate_retry_error(&notice.error),
+        );
+    });
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
@@ -8229,10 +8283,23 @@ impl LiveCli {
                 false
             }
             SlashCommand::Provider { args } => {
-                println!(
-                    "{}",
-                    provider_presets::handle_provider_command(args.as_deref())
-                );
+                // `test` needs the active model to resolve the provider, so
+                // it dispatches here instead of inside the presets module.
+                let trimmed = args.as_deref().map(str::trim).unwrap_or_default();
+                if trimmed == "test" || trimmed.starts_with("test ") {
+                    let model = trimmed
+                        .strip_prefix("test")
+                        .map(str::trim)
+                        .filter(|rest| !rest.is_empty())
+                        .unwrap_or(&self.model)
+                        .to_string();
+                    println!("{}", run_provider_probe(&model));
+                } else {
+                    println!(
+                        "{}",
+                        provider_presets::handle_provider_command(args.as_deref())
+                    );
+                }
                 false
             }
             SlashCommand::Compact => {
@@ -8348,10 +8415,13 @@ impl LiveCli {
                 );
                 false
             }
+            SlashCommand::Upgrade => {
+                println!("{}", format_upgrade_report());
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
-            | SlashCommand::Upgrade
             | SlashCommand::Share
             | SlashCommand::Feedback
             | SlashCommand::Files
@@ -12808,6 +12878,62 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+/// `/provider test [model]`: one real 1-token request against the resolved
+/// provider, so a bad key, wrong base URL, or DNS/proxy failure surfaces
+/// here — with the exact error — instead of on the first real turn.
+fn run_provider_probe(model: &str) -> String {
+    let resolved_model = api::resolve_model_alias(model);
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
+    let header = format!(
+        "Provider test\n  Model            {resolved_model}\n  Provider         {provider_summary}\n  Provider URL     {provider_url}"
+    );
+    let client = match detect_provider_kind(&resolved_model) {
+        ProviderKind::Anthropic => match resolve_cli_auth_source() {
+            Ok(auth) => ApiProviderClient::Anthropic(
+                AnthropicClient::from_auth(auth).with_base_url(api::read_base_url()),
+            ),
+            Err(error) => {
+                return format!(
+                    "{header}\n  Result           FAILED (auth)\n  Error            {error}"
+                );
+            }
+        },
+        ProviderKind::Xai | ProviderKind::OpenAi => {
+            match ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None) {
+                Ok(client) => client,
+                Err(error) => {
+                    return format!(
+                        "{header}\n  Result           FAILED (setup)\n  Error            {error}"
+                    );
+                }
+            }
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return format!("{header}\n  Result           FAILED\n  Error            {error}")
+        }
+    };
+    let request = MessageRequest {
+        model: resolved_model.clone(),
+        max_tokens: 1,
+        messages: vec![InputMessage::user_text("ping")],
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    match runtime.block_on(client.send_message(&request)) {
+        Ok(_) => format!(
+            "{header}\n  Result           ok ({} ms)\n  Hint             credentials and endpoint verified with a live request",
+            started.elapsed().as_millis()
+        ),
+        Err(error) => format!(
+            "{header}\n  Result           FAILED\n  Error            {}\n  Hint             check /provider show and your key; base URL must include the protocol path the provider expects",
+            truncate_retry_error(&error.to_string())
+        ),
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {

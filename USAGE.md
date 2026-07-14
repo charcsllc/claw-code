@@ -248,11 +248,19 @@ URL y modelo por defecto), lo **aplica al instante** y lo **persiste** en
 /provider use qwen <api-key>                    # Alibaba DashScope
 /provider use ollama [base-url]                 # local, sin clave
 /provider show                                  # qué hay guardado y qué env está activo
+/provider test                                  # petición real de 1 token: verifica clave y endpoint
 /provider clear                                 # borra el proveedor guardado
 ```
 
 Las variables de entorno siempre tienen prioridad sobre lo guardado: si
 `ANTHROPIC_API_KEY` está en tu shell, se usa esa.
+
+`/provider test [modelo]` hace una petición real mínima al proveedor resuelto:
+si la clave es inválida, la base URL está mal o hay un problema de red/proxy,
+lo ves aquí con el error exacto — no en tu primer turno de trabajo. Además, si
+un turno se queda esperando por un rate-limit (429) u otro error transitorio,
+el REPL ahora lo dice en vivo (`⟳ reintento k/9 en Ns`) en vez de parecer
+colgado durante el backoff.
 
 ### Clave de API
 

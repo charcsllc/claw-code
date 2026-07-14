@@ -459,6 +459,15 @@ impl AnthropicClient {
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
             };
+            super::notify_retry(&super::RetryNotice {
+                attempt: attempts,
+                max_retries: self.max_retries,
+                delay,
+                error: last_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            });
             tokio::time::sleep(delay).await;
         }
 

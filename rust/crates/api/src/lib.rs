@@ -34,7 +34,7 @@ pub use providers::openai_compat::{
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_family_identity_for, model_family_identity_for_kind, provider_diagnostics_for_model,
-    resolve_model_alias, ProviderDiagnostics, ProviderKind,
+    resolve_model_alias, set_retry_notifier, ProviderDiagnostics, ProviderKind, RetryNotice,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

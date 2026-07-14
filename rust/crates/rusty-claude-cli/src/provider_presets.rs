@@ -251,7 +251,7 @@ fn provider_usage() -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!(
-        "  Usage            /provider [show|list]\n                   /provider use <{kinds}> <api-key> [model]\n                   /provider use ollama [base-url] [model]\n                   /provider clear"
+        "  Usage            /provider [show|list]\n                   /provider use <{kinds}> <api-key> [model]\n                   /provider use ollama [base-url] [model]\n                   /provider test [model]   (live 1-token connectivity check)\n                   /provider clear"
     )
 }
 
