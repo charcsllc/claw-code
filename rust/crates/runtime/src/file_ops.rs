@@ -294,9 +294,29 @@ pub fn edit_file(
     }
     let occurrences = original_file.matches(old_string).count();
     if occurrences == 0 {
+        // Most misses are a stale read: the block moved or was reformatted.
+        // Pointing at where the FIRST line still matches lets the caller
+        // (usually an agent) re-anchor without a blind retry.
+        let hint = old_string
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|first_line| {
+                let trimmed = first_line.trim();
+                original_file
+                    .lines()
+                    .position(|line| line.contains(trimmed))
+                    .map(|index| {
+                        format!(
+                            "; its first line matches line {} but the full block \
+                             differs — re-read the file and retry with the current text",
+                            index + 1
+                        )
+                    })
+            })
+            .unwrap_or_default();
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!("old_string not found in file{hint}"),
         ));
     }
     // Editing "the first match" of a non-unique string silently mutates a
@@ -851,6 +871,31 @@ mod tests {
             "abc",
             "file must be untouched"
         );
+    }
+
+    #[test]
+    fn edit_not_found_hints_at_moved_block() {
+        let path = temp_path("edit-hint.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "fn main() {\n    println!(\"hola\");\n}\n",
+        )
+        .expect("write");
+        // First line matches but the block body differs: the error should
+        // point the caller at the surviving anchor line.
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "fn main() {\n    println!(\"adios\");\n}",
+            "X",
+            false,
+        )
+        .expect_err("stale block must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("line 1"), "{error}");
+        // No anchor at all: plain not-found, no hint.
+        let error = edit_file(path.to_string_lossy().as_ref(), "no existe", "X", false)
+            .expect_err("missing text must be rejected");
+        assert!(!error.to_string().contains("first line"), "{error}");
     }
 
     #[test]

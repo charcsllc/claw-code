@@ -207,6 +207,18 @@ impl Drop for BuildGuard {
 pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     options.catalog.validate_credentials()?;
 
+    // Fail fast on missing credentials: without this, the run does planning
+    // setup, creates docs/ and a git branch, and only then dies inside the
+    // first Director agent with a confusing provider error.
+    if !has_any_provider_credentials() {
+        return Err(
+            "no provider credentials found in the environment; run /provider use \
+             <preset> <key> (or export ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / \
+             OPENAI_API_KEY / OLLAMA_HOST) before building"
+                .to_string(),
+        );
+    }
+
     // In Improve mode the project must already have code: refuse an empty
     // directory (the user wants /web there, not /improve). Checked BEFORE any
     // side effect so a rejected target is not left with docs/ or a new .git/.
@@ -1063,6 +1075,28 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             .map(|(_, task)| task.id.clone())
             .collect()
     };
+    // Persist the outcome next to the other build docs: the terminal
+    // scrolls away, docs/SUMMARY.md doesn't.
+    let summary_md = format!(
+        "# Resumen de la construcción\n\n- Visión: {}\n- Tareas: {} (completadas {completed}, \
+         fallidas {failed}, bloqueadas {})\n- Tareas fallidas: {}\n- Issues de supervisión: \
+         {supervision_issues}\n- Coste estimado: {}\n- Rama de trabajo: {}\n",
+        plan.vision,
+        tasks.len(),
+        blocked_task_ids.len(),
+        if failed_task_ids.is_empty() {
+            "ninguna".to_string()
+        } else {
+            failed_task_ids.join(", ")
+        },
+        budget.spent().map_or_else(
+            || "desconocido (sin telemetría)".to_string(),
+            |cost| { format!("{cost:.2} USD") }
+        ),
+        improve_branch.as_deref().unwrap_or("(rama actual)"),
+    );
+    let _ = save_doc(&docs, "SUMMARY.md", &summary_md);
+
     Ok(RunSummary {
         plan,
         tasks: tasks.len(),
@@ -2658,6 +2692,24 @@ fn append_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(content.as_bytes())
         .map_err(|error| error.to_string())
+}
+
+/// Any credential the agent runners could authenticate with.
+fn has_any_provider_credentials() -> bool {
+    [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "OLLAMA_HOST",
+    ]
+    .iter()
+    .any(|name| {
+        std::env::var(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn init_git_repo(project_dir: &Path) -> Result<(), String> {

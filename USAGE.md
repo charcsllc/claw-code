@@ -607,12 +607,21 @@ Más comandos de sesión y utilidad:
 - `/files` — rama actual y archivos cambiados del árbol de trabajo (git status).
 - `/keybindings` — atajos reales del editor de línea (historial, búsqueda inversa, multilínea…).
 - `/upgrade` — versión, commit del binario y comandos exactos de actualización.
-- `/summary` — la sesión de un vistazo: modelo, mensajes, turnos, tokens, coste y último prompt.
+- `/plan <petición>` — turno de planificación con las **herramientas desactivadas**: el modelo solo puede pensar, no ejecutar; ideal antes de un cambio grande.
+- `/review [staged]` — revisión con IA del diff del árbol de trabajo (o del staged), con veredicto ship/fix-first.
+- `/fast` — cambia al modelo rápido configurado (`subagentModel` de `/setup`) y con otro `/fast` vuelves al anterior.
+- `/security-review` — checks deterministas de 0 tokens: escaneo de credenciales hardcodeadas y `.env` commiteados.
+- `/release-notes` — los últimos 20 commits del checkout que sirve tu binario.
+- `/privacy-settings` — dónde vive cada dato local (settings, sesiones, telemetría) y cómo purgarlo.
+- `/history search <término>` — busca en el historial de prompts en vez de listar los últimos.
+- `/summary` — la sesión de un vistazo: modelo, proveedor, effort, mensajes, turnos, tokens, coste y último prompt.
 - `/hooks` — hooks configurados por evento, incluyendo los que no parsearon (y por qué).
 - `/color on|off|auto` (también `/theme`) — fuerza o desactiva los colores ANSI en vivo; `off` silencia también el spinner.
 - `/usage last` — tokens solo del último turno.
 
-Además: el banner de arranque y `/doctor` muestran el proveedor activo; `/doctor` avisa si `~/.claw/settings.json` quedó legible por otros usuarios; los archivos de sesión se guardan con permisos 0600; el historial de prompts se limita a 1000 entradas; y `CLAW_BASH_TIMEOUT_MS` ajusta el timeout por defecto de la herramienta bash.
+Además: el banner de arranque muestra la versión y el proveedor activo; `/doctor` muestra el proveedor y avisa si `~/.claw/settings.json` quedó legible por otros usuarios; los archivos de sesión se guardan con permisos 0600; el historial de prompts se limita a 1000 entradas; `CLAW_BASH_TIMEOUT_MS` ajusta el timeout por defecto de la herramienta bash; y el spinner indica el modelo que está pensando.
+
+En los builds multiagente: `--timeout-secs N` ajusta el timeout por agente desde el REPL, `--parallel` se acota a 1–16, el build **falla rápido** si no hay credenciales de proveedor en el entorno (antes moría dentro del Director con un error confuso), y el resultado queda persistido en `docs/SUMMARY.md`.
 
 ## Orden de resolución de los archivos de configuración
 

@@ -262,6 +262,16 @@ fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(),
         catalog.supervisor = model;
     }
 
+    // 0 developer slots would deadlock the scheduler; beyond 16 the agent
+    // processes just contend for CPU/IO.
+    let parallel = common.parallel.clamp(1, 16);
+    if parallel != common.parallel {
+        eprintln!(
+            "[multiagent] aviso: --parallel {} fuera de rango; usando {parallel}",
+            common.parallel
+        );
+    }
+
     if common.dashboard {
         launch_dashboard(&project_dir);
     }
@@ -285,7 +295,7 @@ fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(),
         prompt: common.prompt,
         project_dir,
         catalog,
-        parallel: common.parallel,
+        parallel,
         dry_run: common.dry_run,
         agent_timeout: Duration::from_secs(common.agent_timeout_secs),
         resume: common.resume,

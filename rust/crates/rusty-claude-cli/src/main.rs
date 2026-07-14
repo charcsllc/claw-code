@@ -7328,13 +7328,21 @@ fn format_files_report() -> String {
         .map(|branch| branch.trim().to_string())
         .filter(|branch| !branch.is_empty())
         .unwrap_or_else(|| "(detached)".to_string());
+    // "## main...origin/main [ahead 2, behind 1]" → keep the bracket part.
+    let upstream = run_git_capture_in(&cwd, &["status", "--short", "--branch"])
+        .and_then(|out| out.lines().next().map(ToString::to_string))
+        .and_then(|head| {
+            head.find('[')
+                .map(|start| format!(" — {}", head[start..].trim_end()))
+        })
+        .unwrap_or_default();
     let lines: Vec<&str> = status.lines().collect();
     if lines.is_empty() {
         return format!(
-            "Files\n  Branch           {branch}\n  Working tree     clean (no changes)"
+            "Files\n  Branch           {branch}{upstream}\n  Working tree     clean (no changes)"
         );
     }
-    let mut out = format!("Files ({} changed on {branch})\n", lines.len());
+    let mut out = format!("Files ({} changed on {branch}{upstream})\n", lines.len());
     for line in lines.iter().take(100) {
         let _ = writeln!(out, "  {line}");
     }
@@ -7342,6 +7350,114 @@ fn format_files_report() -> String {
         let _ = write!(out, "  … and {} more (see git status)", lines.len() - 100);
     }
     out.trim_end().to_string()
+}
+
+/// `/review`: the working-tree (or staged) diff, capped so a huge refactor
+/// doesn't blow the context window before the review starts.
+fn collect_review_diff(staged: bool) -> Result<String, String> {
+    const MAX_DIFF_CHARS: usize = 60_000;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let args: &[&str] = if staged {
+        &["diff", "--staged"]
+    } else {
+        &["diff"]
+    };
+    let diff =
+        run_git_capture_in(&cwd, args).ok_or("not inside a git repository (or git unavailable)")?;
+    if diff.trim().is_empty() {
+        return Err(if staged {
+            "no staged changes to review (try /review for unstaged ones)".to_string()
+        } else {
+            "working tree is clean — nothing to review (try /review staged)".to_string()
+        });
+    }
+    if diff.chars().count() > MAX_DIFF_CHARS {
+        let truncated: String = diff.chars().take(MAX_DIFF_CHARS).collect();
+        Ok(format!(
+            "{truncated}\n… (diff truncated at {MAX_DIFF_CHARS} chars; review the rest separately)"
+        ))
+    } else {
+        Ok(diff)
+    }
+}
+
+/// `/release-notes`: what changed recently in the checkout this binary
+/// serves — the local-build equivalent of hosted release notes.
+fn format_release_notes_report() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(log) = run_git_capture_in(&cwd, &["log", "--oneline", "-n", "20"]) else {
+        return format!(
+            "Release notes\n  Version          {VERSION}\n  Error            not inside a git checkout; see https://github.com/charcsllc/claw-code/commits"
+        );
+    };
+    let mut out = format!("Release notes (últimos 20 commits)\n  Version          {VERSION}\n");
+    for line in log.lines().take(20) {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("  Full history     git log  ·  https://github.com/charcsllc/claw-code/commits");
+    out
+}
+
+/// `/security-review`: deterministic, zero-token checks over the working
+/// tree — hardcoded credentials and committed .env files.
+fn format_security_review_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let findings = claw_multiagent::orchestrator::scan_for_secrets(&cwd);
+    let tracked_env = run_git_capture_in(&cwd, &["ls-files", ".env", "*/.env", ".env.*"])
+        .map(|out| {
+            out.lines()
+                .filter(|line| !line.trim().is_empty() && !line.ends_with(".env.example"))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut out = String::from("Security review (checks deterministas, 0 tokens)\n");
+    if findings.is_empty() {
+        out.push_str("  Secret scan      ok — sin credenciales hardcodeadas detectadas\n");
+    } else {
+        let _ = writeln!(out, "  Secret scan      {} hallazgo(s):", findings.len());
+        for finding in findings.iter().take(20) {
+            let _ = writeln!(out, "    {finding}");
+        }
+    }
+    if tracked_env.is_empty() {
+        out.push_str("  .env tracking    ok — ningún .env commiteado\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "  .env tracking    ⚠ commiteados: {} (muévelos a .gitignore y rota las claves)",
+            tracked_env.join(", ")
+        );
+    }
+    out.push_str("  Deep review      /review — revisión con IA del diff actual");
+    out
+}
+
+/// `/privacy-settings`: where claw stores data locally and how to purge it.
+fn format_privacy_report() -> String {
+    let config_home = runtime::default_config_home();
+    let sessions = sessions_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "(no disponible)".to_string());
+    let telemetry = std::env::var("CLAW_DASHBOARD_EVENTS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            "desactivada (solo con --dashboard o CLAW_DASHBOARD_EVENTS)".to_string()
+        });
+    format!(
+        "Privacy
+  Todo es local — este fork no envía datos a ningún servicio salvo tu proveedor de IA.
+  Settings         {} (0600; puede contener tu API key)
+  Sesiones         {sessions} (0600; conversaciones completas)
+  Telemetría       {telemetry}
+  Prompts          se envían solo al proveedor configurado (/provider show)
+  Purgar           borra ~/.claw/ y el directorio de sesiones para eliminarlo todo",
+        config_home.join("settings.json").display(),
+    )
 }
 
 /// `/hooks`: every configured hook by event, plus config entries that
@@ -7567,6 +7683,12 @@ struct LiveCli {
     /// builds a FRESH runtime: without re-applying, `--effort`/`/effort`
     /// silently stopped working after the first turn.
     reasoning_effort: Option<String>,
+    /// `/plan`: the next turn runs with tools DISABLED so the model can only
+    /// plan, never execute. Consumed (reset) by `prepare_turn_runtime`.
+    plan_mode_once: std::cell::Cell<bool>,
+    /// `/fast`: the model that was active before switching to the fast
+    /// (subagent) model, so a second `/fast` switches back.
+    fast_model_stash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8100,6 +8222,8 @@ impl LiveCli {
             session,
             prompt_history: Vec::new(),
             reasoning_effort: None,
+            plan_mode_once: std::cell::Cell::new(false),
+            fast_model_stash: None,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -8145,6 +8269,7 @@ impl LiveCli {
 ██║     ██║     ██╔══██║██║███╗██║\n\
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+  \x1b[2mVersion\x1b[0m          {VERSION}\n\
   \x1b[2mModel\x1b[0m            {}\n\
   \x1b[2mProvider\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
@@ -8178,6 +8303,8 @@ impl LiveCli {
         format!(
             "Summary
   Model            {}
+  Provider         {}
+  Effort           {}
   Session          {}
   Messages         {}
   Turns            {}
@@ -8186,6 +8313,10 @@ impl LiveCli {
   Last prompt      {}
   File             {}",
             self.model,
+            provider_presets::active_provider_summary().0,
+            self.reasoning_effort
+                .as_deref()
+                .unwrap_or("(provider default)"),
             session.session_id,
             session.messages.len(),
             tracker.turns(),
@@ -8212,12 +8343,15 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
+        // `/plan` disables tools for exactly one turn; consuming the flag
+        // here (not in the handler) keeps it correct even if the turn errors.
+        let enable_tools = !self.plan_mode_once.replace(false);
         let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
-            true,
+            enable_tools,
             emit_output,
             self.allowed_tools.clone(),
             self.permission_mode,
@@ -8246,7 +8380,7 @@ impl LiveCli {
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
-            "🦀 Thinking...",
+            &format!("🦀 Thinking... ({})", self.model),
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
@@ -8925,23 +9059,90 @@ impl LiveCli {
                 println!("Session saved. Bye!");
                 std::process::exit(0);
             }
+            SlashCommand::Plan { mode } => {
+                match mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(request) => {
+                        // Tools off for one turn: the model can read nothing
+                        // and write nothing — it can only think out loud.
+                        self.plan_mode_once.set(true);
+                        let prompt = format!(
+                            "PLANNING MODE (tools are disabled this turn). Produce a concrete, \
+                             step-by-step implementation plan for the request below: files to \
+                             touch, functions/interfaces, risks, and how to verify. Do NOT \
+                             write final code.\n\nRequest:\n{request}"
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    None => eprintln!("Usage: /plan <qué quieres planificar>"),
+                }
+                false
+            }
+            SlashCommand::Review { scope } => {
+                let staged = matches!(scope.as_deref().map(str::trim), Some("staged"));
+                match collect_review_diff(staged) {
+                    Ok(diff) => {
+                        let prompt = format!(
+                            "Review the following git diff like a strict senior engineer: \
+                             point out real bugs, security issues, and risky patterns with \
+                             file:line references; skip style nitpicks. End with a verdict \
+                             (ship / fix first).\n\n```diff\n{diff}\n```"
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    Err(message) => eprintln!("{message}"),
+                }
+                false
+            }
+            SlashCommand::Fast => match self.fast_model_stash.take() {
+                Some(previous) => {
+                    println!("Fast mode OFF — volviendo a {previous}");
+                    self.set_model(Some(previous))?
+                }
+                None => match runtime::load_user_settings_field("subagentModel") {
+                    Some(fast) if fast != self.model => {
+                        self.fast_model_stash = Some(self.model.clone());
+                        println!("Fast mode ON — usando {fast} (repite /fast para volver)");
+                        self.set_model(Some(fast))?
+                    }
+                    Some(_) => {
+                        eprintln!("el modelo rápido configurado es el actual; nada que cambiar");
+                        false
+                    }
+                    None => {
+                        eprintln!(
+                            "no hay modelo rápido configurado; define subagentModel con /setup"
+                        );
+                        false
+                    }
+                },
+            },
+            SlashCommand::ReleaseNotes => {
+                println!("{}", format_release_notes_report());
+                false
+            }
+            SlashCommand::SecurityReview => {
+                println!("{}", format_security_review_report());
+                false
+            }
+            SlashCommand::PrivacySettings => {
+                println!("{}", format_privacy_report());
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
             | SlashCommand::Share
             | SlashCommand::Feedback
-            | SlashCommand::Fast
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
             | SlashCommand::Stickers
             | SlashCommand::Insights
             | SlashCommand::Thinkback
-            | SlashCommand::ReleaseNotes
-            | SlashCommand::SecurityReview
-            | SlashCommand::PrivacySettings
-            | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
             | SlashCommand::Tasks { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
@@ -9015,6 +9216,37 @@ impl LiveCli {
     }
 
     fn print_prompt_history(&self, count: Option<&str>) {
+        // `/history search <term>`: filter instead of tail.
+        if let Some(term) = count
+            .and_then(|value| value.trim().strip_prefix("search"))
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+        {
+            let needle = term.to_lowercase();
+            let matches: Vec<&runtime::SessionPromptEntry> = self
+                .runtime
+                .session()
+                .prompt_history
+                .iter()
+                .filter(|entry| entry.text.to_lowercase().contains(&needle))
+                .collect();
+            if matches.is_empty() {
+                println!("History search\n  Term             {term}\n  Matches          0");
+            } else {
+                println!(
+                    "History search ({} match(es) for \"{term}\")",
+                    matches.len()
+                );
+                for entry in matches.iter().rev().take(20) {
+                    println!(
+                        "  {}  {}",
+                        format_history_timestamp(entry.timestamp_ms),
+                        truncate_retry_error(&entry.text)
+                    );
+                }
+            }
+            return;
+        }
         let limit = match parse_history_count(count) {
             Ok(limit) => limit,
             Err(message) => {
@@ -13424,10 +13656,17 @@ fn run_provider_probe(model: &str) -> String {
     };
     let started = std::time::Instant::now();
     match runtime.block_on(client.send_message(&request)) {
-        Ok(_) => format!(
-            "{header}\n  Result           ok ({} ms)\n  Hint             credentials and endpoint verified with a live request",
-            started.elapsed().as_millis()
-        ),
+        Ok(_) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            let slow_note = if elapsed_ms > 5_000 {
+                "\n  Note             respuesta lenta (>5s): revisa red/proxy o elige un endpoint más cercano"
+            } else {
+                ""
+            };
+            format!(
+                "{header}\n  Result           ok ({elapsed_ms} ms){slow_note}\n  Hint             credentials and endpoint verified with a live request"
+            )
+        }
         Err(error) => format!(
             "{header}\n  Result           FAILED\n  Error            {}\n  Hint             check /provider show and your key; base URL must include the protocol path the provider expects",
             truncate_retry_error(&error.to_string())
@@ -18473,6 +18712,21 @@ mod tests {
         let report = format_color_report();
         assert!(report.contains("Mode"));
         assert!(report.contains("/color on|off|auto"));
+    }
+
+    #[test]
+    fn release_notes_report_names_version() {
+        let report = crate::format_release_notes_report();
+        assert!(report.contains(VERSION));
+        assert!(report.contains("charcsllc/claw-code"));
+    }
+
+    #[test]
+    fn privacy_report_points_at_local_paths() {
+        let report = crate::format_privacy_report();
+        assert!(report.contains("settings.json"));
+        assert!(report.contains("0600"));
+        assert!(report.contains("/provider show"));
     }
 
     #[test]

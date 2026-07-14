@@ -1459,7 +1459,8 @@ pub fn validate_slash_command_input(
         }
         "login" | "logout" => {
             return Err(command_error(
-                "This auth flow was removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead.",
+                "This auth flow was removed. Use /provider use <preset> <key> (verify with \
+                 /provider test), or set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN.",
                 command,
                 "",
             ));

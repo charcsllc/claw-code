@@ -35,11 +35,27 @@ impl Drop for ReplEnvGuard {
 }
 
 const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N] \
-[--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold]\n\
+[--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold] \
+[--timeout-secs N]\n\
                             /app <prompt> [same options]\n\
                      Tips: --approve pauses after planning for a go/no-go;\n\
                      --dry-run stops after planning entirely.\n\
                      --max-cost-usd is OFF by default (subscription accounts).";
+
+/// Developer-slot bounds: 0 would deadlock the scheduler and beyond 16 the
+/// per-agent processes contend for CPU/IO without building any faster.
+pub(crate) fn clamp_parallel(requested: usize) -> (usize, Option<String>) {
+    match requested {
+        0 => (1, Some("--parallel 0 no es válido; usando 1".to_string())),
+        1..=16 => (requested, None),
+        _ => (
+            16,
+            Some(format!(
+                "--parallel {requested} supera el máximo razonable; usando 16"
+            )),
+        ),
+    }
+}
 
 /// Parses the slash-command arguments and runs the build. The working
 /// directory and agent store are restored afterwards so the REPL session
@@ -70,6 +86,7 @@ pub(crate) fn run_multiagent_build(
     };
     let mut max_cost_usd: Option<f64> = None;
     let mut build_cmd: Option<String> = None;
+    let mut agent_timeout_secs = 1800_u64;
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
@@ -107,6 +124,14 @@ pub(crate) fn run_multiagent_build(
                     .to_string(),
                 );
             }
+            "--timeout-secs" => {
+                index += 1;
+                agent_timeout_secs = tokens
+                    .get(index)
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0)
+                    .ok_or("--timeout-secs expects a positive number of seconds")?;
+            }
             word => prompt_words.push(word),
         }
         index += 1;
@@ -115,6 +140,10 @@ pub(crate) fn run_multiagent_build(
     if prompt.is_empty() {
         println!("{USAGE}");
         return Ok(());
+    }
+    let (parallel, parallel_warning) = clamp_parallel(parallel);
+    if let Some(warning) = parallel_warning {
+        println!("[multiagent] {warning}");
     }
 
     let original_cwd = std::env::current_dir()?;
@@ -146,7 +175,7 @@ pub(crate) fn run_multiagent_build(
         catalog,
         parallel,
         dry_run,
-        agent_timeout: Duration::from_secs(1800),
+        agent_timeout: Duration::from_secs(agent_timeout_secs),
         resume,
         max_cost_usd,
         build_command: build_cmd,
@@ -199,5 +228,25 @@ pub(crate) fn run_multiagent_build(
             println!("[multiagent] error: {error}");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_parallel;
+
+    #[test]
+    fn clamp_parallel_bounds_and_warns() {
+        assert_eq!(clamp_parallel(4), (4, None));
+        assert_eq!(clamp_parallel(1).0, 1);
+        assert_eq!(clamp_parallel(16).0, 16);
+
+        let (fixed, warning) = clamp_parallel(0);
+        assert_eq!(fixed, 1);
+        assert!(warning.is_some());
+
+        let (capped, warning) = clamp_parallel(64);
+        assert_eq!(capped, 16);
+        assert!(warning.unwrap().contains("16"));
     }
 }
