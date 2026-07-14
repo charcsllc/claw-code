@@ -90,6 +90,14 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         default_model: "grok",
     },
     ProviderPreset {
+        kind: "openrouter",
+        label: "OpenRouter (multi-modelo, OpenAI-compat)",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "https://openrouter.ai/api/v1",
+        default_model: "",
+    },
+    ProviderPreset {
         kind: "ollama",
         label: "Ollama (local, keyless)",
         key_env: "",
@@ -107,6 +115,7 @@ pub(crate) fn preset_for(kind: &str) -> Option<&'static ProviderPreset> {
         "moonshot" => "kimi",
         "qwen" | "alibaba" => "dashscope",
         "grok" => "xai",
+        "or" => "openrouter",
         other => other,
     };
     PROVIDER_PRESETS
@@ -268,7 +277,7 @@ fn render_provider_list() -> String {
             ""
         };
         out.push_str(&format!(
-            "    {:<10} {} — {}{}{marker}\n",
+            "    {:<10} {} — {}{}{}{marker}\n",
             preset.kind,
             preset.label,
             if preset.key_env.is_empty() {
@@ -280,6 +289,11 @@ fn render_provider_list() -> String {
                 String::new()
             } else {
                 format!(" @ {}", preset.default_base_url)
+            },
+            if preset.default_model.is_empty() {
+                String::new()
+            } else {
+                format!(" · modelo {}", preset.default_model)
             }
         ));
     }
@@ -417,6 +431,10 @@ mod tests {
         assert_eq!(preset_for("GLM").expect("case+alias").kind, "zhipu");
         assert_eq!(preset_for("qwen").expect("qwen").kind, "dashscope");
         assert_eq!(preset_for("moonshot").expect("moonshot").kind, "kimi");
+        assert_eq!(preset_for("or").expect("alias").kind, "openrouter");
+        let openrouter = preset_for("openrouter").expect("openrouter");
+        assert_eq!(openrouter.key_env, "OPENAI_API_KEY");
+        assert!(openrouter.default_base_url.contains("openrouter.ai"));
         assert!(preset_for("nope").is_none());
     }
 

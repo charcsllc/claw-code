@@ -195,11 +195,13 @@ if ($skipVerify) {
 
 # --------------------------------------------------------------------------
 Write-Step 6 $total "Next steps"
+$installedVersion = try { (& $clawBin --version 2>$null | Select-Object -First 1) } catch { "unknown" }
 @"
 
 Claw Code is built and ready.
 
   Binary:  $clawBin
+  Version: $installedVersion
   Profile: $buildProfile
 
 Try it out:

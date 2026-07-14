@@ -61,6 +61,10 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  \x1b[1mClaw Code Setup Wizard\x1b[0m");
     println!("  Configure your provider, API key, and model.");
+    println!(
+        "  Active now: {}",
+        crate::provider_presets::active_provider_summary().0
+    );
     println!("  Press Enter to keep current value.\n");
 
     let kind = prompt_provider(&current)?;
@@ -97,6 +101,24 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
         "  Run \x1b[1m/model {}\x1b[0m to activate the model.",
         model.as_deref().unwrap_or(&kind)
     );
+
+    // One live request catches a typo'd key or wrong base URL here, not on
+    // the first real prompt.
+    let test = read_line("  Test the connection now with a 1-token request? [y/N]: ")?;
+    if matches!(
+        test.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "s" | "si" | "sí"
+    ) {
+        let probe_model = model
+            .clone()
+            .or_else(|| {
+                crate::provider_presets::preset_for(&kind)
+                    .map(|preset| preset.default_model.to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| kind.clone());
+        println!("{}", crate::run_provider_probe(&probe_model));
+    }
     println!();
 
     Ok(())

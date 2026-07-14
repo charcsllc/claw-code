@@ -3753,12 +3753,32 @@ fn check_settings_permissions_health() -> DiagnosticCheck {
             );
         };
         let mode = metadata.permissions().mode() & 0o777;
+        // Sessions hold the full conversations; a loose sessions dir leaks
+        // as much as a loose settings file.
+        let sessions_note = sessions_dir()
+            .ok()
+            .and_then(|dir| std::fs::metadata(&dir).ok().map(|meta| (dir, meta)))
+            .map(|(dir, meta)| {
+                let dir_mode = meta.permissions().mode() & 0o777;
+                if dir_mode & 0o077 == 0 {
+                    format!("sessions dir {} is owner-only", dir.display())
+                } else {
+                    format!(
+                        "sessions dir {} is accessible to other users (mode {dir_mode:o}); run chmod 700 on it",
+                        dir.display()
+                    )
+                }
+            });
         if mode & 0o077 == 0 {
-            DiagnosticCheck::new(
+            let mut check = DiagnosticCheck::new(
                 "Secrets file permissions",
                 DiagnosticLevel::Ok,
                 format!("{} is owner-only ({mode:o})", settings_path.display()),
-            )
+            );
+            if let Some(note) = sessions_note {
+                check = check.with_details(vec![note]);
+            }
+            check
         } else {
             DiagnosticCheck::new(
                 "Secrets file permissions",
@@ -4713,6 +4733,10 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
             "Logging env      CLAW_LOG={} RUST_LOG={}",
             env::var("CLAW_LOG").unwrap_or_else(|_| "<unset>".to_string()),
             env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string())
+        ),
+        format!(
+            "Bash timeout     CLAW_BASH_TIMEOUT_MS={} (default 120000)",
+            env::var("CLAW_BASH_TIMEOUT_MS").unwrap_or_else(|_| "<unset>".to_string())
         ),
     ];
     if let Some(model) = default_model {
@@ -6245,6 +6269,7 @@ fn format_usage_report(tracker: &UsageTracker) -> String {
   Output tokens    {}
   Cache create     {}
   Cache read       {}
+  Cache hit rate   {}
   Total tokens     {}
   Estimated cost   {}",
         tracker.turns(),
@@ -6256,8 +6281,33 @@ fn format_usage_report(tracker: &UsageTracker) -> String {
         total.output_tokens,
         total.cache_creation_input_tokens,
         total.cache_read_input_tokens,
+        format_cache_hit_rate(total.input_tokens, total.cache_read_input_tokens),
         total.total_tokens(),
         format_usd(total.estimate_cost_usd().total_cost_usd()),
+    )
+}
+
+/// Share of prompt tokens served from the prompt cache — the single number
+/// that says whether caching is working (cache reads cost ~10% of fresh
+/// input tokens).
+fn format_cache_hit_rate(input_tokens: u32, cache_read_tokens: u32) -> String {
+    let denominator = u64::from(input_tokens) + u64::from(cache_read_tokens);
+    if denominator == 0 {
+        return "n/a (no requests yet)".to_string();
+    }
+    let percent = u64::from(cache_read_tokens) * 100 / denominator;
+    format!("{percent}% of prompt tokens from cache")
+}
+
+/// A ten-slot text gauge: `[####------] 40%` — readable in any terminal,
+/// no colors required.
+fn render_utilization_bar(percent: u32) -> String {
+    let clamped = percent.min(100) as usize;
+    let filled = clamped / 10;
+    format!(
+        "[{}{}] {percent}%",
+        "#".repeat(filled),
+        "-".repeat(10 - filled)
     )
 }
 
@@ -6290,8 +6340,9 @@ fn format_context_report(
   Session tokens   {estimated_session_tokens} (estimated from message content){window_lines}
   Cumulative input {cumulative_input_tokens}
   Auto-compact at  {threshold} cumulative input tokens
-  Utilization      {percent}% of the auto-compact trigger
-  Tip              /compact shrinks the session now; auto-compaction fires at 100%"
+  Utilization      {} of the auto-compact trigger
+  Tip              /compact shrinks the session now; auto-compaction fires at 100%",
+        render_utilization_bar(percent)
     )
 }
 
@@ -7229,6 +7280,21 @@ fn truncate_last_exchanges(messages: &mut Vec<ConversationMessage>, steps: usize
     }
 }
 
+/// First non-empty text line of a message, flattened to one terminal line.
+fn message_first_text_line(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text { text } => text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(truncate_retry_error),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(sin texto)".to_string())
+}
+
 /// The text of the last assistant message in the session.
 fn last_assistant_text(session: &Session) -> String {
     session
@@ -7498,6 +7564,22 @@ fn format_hooks_report() -> String {
     out.trim_end().to_string()
 }
 
+/// Saves the `/color` choice so the next session starts with it.
+fn persist_color_mode(mode: &str) {
+    if let Err(error) = runtime::save_user_settings_field("colorMode", mode) {
+        eprintln!("warning: could not persist color mode: {error}");
+    }
+}
+
+/// Applies the persisted `/color` choice at REPL startup.
+fn apply_saved_color_mode() {
+    match runtime::load_user_settings_field("colorMode").as_deref() {
+        Some("on") => render::set_color_override(Some(true)),
+        Some("off") => render::set_color_override(Some(false)),
+        _ => {}
+    }
+}
+
 /// `/color` and `/theme`: the effective color state and how to change it.
 fn format_color_report() -> String {
     let override_state = match render::color_override() {
@@ -7537,6 +7619,39 @@ fn format_keybindings_report() -> String {
         .to_string()
 }
 
+/// Maps a failed turn's error text to the one command that actually fixes
+/// it — a raw provider error tells the user WHAT broke, never what to do.
+fn hint_for_turn_error(error: &str) -> Option<&'static str> {
+    let lower = error.to_lowercase();
+    if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key")
+        || lower.contains("unauthorized")
+    {
+        return Some("pista: credenciales rechazadas — verifica con /provider test o reconfigura con /provider use");
+    }
+    if lower.contains("retries exhausted") || lower.contains("429") || lower.contains("rate limit")
+    {
+        return Some(
+            "pista: el proveedor está limitando peticiones — espera un poco o cambia de modelo/proveedor (/provider)",
+        );
+    }
+    if lower.contains("context window") || lower.contains("context_window") {
+        return Some("pista: la sesión no cabe en el contexto — ejecuta /compact (o /rewind)");
+    }
+    if lower.contains("dns")
+        || lower.contains("connection refused")
+        || lower.contains("connect error")
+        || lower.contains("timed out")
+    {
+        return Some(
+            "pista: problema de red hacia el proveedor — comprueba la Base URL con /provider show y prueba /provider test",
+        );
+    }
+    None
+}
+
 /// One terminal line: API error strings can embed whole JSON response
 /// bodies, and a retry notice must not scroll the conversation away.
 fn truncate_retry_error(error: &str) -> String {
@@ -7561,6 +7676,7 @@ fn run_repl(
     // Interactive-only: without this, a rate-limited turn silently backs off
     // for up to minutes and the REPL looks frozen. Print/JSON modes never
     // install it, so machine-readable output stays clean.
+    apply_saved_color_mode();
     api::set_retry_notifier(|notice| {
         eprintln!(
             "⟳ error transitorio del proveedor — reintento {}/{} en {}s ({})",
@@ -7583,6 +7699,16 @@ fn run_repl(
     }
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    // No credentials at all: say it now, in one line, instead of letting the
+    // first turn fail with a provider error.
+    if provider_presets::active_provider_summary()
+        .0
+        .starts_with("none")
+    {
+        println!(
+            "⚠ sin credenciales configuradas — ejecuta /provider use <preset> <clave> (verifica con /provider test)"
+        );
+    }
 
     let mut exit_hint_shown = false;
     loop {
@@ -7633,6 +7759,9 @@ fn run_repl(
                 // to the prompt instead of exiting the REPL.
                 if let Err(error) = cli.run_turn(&prompt) {
                     eprintln!("{error}");
+                    if let Some(hint) = hint_for_turn_error(&error.to_string()) {
+                        eprintln!("{hint}");
+                    }
                 }
             }
             input::ReadOutcome::Cancel => {
@@ -8379,11 +8508,16 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        let effort_suffix = self
+            .reasoning_effort
+            .as_deref()
+            .map_or(String::new(), |effort| format!(", effort {effort}"));
         spinner.tick(
-            &format!("🦀 Thinking... ({})", self.model),
+            &format!("🦀 Thinking... ({}{effort_suffix})", self.model),
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
+        let turn_started = Instant::now();
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
@@ -8392,15 +8526,16 @@ impl LiveCli {
                 self.replace_runtime(runtime)?;
                 let final_text = final_assistant_text(&summary);
                 let theme = *TerminalRenderer::new().color_theme();
+                let done_label = format!("✨ Done ({:.1}s)", turn_started.elapsed().as_secs_f32());
                 if final_text.is_empty() {
                     // Tool-only turn: the spinner line is untouched, clear it.
-                    spinner.finish("✨ Done", &theme, &mut stdout)?;
+                    spinner.finish(&done_label, &theme, &mut stdout)?;
                 } else {
                     // The response was already rendered by the streaming path;
                     // do NOT print it again as raw markdown. Terminate its
                     // last line and place the marker below, without erasing it.
                     let _ = writeln!(stdout);
-                    spinner.finish_below("✨ Done", &theme, &mut stdout)?;
+                    spinner.finish_below(&done_label, &theme, &mut stdout)?;
                 }
                 println!();
                 if let Some(event) = summary.auto_compaction {
@@ -8891,12 +9026,13 @@ impl LiveCli {
                 if matches!(scope.as_deref().map(str::trim), Some("last")) {
                     let last = tracker.current_turn_usage();
                     println!(
-                        "Usage (last turn)\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}",
+                        "Usage (last turn)\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}\n  Estimated cost   {}",
                         last.input_tokens,
                         last.output_tokens,
                         last.cache_creation_input_tokens,
                         last.cache_read_input_tokens,
                         last.total_tokens(),
+                        format_usd(last.estimate_cost_usd().total_cost_usd()),
                     );
                 } else {
                     println!("{}", format_usage_report(&tracker));
@@ -8951,12 +9087,13 @@ impl LiveCli {
                 } else {
                     match copy_to_clipboard(&text) {
                         Ok(tool) => println!(
-                            "Copy\n  Copied           {} ({} chars, via {tool})",
+                            "Copy\n  Copied           {} ({} líneas, {} chars, via {tool})",
                             if all {
                                 "whole conversation"
                             } else {
                                 "last response"
                             },
+                            text.lines().count(),
                             text.chars().count()
                         ),
                         Err(error) => eprintln!("{error}"),
@@ -8965,6 +9102,16 @@ impl LiveCli {
                 false
             }
             SlashCommand::Branch { name } => {
+                // Branch names end up in filenames and resume references:
+                // reject separators before they produce a broken handle.
+                if let Some(name) = name.as_deref() {
+                    if name.contains(['/', '\\']) || name.chars().any(char::is_whitespace) {
+                        eprintln!(
+                            "invalid branch name '{name}': use letters, numbers, - and _ only"
+                        );
+                        return Ok(false);
+                    }
+                }
                 let forked = self.runtime.session().fork(name);
                 let forked_id = forked.session_id.clone();
                 match create_managed_session_handle(&forked_id)
@@ -8991,6 +9138,17 @@ impl LiveCli {
                     .map_or(Some(1), |value| value.parse::<usize>().ok());
                 match steps {
                     Some(steps) if steps > 0 => {
+                        // Capture what is about to disappear so the report can
+                        // name it — "removed 4 messages" alone is unverifiable.
+                        let doomed_first_line = {
+                            let messages = &self.runtime.session().messages;
+                            let mut probe = messages.clone();
+                            let removed = truncate_last_exchanges(&mut probe, steps);
+                            messages
+                                .get(probe.len())
+                                .filter(|_| removed > 0)
+                                .map(message_first_text_line)
+                        };
                         let removed = self.rewind_exchanges(steps);
                         if removed == 0 {
                             println!("Rewind\n  Result           nothing to rewind (no user exchange in session)");
@@ -8999,7 +9157,8 @@ impl LiveCli {
                                 eprintln!("warning: could not persist session: {error}");
                             }
                             println!(
-                                "Rewind\n  Removed          {removed} message(s)\n  Messages left    {}\n  Note             the model will not see the removed exchange(s)",
+                                "Rewind\n  Removed          {removed} message(s), starting at: {}\n  Messages left    {}\n  Note             the model will not see the removed exchange(s)",
+                                doomed_first_line.as_deref().unwrap_or("(sin texto)"),
                                 self.runtime.session().messages.len()
                             );
                         }
@@ -9036,15 +9195,25 @@ impl LiveCli {
                     None | Some("") => println!("{}", format_color_report()),
                     Some("on" | "always") => {
                         render::set_color_override(Some(true));
+                        persist_color_mode("on");
                         println!("{}", format_color_report());
                     }
                     Some("off" | "never") => {
                         render::set_color_override(Some(false));
+                        persist_color_mode("off");
                         println!("{}", format_color_report());
                     }
                     Some("auto") => {
                         render::set_color_override(None);
+                        persist_color_mode("auto");
                         println!("{}", format_color_report());
+                    }
+                    Some("dark" | "light") => {
+                        println!(
+                            "claw no impone paletas: los colores los decide tu terminal. \
+                             Cambia el tema del terminal para dark/light; /color on|off|auto \
+                             controla si claw emite ANSI."
+                        );
                     }
                     Some(other) => {
                         eprintln!("unsupported mode '{other}'. Usage: /color on|off|auto");
@@ -9344,6 +9513,15 @@ impl LiveCli {
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
+        // Crossing provider families (e.g. glm → gpt) changes which env
+        // credentials are used; say so before the next turn fails.
+        let previous_kind = detect_provider_kind(&api::resolve_model_alias(&previous));
+        let next_kind = detect_provider_kind(&api::resolve_model_alias(&model));
+        if previous_kind != next_kind {
+            println!(
+                "  Note             el nuevo modelo usa otro proveedor ({next_kind:?}); verifica con /provider test"
+            );
+        }
         Ok(true)
     }
 
@@ -9429,9 +9607,12 @@ impl LiveCli {
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
+        let estimate = cumulative.estimate_cost_usd();
         println!(
-            "{}\n  Turns            {}",
+            "{}\n  Input cost       {}\n  Output cost      {}\n  Turns            {}",
             format_cost_report(cumulative),
+            format_usd(estimate.input_cost_usd),
+            format_usd(estimate.output_cost_usd),
             self.runtime.usage().turns()
         );
     }
@@ -9758,9 +9939,11 @@ impl LiveCli {
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        let rendered = render_export_text(self.runtime.session());
+        let bytes = rendered.len();
+        fs::write(&export_path, rendered)?;
         println!(
-            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+            "Export\n  Result           wrote transcript\n  File             {}\n  Size             {bytes} bytes\n  Messages         {}",
             export_path.display(),
             self.runtime.session().messages.len(),
         );
@@ -9965,6 +10148,12 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if !skipped {
+            println!(
+                "  Estimated tokens {} (after compaction)",
+                self.runtime.estimated_tokens()
+            );
+        }
         Ok(())
     }
 
@@ -13655,9 +13844,18 @@ fn run_provider_probe(model: &str) -> String {
         ..Default::default()
     };
     let started = std::time::Instant::now();
-    match runtime.block_on(client.send_message(&request)) {
-        Ok(_) => {
-            let elapsed_ms = started.elapsed().as_millis();
+    // Bounded: a black-holed endpoint (wrong port, firewalled proxy) must
+    // report "timed out", not hang the REPL until Ctrl+C.
+    let response = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.send_message(&request),
+        )
+        .await
+    });
+    let elapsed_ms = started.elapsed().as_millis();
+    match response {
+        Ok(Ok(_)) => {
             let slow_note = if elapsed_ms > 5_000 {
                 "\n  Note             respuesta lenta (>5s): revisa red/proxy o elige un endpoint más cercano"
             } else {
@@ -13667,9 +13865,12 @@ fn run_provider_probe(model: &str) -> String {
                 "{header}\n  Result           ok ({elapsed_ms} ms){slow_note}\n  Hint             credentials and endpoint verified with a live request"
             )
         }
-        Err(error) => format!(
-            "{header}\n  Result           FAILED\n  Error            {}\n  Hint             check /provider show and your key; base URL must include the protocol path the provider expects",
+        Ok(Err(error)) => format!(
+            "{header}\n  Result           FAILED ({elapsed_ms} ms)\n  Error            {}\n  Hint             check /provider show and your key; base URL must include the protocol path the provider expects",
             truncate_retry_error(&error.to_string())
+        ),
+        Err(_) => format!(
+            "{header}\n  Result           FAILED (timeout tras 30s)\n  Hint             el endpoint no responde — revisa la Base URL, el puerto y tu red/proxy"
         ),
     }
 }
@@ -18712,6 +18913,44 @@ mod tests {
         let report = format_color_report();
         assert!(report.contains("Mode"));
         assert!(report.contains("/color on|off|auto"));
+    }
+
+    #[test]
+    fn turn_error_hints_map_to_the_fixing_command() {
+        use crate::hint_for_turn_error;
+        assert!(hint_for_turn_error("HTTP 401 Unauthorized")
+            .unwrap()
+            .contains("/provider test"));
+        assert!(hint_for_turn_error("retries exhausted after 9 attempts")
+            .unwrap()
+            .contains("limitando"));
+        assert!(hint_for_turn_error("context_window_blocked")
+            .unwrap()
+            .contains("/compact"));
+        assert!(hint_for_turn_error("connection refused")
+            .unwrap()
+            .contains("Base URL"));
+        assert!(hint_for_turn_error("something else entirely").is_none());
+    }
+
+    #[test]
+    fn utilization_bar_fills_proportionally() {
+        use crate::render_utilization_bar;
+        assert_eq!(render_utilization_bar(0), "[----------] 0%");
+        assert_eq!(render_utilization_bar(40), "[####------] 40%");
+        assert_eq!(render_utilization_bar(100), "[##########] 100%");
+        // Over 100 clamps the bar but reports the real number.
+        assert_eq!(render_utilization_bar(250), "[##########] 250%");
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_zero_and_ratios() {
+        use crate::format_cache_hit_rate;
+        assert!(format_cache_hit_rate(0, 0).contains("n/a"));
+        assert_eq!(
+            format_cache_hit_rate(25, 75),
+            "75% of prompt tokens from cache"
+        );
     }
 
     #[test]

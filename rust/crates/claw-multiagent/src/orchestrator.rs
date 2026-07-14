@@ -1637,8 +1637,12 @@ const SECRET_MARKERS: &[&str] = &[
     "sk-proj-",
     "AKIA",
     "ghp_",
+    "github_pat_",
+    "glpat-",
     "xoxb-",
     "xoxp-",
+    "AIzaSy",
+    "npm_",
     "-----BEGIN RSA PRIVATE KEY",
     "-----BEGIN OPENSSH PRIVATE KEY",
     "-----BEGIN EC PRIVATE KEY",
@@ -1673,6 +1677,12 @@ pub fn scan_for_secrets(project_dir: &Path) -> Vec<String> {
                 continue;
             }
             if name == ".env.example" {
+                continue;
+            }
+            // Minified/bundled artifacts routinely embed marker-like strings
+            // (e.g. "npm_" in tooling banners) and are not hand-written
+            // sources; scanning them yields noise, not leaks.
+            if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".map") {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -2410,10 +2420,14 @@ fn run_build_gate(
     workflow.phase(&format!(
         "Build gate tras la ola {wave_number}: `{command}`"
     ));
+    let gate_started = Instant::now();
     for attempt in 1..=2 {
         match shell_output(&command, &options.project_dir) {
             Ok(()) => {
-                workflow.phase("  build gate: OK");
+                workflow.phase(&format!(
+                    "  build gate: OK ({}s)",
+                    gate_started.elapsed().as_secs()
+                ));
                 return Ok(());
             }
             Err(output) if attempt == 1 => {

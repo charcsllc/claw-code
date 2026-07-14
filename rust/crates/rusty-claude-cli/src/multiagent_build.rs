@@ -38,6 +38,7 @@ const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N]
 [--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold] \
 [--timeout-secs N]\n\
                             /app <prompt> [same options]\n\
+                            /improve <prompt> [same options; opera sobre el proyecto actual]\n\
                      Tips: --approve pauses after planning for a go/no-go;\n\
                      --dry-run stops after planning entirely.\n\
                      --max-cost-usd is OFF by default (subscription accounts).";

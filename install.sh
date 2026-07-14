@@ -366,10 +366,13 @@ fi
 
 step "Next steps"
 
+INSTALLED_VERSION="$("${CLAW_BIN}" --version 2>/dev/null | head -1 || echo "unknown")"
+
 cat <<EOF
 ${COLOR_GREEN}Claw Code is built and ready.${COLOR_RESET}
 
   Binary:  ${COLOR_BOLD}${CLAW_BIN}${COLOR_RESET}
+  Version: ${INSTALLED_VERSION}
   Profile: ${BUILD_PROFILE}
 
 Try it out:
