@@ -112,7 +112,12 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 
 ## Novedades destacadas
 
-- **Plataforma multiagente (`/web`, `/app` y `/improve`)** — a partir de un solo prompt, una jerarquía de agentes (Director → Arquitectos → Subdirector → developers en paralelo → Supervisor → Técnico → QA → Docs) construye un proyecto web o una aplicación completa: scaffold determinista, contratos de tipos compartidos, scheduler por grafo sin barreras, verificación por entrega, build gate, tests reales, smoke test del servidor y un commit de git por tarea. Con **`/improve`** el mismo pipeline opera sobre un **proyecto ya existente**: analiza el repo, planifica solo el cambio y lo implementa respetando el stack y las convenciones actuales. Detalles y flags en [`USAGE.md`](./USAGE.md).
+- **`/provider` — autenticación en un comando** — presets para Z.ai GLM (con la suscripción del coding plan), Kimi, DeepSeek, Qwen, OpenRouter u Ollama: `/provider use zhipu <token>` configura credencial, base URL y modelo por defecto, lo aplica al instante y lo persiste para las próximas sesiones. `/provider test` verifica clave y endpoint con una petición real de 1 token; `show`/`list`/`clear` completan la gestión.
+- **`/improve` — multiagente sobre proyectos existentes** — analiza el repo, planifica solo el cambio pedido y lo implementa respetando el stack y las convenciones actuales. Los commits van a una rama dedicada `multiagent/improve-<n>` (tu rama queda intacta), `--resume` continúa sobre la misma rama, y al terminar deja `docs/SUMMARY.md` con el coste estimado y las tareas fallidas o bloqueadas.
+- **`/plan` y `/review`** — `/plan <petición>` abre un turno de planificación con las herramientas desactivadas (el modelo solo piensa, no ejecuta); `/review [staged]` revisa el diff del árbol de trabajo con veredicto ship/fix-first.
+- **Nueva tanda de comandos de sesión** — `/summary`, `/branch`, `/rewind`, `/copy`, `/fast`, `/security-review`, `/release-notes`, `/privacy-settings`, `/history search`, `/context` (con barra de utilización), `/files`, `/keybindings`, `/upgrade`, `/usage`, `/effort`, `/hooks` y `/color` persistente — lista completa en [`USAGE.md`](./USAGE.md).
+- **Plataforma multiagente (`/web` y `/app`)** — a partir de un solo prompt, una jerarquía de agentes (Director → Arquitectos → Subdirector → developers en paralelo → Supervisor → QA → Docs) construye un proyecto completo: scaffold determinista, contratos de tipos compartidos, scheduler por grafo, build gate, tests reales, smoke test y un commit de git por tarea. Detalles y flags en [`USAGE.md`](./USAGE.md).
+- **Robustez del día a día** — reintentos visibles en vivo (`⟳ reintento k/9`), pistas accionables en los errores (401→`/provider test`, contexto lleno→`/compact`…), sesiones guardadas con permisos 0600 y `claw doctor` avisa de permisos laxos en settings y sesiones.
 - **Dashboard local (`claw-dashboard`)** — telemetría en vivo en el navegador: tokens de entrada/salida por sesión, coste estimado, y el workflow multiagente con cada agente en ejecución/terminado en tiempo real. 100 % local (lee un JSONL; nada sale de tu máquina).
 - **`claw mcp add` / `claw mcp remove`** — instalación de servidores MCP en un comando (stdio, HTTP, SSE), con validación y rollback seguro de la configuración.
 
@@ -138,7 +143,7 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 .\install.ps1             # build de debug; añade -Release para el optimizado
 ```
 
-Ambos detectan el entorno, verifican el toolchain de Rust, compilan el workspace `rust/` local y hacen un smoke test del binario. O manualmente:
+Ambos detectan el entorno, verifican el toolchain de Rust, compilan el workspace `rust/` local, hacen un smoke test del binario, imprimen la versión instalada y recomiendan `/provider use` como siguiente paso para autenticarte. O manualmente:
 
 ```bash
 # 1. Clona y compila
@@ -146,7 +151,8 @@ git clone https://github.com/charcsllc/claw-code
 cd claw-code/rust
 cargo build --workspace
 
-# 2. Configura tu API key (API key de Anthropic — no una suscripción de Claude)
+# 2. Configura credenciales — o exporta una API key ahora, o hazlo luego
+#    dentro del REPL con "/provider use <preset> <clave>" + "/provider test"
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 3. Verifica que todo está bien conectado
@@ -278,7 +284,7 @@ claw --help
 - **Debug vs. release** — Si el binario va lento, estás en modo debug (el default). Añade `--release` a `cargo build` para mejor rendimiento en ejecución, aunque el build tardará 5–10 minutos.
 
 > [!NOTE]
-> **Autenticación:** claw requiere una **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — el login con suscripción de Claude no es una ruta de autenticación soportada.
+> **Autenticación:** la ruta recomendada es dentro del REPL — `/provider use <preset> <clave>` (zhipu/kimi/deepseek/qwen/openrouter/ollama…) configura credencial, base URL y modelo por defecto, lo aplica al instante y lo persiste para las próximas sesiones; verifica con `/provider test` (petición real de 1 token). Las variables de entorno (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) siguen funcionando y tienen prioridad sobre lo guardado. El login con suscripción de Claude no es una ruta de autenticación soportada; la suscripción del coding plan de Z.ai sí lo es vía `/provider use zhipu`. Detalles en [`USAGE.md`](./USAGE.md).
 
 Ejecuta la suite de tests del workspace después de verificar que el binario funciona:
 

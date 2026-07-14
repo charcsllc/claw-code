@@ -752,6 +752,15 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                         "  {} falló → reintento con modelo superior {retry_model}",
                         task.id
                     ));
+                    // Escalations cost premium tokens: leave an audit trail.
+                    append_file(
+                        &supervision_md,
+                        &format!(
+                            "\n- Escalation: task {} — {} → {retry_model}\n",
+                            task.id,
+                            options.catalog.model_for(task.complexity)
+                        ),
+                    )?;
                     retried.insert(slot.task_index);
                     let context = render_wave_context(&built_context);
                     let handle = spawn_developer(
@@ -1448,6 +1457,16 @@ const REPO_SKIP_DIRS: &[&str] = &[
     "vendor",
     ".venv",
     "__pycache__",
+    "coverage",
+    ".cache",
+    ".idea",
+    ".vscode",
+    ".terraform",
+    "Pods",
+    "DerivedData",
+    ".gradle",
+    ".pytest_cache",
+    ".mypy_cache",
 ];
 
 /// Manifest/config files whose full contents anchor the planner in the
@@ -1465,6 +1484,15 @@ const REPO_MANIFEST_FILES: &[&str] = &[
     "svelte.config.js",
     "tailwind.config.js",
     "tailwind.config.ts",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "Dockerfile",
+    "docker-compose.yml",
+    "Makefile",
+    "deno.json",
+    "composer.json",
+    "Gemfile",
+    "go.sum",
 ];
 
 /// True when the directory contains at least one source file worth
@@ -1685,6 +1713,11 @@ pub fn scan_for_secrets(project_dir: &Path) -> Vec<String> {
             if name.ends_with(".min.js") || name.ends_with(".min.css") || name.ends_with(".map") {
                 continue;
             }
+            // Lockfiles embed integrity hashes that trip marker-like
+            // substrings without being leaks (yarn.lock matches `.lock`).
+            if name.ends_with(".lock") || name == "package-lock.json" || name == "pnpm-lock.yaml" {
+                continue;
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
@@ -1783,11 +1816,27 @@ fn run_security_gate(
 
 /// Per-chunk JS budget over the built output. 400 KB raw ≈ 120 KB gzipped —
 /// past that, the first paint pays for it.
-const BUNDLE_BUDGET_BYTES: u64 = 400_000;
+const DEFAULT_BUNDLE_BUDGET_KB: u64 = 400;
+
+/// Budget override in KB; junk or zero falls back to the default so a typo
+/// cannot silently disable the gate.
+#[must_use]
+fn parse_perf_budget_kb(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&kb| kb > 0)
+        .unwrap_or(DEFAULT_BUNDLE_BUDGET_KB)
+}
+
+/// Thin env wrapper over [`parse_perf_budget_kb`] (`CLAW_PERF_BUDGET_KB`).
+#[must_use]
+fn perf_budget_kb() -> u64 {
+    parse_perf_budget_kb(std::env::var("CLAW_PERF_BUDGET_KB").ok().as_deref())
+}
 
 /// Collects built JS chunks over budget, largest first.
 #[must_use]
 pub fn oversized_bundles(dist: &Path) -> Vec<(PathBuf, u64)> {
+    let budget_bytes = perf_budget_kb() * 1_000;
     let mut heavy = Vec::new();
     let mut pending = vec![dist.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -1806,7 +1855,7 @@ pub fn oversized_bundles(dist: &Path) -> Vec<(PathBuf, u64)> {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
-            if is_js && metadata.len() > BUNDLE_BUDGET_BYTES {
+            if is_js && metadata.len() > budget_bytes {
                 heavy.push((path, metadata.len()));
             }
         }
@@ -1847,10 +1896,10 @@ fn run_performance_gate(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let budget_kb = perf_budget_kb();
     workflow.phase(&format!(
-        "Performance budget: {} chunk(s) sobre {} KB → despachando Técnico",
-        heavy.len(),
-        BUNDLE_BUDGET_BYTES / 1024
+        "Performance budget: {} chunk(s) sobre {budget_kb} KB → despachando Técnico",
+        heavy.len()
     ));
     append_file(
         supervision_md,
@@ -1861,12 +1910,11 @@ fn run_performance_gate(
         &options.catalog.supervisor,
         options,
         &format!(
-            "These built JS chunks exceed the {} KB performance budget:\n\n\
+            "These built JS chunks exceed the {budget_kb} KB performance budget:\n\n\
              {listing}\n\nReduce them: route-level code-splitting with dynamic \
              imports, lazy-load heavy components, and replace heavyweight \
              dependencies used for trivial work. Rebuild to verify, and report \
              each change.",
-            BUNDLE_BUDGET_BYTES / 1024
         ),
     ) {
         Ok(fixer) => {
@@ -1925,6 +1973,27 @@ fn plan_checkpoint_confirmed(
 
 // ---------- Smoke test ----------
 
+/// Seconds to wait for the dev server before declaring the smoke test dead.
+#[cfg(unix)]
+const DEFAULT_SMOKE_TIMEOUT_SECS: u64 = 45;
+
+/// Timeout override in seconds; junk or zero keeps the default.
+#[cfg(unix)]
+#[must_use]
+fn parse_smoke_timeout_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_SMOKE_TIMEOUT_SECS)
+}
+
+/// Thin env wrapper over [`parse_smoke_timeout_secs`]
+/// (`CLAW_SMOKE_TIMEOUT_SECS`).
+#[cfg(unix)]
+#[must_use]
+fn smoke_timeout_secs() -> u64 {
+    parse_smoke_timeout_secs(std::env::var("CLAW_SMOKE_TIMEOUT_SECS").ok().as_deref())
+}
+
 /// Start command for the smoke test, from package.json scripts.
 #[must_use]
 pub fn smoke_command(project_dir: &Path) -> Option<String> {
@@ -1978,8 +2047,9 @@ fn run_smoke_test(project_dir: &Path, docs: &Path, workflow: &WorkflowLog) {
     };
 
     let ports: [u16; 6] = [5173, 3000, 8080, 4321, 4173, 8000];
+    let timeout_secs = smoke_timeout_secs();
     let mut hit: Option<(u16, String)> = None;
-    'wait: for _ in 0..45 {
+    'wait: for _ in 0..timeout_secs {
         std::thread::sleep(Duration::from_secs(1));
         for port in ports {
             let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
@@ -2063,8 +2133,10 @@ fn run_smoke_test(project_dir: &Path, docs: &Path, workflow: &WorkflowLog) {
             let _ = save_doc(
                 docs,
                 "smoke-test.md",
-                "# Smoke test\n\nFAILED: the dev server never answered on a known \
-                 port within 45s (see .multiagent/smoke.log).\n",
+                &format!(
+                    "# Smoke test\n\nFAILED: the dev server never answered on a known \
+                     port within {timeout_secs}s (see .multiagent/smoke.log).\n"
+                ),
             );
         }
     }
@@ -2396,6 +2468,14 @@ pub fn detect_build_command(project_dir: &Path, explicit: Option<&str>) -> Optio
         return Some(trimmed.to_string());
     }
     if project_dir.join("package.json").exists() {
+        // The lockfile pins the package manager: installing with a different
+        // one rewrites the resolved tree and breaks reproducibility.
+        if project_dir.join("pnpm-lock.yaml").exists() {
+            return Some("pnpm install && pnpm run build --if-present".to_string());
+        }
+        if project_dir.join("yarn.lock").exists() {
+            return Some("yarn install && yarn run build --if-present".to_string());
+        }
         return Some("npm install --no-audit --no-fund && npm run build --if-present".to_string());
     }
     if project_dir.join("Cargo.toml").exists() {
@@ -3241,6 +3321,59 @@ mod tests {
         );
         assert_eq!(detect_build_command(&dir, Some("off")), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_command_prefers_lockfile_package_manager() {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-lockfile-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("package.json"), "{}").expect("pkg");
+        assert!(detect_build_command(&dir, None)
+            .expect("npm build")
+            .starts_with("npm install"));
+        std::fs::write(dir.join("yarn.lock"), "").expect("yarn lock");
+        assert!(detect_build_command(&dir, None)
+            .expect("yarn build")
+            .starts_with("yarn install"));
+        // pnpm wins even when a stale yarn.lock lingers alongside it.
+        std::fs::write(dir.join("pnpm-lock.yaml"), "").expect("pnpm lock");
+        assert!(detect_build_command(&dir, None)
+            .expect("pnpm build")
+            .starts_with("pnpm install"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn perf_budget_parses_override_and_rejects_junk() {
+        assert_eq!(parse_perf_budget_kb(None), DEFAULT_BUNDLE_BUDGET_KB);
+        assert_eq!(parse_perf_budget_kb(Some("250")), 250);
+        assert_eq!(parse_perf_budget_kb(Some(" 1024 ")), 1024, "trims");
+        // Zero would disable the gate; junk must not change it silently.
+        assert_eq!(parse_perf_budget_kb(Some("0")), DEFAULT_BUNDLE_BUDGET_KB);
+        assert_eq!(parse_perf_budget_kb(Some("-5")), DEFAULT_BUNDLE_BUDGET_KB);
+        assert_eq!(parse_perf_budget_kb(Some("huge")), DEFAULT_BUNDLE_BUDGET_KB);
+        assert_eq!(parse_perf_budget_kb(Some("")), DEFAULT_BUNDLE_BUDGET_KB);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_timeout_parses_override_and_rejects_junk() {
+        assert_eq!(parse_smoke_timeout_secs(None), DEFAULT_SMOKE_TIMEOUT_SECS);
+        assert_eq!(parse_smoke_timeout_secs(Some("120")), 120);
+        assert_eq!(
+            parse_smoke_timeout_secs(Some("0")),
+            DEFAULT_SMOKE_TIMEOUT_SECS
+        );
+        assert_eq!(
+            parse_smoke_timeout_secs(Some("soon")),
+            DEFAULT_SMOKE_TIMEOUT_SECS
+        );
     }
 
     #[test]

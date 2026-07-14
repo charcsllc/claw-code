@@ -268,8 +268,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "provider",
         aliases: &[],
-        summary: "Show or switch the AI provider (anthropic/zhipu/kimi/deepseek/qwen/ollama)",
-        argument_hint: Some("[show|list|use <provider> <api-key> [model]|clear]"),
+        summary: "Show, switch or live-test the AI provider (anthropic/zhipu/kimi/deepseek/qwen/openrouter/ollama)",
+        argument_hint: Some("[show|list|use <provider> <api-key> [model]|test [model]|clear]"),
         resume_supported: false,
     },
     SlashCommandSpec {

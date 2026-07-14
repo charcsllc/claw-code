@@ -47,13 +47,18 @@ impl Default for ModelCatalog {
 
 impl ModelCatalog {
     /// Loads overrides from `<cwd>/.claw/multiagent.json` when present.
+    ///
+    /// Precedence (lowest to highest): built-in defaults < config file <
+    /// `CLAW_MA_*_MODEL` env vars < CLI flags — callers apply flags after
+    /// this returns, so they win over everything.
     #[must_use]
     pub fn load(cwd: &Path) -> Self {
         let path = cwd.join(".claw").join("multiagent.json");
-        std::fs::read_to_string(path)
+        let from_file = std::fs::read_to_string(path)
             .ok()
             .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        apply_model_env_overrides(from_file, |key| std::env::var(key).ok())
     }
 
     #[must_use]
@@ -102,6 +107,31 @@ impl ModelCatalog {
             ))
         }
     }
+}
+
+/// Applies per-tier `CLAW_MA_*_MODEL` env overrides on top of a loaded
+/// catalog. Takes the lookup as a closure so tests never mutate process
+/// env (parallel tests share it); blank values are ignored.
+#[must_use]
+pub fn apply_model_env_overrides(
+    mut catalog: ModelCatalog,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> ModelCatalog {
+    for (key, slot) in [
+        ("CLAW_MA_SIMPLE_MODEL", &mut catalog.simple),
+        ("CLAW_MA_MEDIUM_MODEL", &mut catalog.medium),
+        ("CLAW_MA_COMPLEX_MODEL", &mut catalog.complex),
+        ("CLAW_MA_DIRECTOR_MODEL", &mut catalog.director),
+        ("CLAW_MA_SUPERVISOR_MODEL", &mut catalog.supervisor),
+    ] {
+        if let Some(value) = lookup(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                *slot = trimmed.to_string();
+            }
+        }
+    }
+    catalog
 }
 
 #[must_use]
@@ -221,6 +251,22 @@ mod tests {
         assert_eq!(provider_for_model("gpt-4o"), ProviderKind::OpenAi);
         assert_eq!(provider_for_model("grok-3"), ProviderKind::Xai);
         assert_eq!(provider_for_model("qwen-plus"), ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn env_overrides_replace_tiers_and_ignore_blanks() {
+        let catalog = apply_model_env_overrides(ModelCatalog::default(), |key| match key {
+            "CLAW_MA_SIMPLE_MODEL" => Some("qwen-turbo".to_string()),
+            "CLAW_MA_SUPERVISOR_MODEL" => Some("  gpt-4o  ".to_string()),
+            "CLAW_MA_MEDIUM_MODEL" => Some("   ".to_string()),
+            _ => None,
+        });
+        assert_eq!(catalog.simple, "qwen-turbo");
+        assert_eq!(catalog.supervisor, "gpt-4o", "values are trimmed");
+        // Blank values and unset vars keep the previous assignment.
+        assert_eq!(catalog.medium, DEFAULT_MEDIUM);
+        assert_eq!(catalog.complex, DEFAULT_COMPLEX);
+        assert_eq!(catalog.director, DEFAULT_COMPLEX);
     }
 
     #[test]

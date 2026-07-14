@@ -213,6 +213,7 @@ impl TableState {
 struct RenderState {
     emphasis: usize,
     strong: usize,
+    strikethrough: usize,
     heading_level: Option<u8>,
     quote: usize,
     list_stack: Vec<ListKind>,
@@ -235,6 +236,9 @@ impl RenderState {
         }
         if self.emphasis > 0 {
             style = style.italic();
+        }
+        if self.strikethrough > 0 {
+            style = style.crossed_out();
         }
 
         if let Some(level) = self.heading_level {
@@ -412,12 +416,29 @@ impl TerminalRenderer {
             Event::End(TagEnd::Emphasis) => state.emphasis = state.emphasis.saturating_sub(1),
             Event::Start(Tag::Strong) => state.strong += 1,
             Event::End(TagEnd::Strong) => state.strong = state.strong.saturating_sub(1),
+            Event::Start(Tag::Strikethrough) => {
+                // Without color the crossed-out attribute is stripped away,
+                // so mark struck text with tildes to keep the meaning visible.
+                if !self.color_enabled {
+                    state.append_raw(output, "~");
+                }
+                state.strikethrough += 1;
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                state.strikethrough = state.strikethrough.saturating_sub(1);
+                if !self.color_enabled {
+                    state.append_raw(output, "~");
+                }
+            }
             Event::Code(code) => {
                 let rendered =
                     format!("{}", format!("`{code}`").with(self.color_theme.inline_code));
                 state.append_raw(output, &rendered);
             }
-            Event::Rule => output.push_str("---\n"),
+            Event::Rule => {
+                let _ = writeln!(output, "{}", "─".repeat(40).dim());
+                output.push('\n');
+            }
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
@@ -428,7 +449,12 @@ impl TerminalRenderer {
                 state.append_raw(output, &format!("[{reference}]"));
             }
             Event::TaskListMarker(done) => {
-                state.append_raw(output, if done { "[x] " } else { "[ ] " });
+                // The item marker ("• ") was already emitted by `start_item`;
+                // replace it with a checkbox so task lists read as task lists.
+                if output.ends_with("• ") {
+                    output.truncate(output.len() - "• ".len());
+                }
+                state.append_raw(output, if done { "☑ " } else { "☐ " });
             }
             Event::InlineMath(math) | Event::DisplayMath(math) => {
                 state.append_raw(output, &math);
@@ -1094,6 +1120,44 @@ mod tests {
         assert!(plain_text.contains("2. second"));
         assert!(plain_text.contains("  • nested"));
         assert!(plain_text.contains("  • child"));
+    }
+
+    #[test]
+    fn renders_task_list_items_with_checkboxes() {
+        let terminal_renderer = TerminalRenderer::new().with_color(false);
+        let markdown_output =
+            terminal_renderer.render_markdown("- [ ] pending task\n- [x] finished task");
+
+        assert!(markdown_output.contains("☐ pending task"));
+        assert!(markdown_output.contains("☑ finished task"));
+        assert!(
+            !markdown_output.contains('•'),
+            "task items must replace the plain bullet: {markdown_output:?}"
+        );
+    }
+
+    #[test]
+    fn renders_rule_as_dashed_line() {
+        let terminal_renderer = TerminalRenderer::new().with_color(false);
+        let markdown_output = terminal_renderer.render_markdown("above\n\n---\n\nbelow");
+
+        assert!(markdown_output.contains(&"─".repeat(40)));
+        assert!(markdown_output.contains("above"));
+        assert!(markdown_output.contains("below"));
+    }
+
+    #[test]
+    fn renders_strikethrough_with_plain_fallback() {
+        let plain_renderer = TerminalRenderer::new().with_color(false);
+        let plain_output = plain_renderer.render_markdown("this is ~~gone~~ now");
+        assert_eq!(plain_output, "this is ~gone~ now");
+
+        let colored_renderer = TerminalRenderer::new().with_color(true);
+        let colored_output = colored_renderer.render_markdown("~~gone~~");
+        assert!(
+            colored_output.contains("\u{1b}[9m"),
+            "colored strikethrough must use the crossed-out attribute: {colored_output:?}"
+        );
     }
 
     #[test]

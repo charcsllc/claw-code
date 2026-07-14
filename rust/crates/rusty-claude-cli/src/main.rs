@@ -6166,7 +6166,7 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
   Current model    {model}
   Session messages {message_count}
   Session turns    {turns}
-  Common aliases   opus, sonnet, haiku, glm-4.6, kimi-k2-0905-preview, deepseek-chat
+  Common aliases   opus, sonnet, haiku, glm, kimi, deepseek, qwen, grok
 
 Usage
   Inspect current model with /model
@@ -7640,6 +7640,34 @@ fn hint_for_turn_error(error: &str) -> Option<&'static str> {
     if lower.contains("context window") || lower.contains("context_window") {
         return Some("pista: la sesión no cabe en el contexto — ejecuta /compact (o /rewind)");
     }
+    if lower.contains("insufficient_quota")
+        || lower.contains("insufficient balance")
+        || lower.contains("billing")
+        || lower.contains("quota exceeded")
+    {
+        return Some(
+            "pista: cuota o saldo agotado en el proveedor — revisa tu plan/billing o cambia de proveedor (/provider)",
+        );
+    }
+    if lower.contains("model_not_found")
+        || lower.contains("model not found")
+        || lower.contains("unknown model")
+        || lower.contains("does not exist or you do not have access")
+    {
+        return Some(
+            "pista: el proveedor no reconoce el modelo — mira los nombres con /provider list y cambia con /model",
+        );
+    }
+    if lower.contains("overloaded") || lower.contains("529") {
+        return Some(
+            "pista: el proveedor está sobrecargado — reintenta en unos segundos o cambia de modelo",
+        );
+    }
+    if lower.contains("certificate") || lower.contains("ssl") || lower.contains("tls") {
+        return Some(
+            "pista: fallo TLS/certificado — típico de proxies corporativos; revisa HTTPS_PROXY y el bundle de CA",
+        );
+    }
     if lower.contains("dns")
         || lower.contains("connection refused")
         || lower.contains("connect error")
@@ -7722,10 +7750,21 @@ fn run_repl(
                 // Everything typed is recallable with Up/Ctrl-R — including
                 // slash commands and lines that later fail to parse.
                 editor.push_history(input);
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                // Bare exit words work too: "exit" typed without the slash is
+                // an exit request, not a prompt for the model.
+                if matches!(
+                    trimmed.as_str(),
+                    "/exit" | "/quit" | "exit" | "quit" | "salir"
+                ) {
                     cli.persist_session()?;
                     break;
                 }
+                // "?" is the universal help reflex.
+                let trimmed = if trimmed == "?" {
+                    "/help".to_string()
+                } else {
+                    trimmed
+                };
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
                         // A failed command (bad flag, missing session, IO
@@ -18930,6 +18969,20 @@ mod tests {
         assert!(hint_for_turn_error("connection refused")
             .unwrap()
             .contains("Base URL"));
+        assert!(hint_for_turn_error("insufficient_quota for this key")
+            .unwrap()
+            .contains("saldo"));
+        assert!(
+            hint_for_turn_error("The model `nope-9` does not exist or you do not have access")
+                .unwrap()
+                .contains("/model")
+        );
+        assert!(hint_for_turn_error("529 overloaded_error")
+            .unwrap()
+            .contains("sobrecargado"));
+        assert!(hint_for_turn_error("invalid peer certificate")
+            .unwrap()
+            .contains("TLS"));
         assert!(hint_for_turn_error("something else entirely").is_none());
     }
 

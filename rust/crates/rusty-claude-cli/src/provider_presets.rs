@@ -225,6 +225,14 @@ pub(crate) fn handle_provider_command(args: Option<&str>) -> String {
                     provider_usage()
                 );
             };
+            // Catch pasted placeholders before persisting them: "<token>",
+            // "TU-TOKEN", "..." would silently poison the saved settings.
+            if key.contains('<') || key.contains('>') || key == "..." || key.len() < 8 {
+                return format!(
+                    "Provider\n  Error            '{}' parece un placeholder, no una clave real — pega el token completo de tu cuenta",
+                    mask_key(&key)
+                );
+            }
             let model_to_save = model.clone().or_else(|| {
                 (!preset.default_model.is_empty()).then(|| preset.default_model.to_string())
             });
@@ -445,6 +453,17 @@ mod tests {
             assert_eq!(preset.key_env, "ANTHROPIC_AUTH_TOKEN");
             assert_eq!(preset.base_url_env, "ANTHROPIC_BASE_URL");
             assert!(!preset.default_base_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn provider_use_rejects_placeholder_keys() {
+        for placeholder in ["<token>", "TU-<CLAVE>", "...", "corta"] {
+            let output = handle_provider_command(Some(&format!("use zhipu {placeholder}")));
+            assert!(
+                output.contains("placeholder"),
+                "'{placeholder}' should be rejected: {output}"
+            );
         }
     }
 

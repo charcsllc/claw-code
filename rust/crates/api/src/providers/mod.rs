@@ -264,6 +264,36 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         },
     ),
+    // Zhipu GLM rides the Anthropic protocol (ANTHROPIC_AUTH_TOKEN +
+    // ANTHROPIC_BASE_URL → api.z.ai), so its alias routes like a Claude
+    // model and the /provider zhipu preset supplies the endpoint.
+    (
+        "glm",
+        ProviderMetadata {
+            provider: ProviderKind::Anthropic,
+            auth_env: "ANTHROPIC_API_KEY",
+            base_url_env: "ANTHROPIC_BASE_URL",
+            default_base_url: anthropic::DEFAULT_BASE_URL,
+        },
+    ),
+    (
+        "deepseek",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        },
+    ),
+    (
+        "qwen",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -278,6 +308,7 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "opus" => "claude-opus-4-7",
                     "sonnet" => "claude-sonnet-4-6",
                     "haiku" => "claude-haiku-4-5-20251213",
+                    "glm" => "glm-4.6",
                     _ => trimmed,
                 },
                 ProviderKind::Xai => match *alias {
@@ -288,6 +319,8 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
+                    "deepseek" => "deepseek-chat",
+                    "qwen" => "qwen-max",
                     _ => trimmed,
                 },
             })
@@ -1200,6 +1233,15 @@ mod tests {
     fn kimi_alias_resolves_to_kimi_k2_5() {
         assert_eq!(super::resolve_model_alias("kimi"), "kimi-k2.5");
         assert_eq!(super::resolve_model_alias("KIMI"), "kimi-k2.5"); // case insensitive
+    }
+
+    #[test]
+    fn chinese_provider_aliases_resolve_to_flagship_models() {
+        assert_eq!(super::resolve_model_alias("glm"), "glm-4.6");
+        assert_eq!(super::resolve_model_alias("deepseek"), "deepseek-chat");
+        assert_eq!(super::resolve_model_alias("qwen"), "qwen-max");
+        // Full model names pass through untouched.
+        assert_eq!(super::resolve_model_alias("glm-4.5-air"), "glm-4.5-air");
     }
 
     #[test]
