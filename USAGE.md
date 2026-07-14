@@ -588,7 +588,7 @@ cd rust
 ./target/debug/claw --resume latest /status /diff
 ```
 
-Entre los comandos interactivos útiles están `/help`, `/status`, `/cost`, `/config`, `/session`, `/model`, `/permissions` y `/export`.
+Entre los comandos interactivos útiles están `/help`, `/status`, `/cost`, `/usage`, `/context`, `/config`, `/session`, `/model`, `/permissions` y `/export`. `/status` muestra también el proveedor activo y su base URL (útil con `/provider`); `/usage` desglosa los tokens de la sesión incluyendo el último turno; `/context` indica cuán cerca estás del umbral de auto-compactación para poder ejecutar `/compact` a tiempo.
 
 ## Orden de resolución de los archivos de configuración
 
@@ -761,6 +761,15 @@ tiene; se mantienen el build gate, la verificación por entrega, la supervisión
 tests y un commit de git por tarea. Por defecto trabaja sobre el **directorio
 actual** (`--output .`); apúntalo a otro con `--output <dir>`. Requiere que el
 directorio ya contenga código (si está vacío, usa `/web` o `/app`).
+
+Los commits van a una **rama dedicada** `multiagent/improve-<n>` — tu rama queda
+intacta. La rama se guarda en `.multiagent/state.json`, así que `--resume`
+continúa sobre **la misma rama** en vez de crear otra. Al terminar, el resumen
+imprime la rama y los comandos exactos para revisarla (`git diff base...rama`),
+integrarla o descartarla, junto con el coste estimado del run (si hay telemetría
+activa) y la lista de tareas fallidas o bloqueadas por dependencias fallidas —
+una tarea cuya dependencia falló ya no se construye sobre esa base rota: se
+bloquea y se informa.
 
 ```
 /improve migra los componentes de clase a hooks --output ./mi-app --approve

@@ -6182,6 +6182,54 @@ fn format_cost_report(usage: TokenUsage) -> String {
     )
 }
 
+/// `/usage`: the per-session token breakdown, including the last turn — a
+/// finer-grained view than `/cost`'s cumulative-only report.
+fn format_usage_report(tracker: &UsageTracker) -> String {
+    let last = tracker.current_turn_usage();
+    let total = tracker.cumulative_usage();
+    format!(
+        "Usage
+  Turns            {}
+  Last turn        in {} · out {} · cache r/w {}/{}
+  Input tokens     {}
+  Output tokens    {}
+  Cache create     {}
+  Cache read       {}
+  Total tokens     {}
+  Estimated cost   {}",
+        tracker.turns(),
+        last.input_tokens,
+        last.output_tokens,
+        last.cache_read_input_tokens,
+        last.cache_creation_input_tokens,
+        total.input_tokens,
+        total.output_tokens,
+        total.cache_creation_input_tokens,
+        total.cache_read_input_tokens,
+        total.total_tokens(),
+        format_usd(total.estimate_cost_usd().total_cost_usd()),
+    )
+}
+
+/// `/context`: how full the session is relative to the auto-compaction
+/// trigger, so the user can `/compact` deliberately instead of being
+/// surprised mid-task.
+fn format_context_report(estimated_session_tokens: usize, cumulative_input_tokens: u32) -> String {
+    let threshold = runtime::auto_compaction_threshold_from_env();
+    let percent = cumulative_input_tokens
+        .saturating_mul(100)
+        .checked_div(threshold)
+        .unwrap_or(0);
+    format!(
+        "Context
+  Session tokens   {estimated_session_tokens} (estimated from message content)
+  Cumulative input {cumulative_input_tokens}
+  Auto-compact at  {threshold} cumulative input tokens
+  Utilization      {percent}%
+  Tip              /compact shrinks the session now; auto-compaction fires at 100%"
+    )
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -8284,6 +8332,22 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Usage { .. } => {
+                let tracker = UsageTracker::from_session(self.runtime.session());
+                println!("{}", format_usage_report(&tracker));
+                false
+            }
+            SlashCommand::Context { .. } => {
+                let tracker = UsageTracker::from_session(self.runtime.session());
+                println!(
+                    "{}",
+                    format_context_report(
+                        self.runtime.estimated_tokens(),
+                        tracker.cumulative_usage().input_tokens,
+                    )
+                );
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
@@ -8309,11 +8373,9 @@ impl LiveCli {
             | SlashCommand::Tasks { .. }
             | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Copy { .. }
             | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
             | SlashCommand::Color { .. }
             | SlashCommand::Effort { .. }
             | SlashCommand::Branch { .. }
@@ -9986,10 +10048,15 @@ fn format_status_report(
             format!("\n  Permission source {}{env_suffix}", p.source.as_str())
         })
         .unwrap_or_default();
+    // Multi-provider support means the active endpoint is no longer implied
+    // by the model name; show what the API clients will actually use.
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
     blocks.extend([
         format!(
             "{status_line}
   Model            {model}{model_source_line}
+  Provider         {provider_summary}
+  Provider URL     {provider_url}
   Permission mode  {permission_mode}{permission_source_line}
   Messages         {}
   Turns            {}

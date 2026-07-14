@@ -158,7 +158,7 @@ pub(crate) fn run_multiagent_build(
         Ok(summary) => {
             println!("[multiagent] visión: {}", summary.plan.vision);
             println!(
-                "[multiagent] stack: {} · tareas: {} · olas: {}",
+                "[multiagent] stack: {} · tareas: {} · niveles: {}",
                 summary.plan.stack.kind, summary.tasks, summary.waves
             );
             if dry_run {
@@ -170,6 +170,28 @@ pub(crate) fn run_multiagent_build(
                     "[multiagent] completadas: {} · fallidas: {} · issues de supervisión: {}",
                     summary.completed, summary.failed, summary.supervision_issues
                 );
+                if !summary.failed_task_ids.is_empty() {
+                    println!(
+                        "[multiagent] tareas fallidas: {}",
+                        summary.failed_task_ids.join(", ")
+                    );
+                }
+                if !summary.blocked_task_ids.is_empty() {
+                    println!(
+                        "[multiagent] bloqueadas por dependencias fallidas: {}",
+                        summary.blocked_task_ids.join(", ")
+                    );
+                }
+                if let Some(cost) = summary.cost_usd {
+                    println!("[multiagent] coste estimado: {cost:.2} USD");
+                }
+            }
+            if let Some(branch) = &summary.improve_branch {
+                let base = summary.base_branch.as_deref().unwrap_or("<tu-rama>");
+                println!("[multiagent] rama de trabajo: {branch}");
+                println!("[multiagent]   revisa:   git diff {base}...{branch}");
+                println!("[multiagent]   integra:  git checkout {base} && git merge {branch}");
+                println!("[multiagent]   descarta: git checkout {base} && git branch -D {branch}");
             }
             Ok(())
         }

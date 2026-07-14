@@ -1,6 +1,9 @@
 use std::io::{self, IsTerminal, Write};
 
-use runtime::{save_user_provider_settings, ConfigLoader, RuntimeProviderConfig};
+use runtime::{
+    load_user_settings_field, save_user_provider_settings, save_user_settings_field, ConfigLoader,
+    RuntimeProviderConfig,
+};
 
 const PROVIDERS: &[(&str, &str, &str)] = &[
     ("1", "Anthropic", "anthropic"),
@@ -69,7 +72,7 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
     save_user_provider_settings(&kind, &api_key, base_url.as_deref(), model.as_deref())?;
 
     if let Some(fast) = &fast_model {
-        save_settings_field("subagentModel", fast)?;
+        save_user_settings_field("subagentModel", fast)?;
     }
 
     println!();
@@ -258,7 +261,7 @@ fn prompt_fast_model(
     println!("    by using a fast model for information-gathering tasks.");
     println!("    Press Enter to skip (agents will use your main model).");
 
-    let current_fast = load_current_settings_field("subagentModel");
+    let current_fast = load_user_settings_field("subagentModel");
     let default_hint = current_fast.as_deref().or(main_model).unwrap_or("");
 
     let input = read_line(&format!(
@@ -274,38 +277,6 @@ fn prompt_fast_model(
     } else {
         Ok(Some(input.trim().to_string()))
     }
-}
-
-fn load_current_settings_field(field: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let settings_path = std::path::Path::new(&home).join(".claw/settings.json");
-    let content = std::fs::read_to_string(&settings_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get(field)?.as_str().map(|s| s.to_string())
-}
-
-fn save_settings_field(field: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::var("HOME")?;
-    let settings_dir = std::path::Path::new(&home).join(".claw");
-    let settings_path = settings_dir.join("settings.json");
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
-
-    if let Some(obj) = settings.as_object_mut() {
-        obj.insert(
-            field.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
-    }
-
-    std::fs::create_dir_all(&settings_dir)?;
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    Ok(())
 }
 
 fn read_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {

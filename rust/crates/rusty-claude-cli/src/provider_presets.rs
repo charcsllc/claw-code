@@ -328,6 +328,55 @@ fn render_provider_show() -> String {
     out
 }
 
+/// One-line description of the credential source the API clients will pick
+/// up, plus the effective base URL — mirrors the env-first resolution order
+/// (auth token, then per-protocol keys). Surfaced by `/status`.
+pub(crate) fn active_provider_summary() -> (String, String) {
+    let set = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let anthropic_url =
+        || set("ANTHROPIC_BASE_URL").unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    if set("ANTHROPIC_AUTH_TOKEN").is_some() {
+        return (
+            "Anthropic protocol (ANTHROPIC_AUTH_TOKEN)".to_string(),
+            anthropic_url(),
+        );
+    }
+    if set("ANTHROPIC_API_KEY").is_some() {
+        return ("Anthropic (ANTHROPIC_API_KEY)".to_string(), anthropic_url());
+    }
+    if set("OPENAI_API_KEY").is_some() {
+        return (
+            "OpenAI-compatible (OPENAI_API_KEY)".to_string(),
+            set("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+        );
+    }
+    if set("XAI_API_KEY").is_some() {
+        return (
+            "xAI (XAI_API_KEY)".to_string(),
+            set("XAI_BASE_URL").unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
+        );
+    }
+    if set("DASHSCOPE_API_KEY").is_some() {
+        return (
+            "DashScope (DASHSCOPE_API_KEY)".to_string(),
+            set("DASHSCOPE_BASE_URL")
+                .unwrap_or_else(|| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        );
+    }
+    if let Some(host) = set("OLLAMA_HOST") {
+        return ("Ollama (OLLAMA_HOST)".to_string(), host);
+    }
+    (
+        "none — set an API key or run /provider use <preset> <key>".to_string(),
+        "-".to_string(),
+    )
+}
+
 /// Masks a credential to its last four characters (char-safe).
 fn mask_key(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();

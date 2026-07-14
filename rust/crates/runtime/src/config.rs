@@ -1156,6 +1156,27 @@ pub fn save_user_provider_settings(
     Ok(())
 }
 
+/// Save a single top-level string field to the user-level settings file,
+/// preserving everything else. Uses the same atomic 0600 writer as the
+/// provider save so a file holding an API key never regresses to 0644.
+pub fn save_user_settings_field(field: &str, value: &str) -> Result<(), ConfigError> {
+    let settings_path = default_config_home().join("settings.json");
+    let mut root = read_settings_root(&settings_path)?;
+    root.insert(
+        field.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    write_settings_root(&settings_path, &root)
+}
+
+/// Read a single top-level string field from the user-level settings file.
+#[must_use]
+pub fn load_user_settings_field(field: &str) -> Option<String> {
+    let settings_path = default_config_home().join("settings.json");
+    let root = read_settings_root(&settings_path).ok()?;
+    root.get(field)?.as_str().map(str::to_string)
+}
+
 /// Remove the `provider` section from the user-level `~/.claw/settings.json`.
 pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     let config_home = default_config_home();

@@ -100,6 +100,16 @@ pub struct RunSummary {
     pub resumed_tasks: usize,
     pub budget_aborted: bool,
     pub user_aborted: bool,
+    /// Ids of tasks that failed terminally (after the escalated retry).
+    pub failed_task_ids: Vec<String>,
+    /// Ids of tasks never attempted because a (transitive) dependency failed.
+    pub blocked_task_ids: Vec<String>,
+    /// This run's spend in USD, when telemetry is active.
+    pub cost_usd: Option<f64>,
+    /// Improve mode: the dedicated work branch and the branch it forked from,
+    /// so the caller can print an accurate review/merge hint.
+    pub improve_branch: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 const DIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
@@ -225,16 +235,23 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     std::env::set_var("CLAWD_AGENT_STORE", options.project_dir.join(".multiagent"));
     std::env::set_current_dir(&options.project_dir).map_err(|error| error.to_string())?;
 
-    let _ = init_git_repo(&options.project_dir, &workflow);
+    let _ = init_git_repo(&options.project_dir);
 
     // Improve commits one change per task; do it on a dedicated branch so
     // the user's current branch stays exactly as they left it. They merge
-    // (or discard) the branch after reviewing.
+    // (or discard) the branch after reviewing. On --resume the SAME branch
+    // is checked out again instead of orphaning it with a fresh one.
+    let mut improve_branch: Option<String> = None;
+    let mut base_branch: Option<String> = None;
     if options.mode.is_improve() {
-        match create_improve_branch(&options.project_dir) {
-            Some(branch) => workflow.phase(&format!(
-                "Rama de trabajo: {branch} — tu rama original queda intacta"
-            )),
+        match ensure_improve_branch(&options.project_dir, options.resume) {
+            Some((branch, base)) => {
+                workflow.phase(&format!(
+                    "Rama de trabajo: {branch} — tu rama original queda intacta"
+                ));
+                improve_branch = Some(branch);
+                base_branch = base;
+            }
             None => workflow.phase(
                 "Aviso: no se pudo crear una rama de trabajo; los commits irán a la rama actual",
             ),
@@ -467,6 +484,11 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             resumed_tasks: 0,
             budget_aborted: false,
             user_aborted: false,
+            failed_task_ids: Vec::new(),
+            blocked_task_ids: Vec::new(),
+            cost_usd: budget.spent(),
+            improve_branch,
+            base_branch,
         });
     }
 
@@ -484,6 +506,11 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             resumed_tasks: 0,
             budget_aborted: false,
             user_aborted: true,
+            failed_task_ids: Vec::new(),
+            blocked_task_ids: Vec::new(),
+            cost_usd: budget.spent(),
+            improve_branch,
+            base_branch,
         });
     }
 
@@ -724,6 +751,25 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             } else {
                 failed += 1;
                 failed_tasks.insert(slot.task_index);
+                // A terminally failed delivery has nothing worth a paid
+                // review: log it, release its file locks, move on.
+                workflow.phase(&format!(
+                    "  {}: fallo terminal ({}) — sin supervisión, archivos liberados",
+                    task.id,
+                    result.error.as_deref().unwrap_or("sin detalle")
+                ));
+                append_file(
+                    &supervision_md,
+                    &format!(
+                        "\n## Task {} — {}\n\n- Status: failed\n- Approved: false\n\
+                         - Summary: delivery failed terminally ({}); not supervised\n",
+                        task.id,
+                        task.module,
+                        result.error.as_deref().unwrap_or("no detail")
+                    ),
+                )?;
+                busy.remove(&slot.task_index);
+                continue;
             }
 
             // Supervisor reviews in parallel; the files stay locked.
@@ -740,14 +786,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                         task.id
                     ));
                     supervision_issues += 1;
-                    if result.succeeded() {
-                        finalize_completed_task(
-                            task,
-                            &mut state,
-                            &mut built_context,
-                            &options.project_dir,
-                        );
-                    }
+                    finalize_completed_task(
+                        task,
+                        &mut state,
+                        &mut built_context,
+                        &options.project_dir,
+                    );
                     busy.remove(&slot.task_index);
                 }
             }
@@ -976,6 +1020,26 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             ("user_aborted", user_aborted.to_string()),
         ],
     );
+    let failed_task_ids: Vec<String> = failed_tasks
+        .iter()
+        .map(|&index| tasks[index].id.clone())
+        .collect();
+    // Tasks the drained scheduler never attempted: with dependents of failed
+    // tasks held back, anything neither completed nor failed was blocked by
+    // a failed (transitive) dependency. Aborts leave ordinary pending tasks
+    // behind too, so the list is only meaningful on a natural drain.
+    let blocked_task_ids: Vec<String> = if budget_aborted || user_aborted {
+        Vec::new()
+    } else {
+        tasks
+            .iter()
+            .enumerate()
+            .filter(|(index, task)| {
+                !state.completed.contains(&task.id) && !failed_tasks.contains(index)
+            })
+            .map(|(_, task)| task.id.clone())
+            .collect()
+    };
     Ok(RunSummary {
         plan,
         tasks: tasks.len(),
@@ -986,6 +1050,11 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         resumed_tasks,
         budget_aborted,
         user_aborted,
+        failed_task_ids,
+        blocked_task_ids,
+        cost_usd: budget.spent(),
+        improve_branch,
+        base_branch,
     })
 }
 
@@ -1005,10 +1074,11 @@ struct SupSlot {
 }
 
 /// Picks the next runnable task: not done/failed/in-flight, every known
-/// dependency settled (completed — or failed, matching the old wave
-/// semantics where later waves ran regardless), and no file shared with an
-/// in-flight task. Deterministic: lowest priority value first, then backlog
-/// order.
+/// dependency COMPLETED (a failed dependency blocks its dependents — they
+/// would build on a missing foundation and cascade-fail, each burning a
+/// developer plus a supervisor run), and no file shared with an in-flight
+/// task. Deterministic: lowest priority value first, then backlog order.
+/// Blocked tasks are reported separately in the run summary.
 #[must_use]
 pub fn next_ready_task(
     tasks: &[TaskSpec],
@@ -1016,10 +1086,6 @@ pub fn next_ready_task(
     failed: &BTreeSet<usize>,
     busy: &BTreeSet<usize>,
 ) -> Option<usize> {
-    let failed_ids: BTreeSet<&str> = failed
-        .iter()
-        .map(|&index| tasks[index].id.as_str())
-        .collect();
     let busy_files: BTreeSet<&str> = busy
         .iter()
         .flat_map(|&index| tasks[index].touched_files())
@@ -1030,10 +1096,7 @@ pub fn next_ready_task(
             continue;
         }
         let deps_settled = task.depends_on.iter().all(|dep| {
-            dep == &task.id
-                || completed_ids.contains(dep)
-                || failed_ids.contains(dep.as_str())
-                || !tasks.iter().any(|t| &t.id == dep)
+            dep == &task.id || completed_ids.contains(dep) || !tasks.iter().any(|t| &t.id == dep)
         });
         if !deps_settled {
             continue;
@@ -1436,7 +1499,14 @@ pub fn repo_digest(project_dir: &Path) -> String {
     }
 
     files.sort();
-    let mut out = String::from("### File tree\n```\n");
+    let mut out = String::new();
+    // Recent history tells the planners what changed lately, the commit
+    // conventions in use, and which areas are active — signal the file
+    // tree alone cannot provide.
+    if let Some(log) = recent_git_log(project_dir) {
+        let _ = write!(out, "### Recent commits\n```\n{log}\n```\n\n");
+    }
+    out.push_str("### File tree\n```\n");
     for (rel, size) in files.iter().take(400) {
         let _ = writeln!(out, "{rel} ({size} B)");
     }
@@ -1448,6 +1518,18 @@ pub fn repo_digest(project_dir: &Path) -> String {
         let _ = write!(out, "\n### {rel}\n```\n{content}\n```\n");
     }
     out
+}
+
+/// The last 20 one-line commits, or `None` outside a repo with history.
+fn recent_git_log(project_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["log", "--oneline", "-n", "20"])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let log = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !log.is_empty()).then_some(log)
 }
 
 // ---------- Security gate ----------
@@ -1471,16 +1553,9 @@ const SECRET_MARKERS: &[&str] = &[
 /// there). Capped so a pathological tree cannot stall the gate.
 #[must_use]
 pub fn scan_for_secrets(project_dir: &Path) -> Vec<String> {
-    const SKIP_DIRS: &[&str] = &[
-        "node_modules",
-        ".git",
-        "target",
-        "dist",
-        "build",
-        ".multiagent",
-        "docs",
-        ".scaffold",
-    ];
+    // Same skip set as the planner digest: vendored/build/VCS trees are not
+    // generated sources, and two hand-maintained lists would drift apart.
+    const SKIP_DIRS: &[&str] = REPO_SKIP_DIRS;
     let mut findings = Vec::new();
     let mut pending = vec![project_dir.to_path_buf()];
     let mut visited = 0_usize;
@@ -2030,11 +2105,15 @@ pub fn escalate(complexity: Complexity) -> Option<Complexity> {
 
 // ---------- Resume state (#5) ----------
 
-/// Tasks already completed, persisted after every supervised delivery so an
-/// interrupted build can resume without repeating work.
+/// Tasks already completed (persisted after every supervised delivery so an
+/// interrupted build can resume without repeating work), plus the Improve
+/// work branch so a resumed run continues on the SAME branch instead of
+/// orphaning it with a fresh checkout.
 #[derive(Default)]
 pub struct BuildState {
     pub completed: BTreeSet<String>,
+    pub improve_branch: Option<String>,
+    pub base_branch: Option<String>,
 }
 
 impl BuildState {
@@ -2044,20 +2123,33 @@ impl BuildState {
 
     #[must_use]
     pub fn load(project_dir: &Path) -> Self {
-        let completed = std::fs::read_to_string(Self::state_path(project_dir))
+        let Some(value) = std::fs::read_to_string(Self::state_path(project_dir))
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-            .and_then(|value| {
-                value.get("completed").and_then(|ids| {
-                    ids.as_array().map(|ids| {
-                        ids.iter()
-                            .filter_map(|id| id.as_str().map(ToString::to_string))
-                            .collect::<BTreeSet<String>>()
-                    })
+        else {
+            return Self::default();
+        };
+        let completed = value
+            .get("completed")
+            .and_then(|ids| {
+                ids.as_array().map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str().map(ToString::to_string))
+                        .collect::<BTreeSet<String>>()
                 })
             })
             .unwrap_or_default();
-        Self { completed }
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Self {
+            completed,
+            improve_branch: field("improve_branch"),
+            base_branch: field("base_branch"),
+        }
     }
 
     pub fn save(&self, project_dir: &Path) {
@@ -2065,9 +2157,21 @@ impl BuildState {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "completed": self.completed.iter().collect::<Vec<_>>(),
         });
+        if let (Some(map), Some(branch)) = (payload.as_object_mut(), &self.improve_branch) {
+            map.insert(
+                "improve_branch".to_string(),
+                serde_json::Value::String(branch.clone()),
+            );
+            if let Some(base) = &self.base_branch {
+                map.insert(
+                    "base_branch".to_string(),
+                    serde_json::Value::String(base.clone()),
+                );
+            }
+        }
         let _ = std::fs::write(path, format!("{payload:#}\n"));
     }
 }
@@ -2117,15 +2221,23 @@ impl Budget {
                  el tope no se aplicará"
             );
         }
-        let baseline = match (&ceiling, &events_path) {
-            (Some(_), Some(path)) => sum_cost_from_events(path),
-            _ => 0.0,
-        };
+        // Baseline is captured whenever telemetry exists — not only under a
+        // ceiling — so the end-of-run summary can report this run's spend.
+        let baseline = events_path
+            .as_ref()
+            .map_or(0.0, |path| sum_cost_from_events(path));
         Self {
             ceiling,
             events_path,
             baseline,
         }
+    }
+
+    /// This run's spend so far in USD, when telemetry is active.
+    #[must_use]
+    pub fn spent(&self) -> Option<f64> {
+        let path = self.events_path.as_ref()?;
+        Some((sum_cost_from_events(path) - self.baseline).max(0.0))
     }
 
     #[must_use]
@@ -2482,7 +2594,7 @@ fn append_file(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn init_git_repo(project_dir: &Path, _workflow: &WorkflowLog) -> Result<(), String> {
+fn init_git_repo(project_dir: &Path) -> Result<(), String> {
     let _status = std::process::Command::new("git")
         .arg("init")
         .current_dir(project_dir)
@@ -2493,10 +2605,23 @@ fn init_git_repo(project_dir: &Path, _workflow: &WorkflowLog) -> Result<(), Stri
     Ok(())
 }
 
-/// Creates and checks out a dedicated branch for an Improve run so the
-/// per-task commits never land on the user's current branch. Returns the
-/// branch name, or `None` when git is unavailable or the checkout failed.
-fn create_improve_branch(project_dir: &Path) -> Option<String> {
+/// Checks out the dedicated branch for an Improve run so the per-task
+/// commits never land on the user's current branch. A fresh run records the
+/// forked-from branch and creates a new one; `--resume` re-checks-out the
+/// branch persisted in `.multiagent/state.json` so every resume continues
+/// the SAME branch instead of orphaning it. Returns `(branch, base)`, or
+/// `None` when git is unavailable or the checkout failed.
+fn ensure_improve_branch(project_dir: &Path, resume: bool) -> Option<(String, Option<String>)> {
+    let mut state = BuildState::load(project_dir);
+    if resume {
+        if let Some(branch) = state.improve_branch.clone() {
+            if git_checkout(project_dir, &branch) {
+                return Some((branch, state.base_branch.clone()));
+            }
+            // Branch deleted since the last run: fall through and start anew.
+        }
+    }
+    let base = current_git_branch(project_dir);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
@@ -2509,7 +2634,35 @@ fn create_improve_branch(project_dir: &Path) -> Option<String> {
         .stderr(std::process::Stdio::null())
         .status()
         .ok()?;
-    status.success().then_some(branch)
+    if !status.success() {
+        return None;
+    }
+    state.improve_branch = Some(branch.clone());
+    state.base_branch = base.clone();
+    state.save(project_dir);
+    Some((branch, base))
+}
+
+/// The current branch name; works on an unborn HEAD too (fresh repo).
+fn current_git_branch(project_dir: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !branch.is_empty()).then_some(branch)
+}
+
+fn git_checkout(project_dir: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["checkout", branch])
+        .current_dir(project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn git_commit(project_dir: &Path, message: &str) -> Result<(), String> {
@@ -3036,18 +3189,26 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_lets_dependents_of_failed_tasks_run() {
+    fn scheduler_blocks_dependents_of_failed_tasks() {
         let tasks = vec![
             spec("T1", "src/a.ts", &[], 1),
             spec("T2", "src/b.ts", &["T1"], 1),
+            spec("T3", "src/c.ts", &[], 2),
         ];
         let completed = BTreeSet::new();
         let mut failed = BTreeSet::new();
         failed.insert(0);
-        // Old wave semantics: a failed dependency settles the constraint.
+        // T2 would build on T1's missing foundation → blocked; the
+        // independent T3 still runs.
         assert_eq!(
             next_ready_task(&tasks, &completed, &failed, &BTreeSet::new()),
-            Some(1)
+            Some(2)
+        );
+        let mut failed_all = failed.clone();
+        failed_all.insert(2);
+        assert_eq!(
+            next_ready_task(&tasks, &completed, &failed_all, &BTreeSet::new()),
+            None
         );
     }
 
@@ -3073,6 +3234,48 @@ mod tests {
         assert_eq!(scaffold_kind_for(&node_plan), Some(ScaffoldKind::NpmInit));
 
         assert_eq!(scaffold_kind_for(&Plan::default()), None);
+    }
+
+    #[test]
+    fn build_state_round_trips_improve_branch() {
+        let dir = std::env::temp_dir().join(format!(
+            "multiagent-state-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+
+        // No state file yet: everything empty.
+        let empty = BuildState::load(&dir);
+        assert!(empty.completed.is_empty());
+        assert_eq!(empty.improve_branch, None);
+
+        let mut state = BuildState::default();
+        state.completed.insert("T1".to_string());
+        state.improve_branch = Some("multiagent/improve-42".to_string());
+        state.base_branch = Some("main".to_string());
+        state.save(&dir);
+
+        // A --resume must find the SAME branch, not mint a new one.
+        let loaded = BuildState::load(&dir);
+        assert!(loaded.completed.contains("T1"));
+        assert_eq!(
+            loaded.improve_branch.as_deref(),
+            Some("multiagent/improve-42")
+        );
+        assert_eq!(loaded.base_branch.as_deref(), Some("main"));
+
+        // Branch fields are optional in the payload: absent stays None.
+        let mut bare = BuildState::default();
+        bare.completed.insert("T2".to_string());
+        bare.save(&dir);
+        let reloaded = BuildState::load(&dir);
+        assert_eq!(reloaded.improve_branch, None);
+        assert_eq!(reloaded.base_branch, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

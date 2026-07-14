@@ -299,15 +299,28 @@ fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(),
     println!("  visión:        {}", summary.plan.vision);
     println!("  stack:         {}", summary.plan.stack.kind);
     println!("  tareas:        {}", summary.tasks);
-    println!("  olas:          {}", summary.waves);
+    println!("  niveles de dependencia: {}", summary.waves);
     if common.dry_run {
         println!("  (dry-run: planificación completada, ejecución omitida)");
     } else {
         println!("  completadas:   {}", summary.completed);
         println!("  fallidas:      {}", summary.failed);
+        if !summary.failed_task_ids.is_empty() {
+            println!("    → {}", summary.failed_task_ids.join(", "));
+        }
+        if !summary.blocked_task_ids.is_empty() {
+            println!(
+                "  bloqueadas por dependencias fallidas: {} ({})",
+                summary.blocked_task_ids.len(),
+                summary.blocked_task_ids.join(", ")
+            );
+        }
         println!("  issues de supervisión: {}", summary.supervision_issues);
         if summary.resumed_tasks > 0 {
             println!("  reanudadas (omitidas): {}", summary.resumed_tasks);
+        }
+        if let Some(cost) = summary.cost_usd {
+            println!("  coste estimado: {cost:.2} USD");
         }
         if summary.budget_aborted {
             println!("  ⚠ abortado por presupuesto (--max-cost-usd)");
@@ -315,6 +328,13 @@ fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(),
         if summary.user_aborted {
             println!("  ⚠ abortado por usuario (Ctrl+C) — reanuda con --resume");
         }
+    }
+    if let Some(branch) = &summary.improve_branch {
+        let base = summary.base_branch.as_deref().unwrap_or("<tu-rama>");
+        println!("  rama de trabajo: {branch}");
+        println!("    revisa:   git diff {base}...{branch}");
+        println!("    integra:  git checkout {base} && git merge {branch}");
+        println!("    descarta: git checkout {base} && git branch -D {branch}");
     }
     Ok(())
 }
