@@ -1127,10 +1127,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // Persist the outcome next to the other build docs: the terminal
     // scrolls away, docs/SUMMARY.md doesn't.
     let summary_md = format!(
-        "# Resumen de la construcción\n\n- Visión: {}\n- Tareas: {} (completadas {completed}, \
-         fallidas {failed}, bloqueadas {})\n- Tareas fallidas: {}\n- Issues de supervisión: \
-         {supervision_issues}\n- Coste estimado: {}\n- Rama de trabajo: {}\n",
+        "# Resumen de la construcción\n\n- Visión: {}\n- Arquetipo de diseño: {}\n- Tareas: {} \
+         (completadas {completed}, fallidas {failed}, bloqueadas {})\n- Tareas fallidas: {}\n- \
+         Issues de supervisión: {supervision_issues}\n- Coste estimado: {}\n- Rama de trabajo: \
+         {}\n",
         plan.vision,
+        crate::design::detect_archetype(&plan).label(),
         tasks.len(),
         blocked_task_ids.len(),
         if failed_task_ids.is_empty() {
@@ -2094,13 +2096,23 @@ pub fn smoke_command(project_dir: &Path) -> Option<String> {
     let package = std::fs::read_to_string(project_dir.join("package.json")).ok()?;
     let json: serde_json::Value = serde_json::from_str(&package).ok()?;
     let scripts = json.get("scripts")?;
-    for (script, command) in [
-        ("dev", "npm run dev"),
-        ("start", "npm start"),
-        ("preview", "npm run preview"),
-    ] {
+    // Same package-manager rule as the build gate: the lockfile decides.
+    let runner = if project_dir.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if project_dir.join("yarn.lock").exists() {
+        "yarn"
+    } else if project_dir.join("bun.lockb").exists() || project_dir.join("bun.lock").exists() {
+        "bun"
+    } else {
+        "npm"
+    };
+    for script in ["dev", "start", "preview"] {
         if scripts.get(script).is_some() {
-            return Some(command.to_string());
+            return Some(if script == "start" && runner == "npm" {
+                "npm start".to_string()
+            } else {
+                format!("{runner} run {script}")
+            });
         }
     }
     None
@@ -2569,6 +2581,9 @@ pub fn detect_build_command(project_dir: &Path, explicit: Option<&str>) -> Optio
         }
         if project_dir.join("yarn.lock").exists() {
             return Some("yarn install && yarn run build --if-present".to_string());
+        }
+        if project_dir.join("bun.lockb").exists() || project_dir.join("bun.lock").exists() {
+            return Some("bun install && bun run build --if-present".to_string());
         }
         return Some("npm install --no-audit --no-fund && npm run build --if-present".to_string());
     }
@@ -3431,6 +3446,11 @@ mod tests {
         assert!(detect_build_command(&dir, None)
             .expect("npm build")
             .starts_with("npm install"));
+        std::fs::write(dir.join("bun.lockb"), "").expect("bun lock");
+        assert!(detect_build_command(&dir, None)
+            .expect("bun build")
+            .starts_with("bun install"));
+        std::fs::remove_file(dir.join("bun.lockb")).expect("rm bun");
         std::fs::write(dir.join("yarn.lock"), "").expect("yarn lock");
         assert!(detect_build_command(&dir, None)
             .expect("yarn build")

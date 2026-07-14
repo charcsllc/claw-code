@@ -310,6 +310,13 @@ fi
 
 step "Building the claw workspace (${BUILD_PROFILE})"
 
+# A full workspace build needs headroom for the linker; running out of disk
+# mid-link fails with confusing SIGBUS/linker errors, not a clear message.
+FREE_KB="$(df -Pk . 2>/dev/null | awk 'NR==2 {print $4}')"
+if [ -n "${FREE_KB}" ] && [ "${FREE_KB}" -lt 3145728 ]; then
+    warn "less than 3GB free on this disk ($((FREE_KB / 1024 / 1024))GB) — the build may fail; free space or run 'cargo clean' in rust/ first"
+fi
+
 CARGO_FLAGS=("build" "--workspace")
 if [ "${BUILD_PROFILE}" = "release" ]; then
     CARGO_FLAGS+=("--release")

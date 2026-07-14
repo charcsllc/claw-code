@@ -41,7 +41,9 @@ const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N]
                             /improve <prompt> [same options; opera sobre el proyecto actual]\n\
                      Tips: --approve pauses after planning for a go/no-go;\n\
                      --dry-run stops after planning entirely.\n\
-                     --max-cost-usd is OFF by default (subscription accounts).";
+                     --max-cost-usd is OFF by default (subscription accounts).\n\
+                     Env: CLAW_MA_{SIMPLE,MEDIUM,COMPLEX,DIRECTOR,SUPERVISOR}_MODEL \
+overrides per-role models; CLAW_PERF_BUDGET_KB and CLAW_SMOKE_TIMEOUT_SECS tune the gates.";
 
 /// Developer-slot bounds: 0 would deadlock the scheduler and beyond 16 the
 /// per-agent processes contend for CPU/IO without building any faster.

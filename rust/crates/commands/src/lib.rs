@@ -518,6 +518,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: false,
     },
     SlashCommandSpec {
+        name: "design-review",
+        aliases: &[],
+        summary: "Deterministic design audit: WCAG token contrast + rendered-HTML accessibility (0 tokens)",
+        argument_hint: None,
+        resume_supported: false,
+    },
+    SlashCommandSpec {
         name: "keybindings",
         aliases: &[],
         summary: "Show or configure keyboard shortcuts",
@@ -1173,6 +1180,7 @@ pub enum SlashCommand {
     Thinkback,
     ReleaseNotes,
     SecurityReview,
+    DesignReview,
     Keybindings,
     PrivacySettings,
     Plan {
@@ -1314,6 +1322,7 @@ impl SlashCommand {
             Self::Thinkback => "/thinkback",
             Self::ReleaseNotes => "/release-notes",
             Self::SecurityReview => "/security-review",
+            Self::DesignReview => "/design-review",
             Self::Keybindings => "/keybindings",
             Self::PrivacySettings => "/privacy-settings",
             Self::Plan { .. } => "/plan",
@@ -1532,6 +1541,10 @@ pub fn validate_slash_command_input(
         "security-review" => {
             validate_no_args(command, &args)?;
             SlashCommand::SecurityReview
+        }
+        "design-review" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::DesignReview
         }
         "keybindings" => {
             validate_no_args(command, &args)?;
@@ -5964,6 +5977,7 @@ pub fn handle_slash_command(
         | SlashCommand::Thinkback
         | SlashCommand::ReleaseNotes
         | SlashCommand::SecurityReview
+        | SlashCommand::DesignReview
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
@@ -6796,7 +6810,7 @@ mod tests {
         assert!(help.contains("/setup"));
         assert!(help.contains("/improve"));
         assert!(help.contains("/provider"));
-        assert_eq!(slash_command_specs().len(), 144);
+        assert_eq!(slash_command_specs().len(), 145);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

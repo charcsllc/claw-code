@@ -6271,6 +6271,7 @@ fn format_usage_report(tracker: &UsageTracker) -> String {
   Cache read       {}
   Cache hit rate   {}
   Total tokens     {}
+  Avg per turn     {}
   Estimated cost   {}",
         tracker.turns(),
         last.input_tokens,
@@ -6283,6 +6284,9 @@ fn format_usage_report(tracker: &UsageTracker) -> String {
         total.cache_read_input_tokens,
         format_cache_hit_rate(total.input_tokens, total.cache_read_input_tokens),
         total.total_tokens(),
+        u64::from(total.total_tokens())
+            .checked_div(u64::from(tracker.turns()))
+            .unwrap_or(0),
         format_usd(total.estimate_cost_usd().total_cost_usd()),
     )
 }
@@ -7084,6 +7088,7 @@ fn run_resume_command(
         | SlashCommand::Thinkback
         | SlashCommand::ReleaseNotes
         | SlashCommand::SecurityReview
+        | SlashCommand::DesignReview
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
@@ -7420,22 +7425,40 @@ fn format_files_report() -> String {
 
 /// `/review`: the working-tree (or staged) diff, capped so a huge refactor
 /// doesn't blow the context window before the review starts.
-fn collect_review_diff(staged: bool) -> Result<String, String> {
+fn collect_review_diff(scope: Option<&str>) -> Result<String, String> {
     const MAX_DIFF_CHARS: usize = 60_000;
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let args: &[&str] = if staged {
-        &["diff", "--staged"]
-    } else {
-        &["diff"]
+    let scope = scope.map(str::trim).filter(|value| !value.is_empty());
+    // `/review` → working tree; `/review staged` → index; `/review <ref>` →
+    // what this branch adds over <ref> (e.g. `/review main` before a PR).
+    let range;
+    let (args, empty_message): (Vec<&str>, &str) = match scope {
+        None => (
+            vec!["diff"],
+            "working tree is clean — nothing to review (try /review staged or /review <rama-base>)",
+        ),
+        Some("staged") => (
+            vec!["diff", "--staged"],
+            "no staged changes to review (try /review for unstaged ones)",
+        ),
+        Some(reference) => {
+            if !reference
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            {
+                return Err(format!("invalid git reference '{reference}'"));
+            }
+            range = format!("{reference}...HEAD");
+            (
+                vec!["diff", range.as_str()],
+                "no differences against that base — the branch adds nothing over it",
+            )
+        }
     };
-    let diff =
-        run_git_capture_in(&cwd, args).ok_or("not inside a git repository (or git unavailable)")?;
+    let diff = run_git_capture_in(&cwd, &args)
+        .ok_or("not inside a git repository, unknown reference, or git unavailable")?;
     if diff.trim().is_empty() {
-        return Err(if staged {
-            "no staged changes to review (try /review for unstaged ones)".to_string()
-        } else {
-            "working tree is clean — nothing to review (try /review staged)".to_string()
-        });
+        return Err(empty_message.to_string());
     }
     if diff.chars().count() > MAX_DIFF_CHARS {
         let truncated: String = diff.chars().take(MAX_DIFF_CHARS).collect();
@@ -7500,6 +7523,52 @@ fn format_security_review_report() -> String {
     }
     out.push_str("  Deep review      /review — revisión con IA del diff actual");
     out
+}
+
+/// `/design-review`: the multiagent design gate, standalone over the
+/// current project — WCAG contrast of any token stylesheet, accessibility
+/// audit of `docs/rendered-dom.html`/`index.html` if present, and token
+/// discipline. Deterministic, zero tokens.
+fn format_design_review_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut findings = claw_multiagent::design::run_design_gate(&cwd, &cwd.join("docs"), false);
+    // Outside a multiagent build there is rarely a rendered DOM capture;
+    // fall back to auditing the source index.html so the command is useful
+    // on any web project.
+    if !cwd.join("docs/rendered-dom.html").exists() {
+        for candidate in ["index.html", "public/index.html", "src/index.html"] {
+            if let Ok(html) = std::fs::read_to_string(cwd.join(candidate)) {
+                for finding in claw_multiagent::design::audit_rendered_html(&html) {
+                    findings.push(format!("[A11Y] {candidate}: {finding}"));
+                }
+                break;
+            }
+        }
+    }
+    for finding in claw_multiagent::design::audit_hardcoded_colors(&cwd) {
+        findings.push(format!("[TOKENS] {finding}"));
+    }
+    if findings.is_empty() {
+        return "Design review (checks deterministas, 0 tokens)\n  Result           ok — \
+                sin fallos de contraste WCAG, accesibilidad HTML ni disciplina de tokens\n  \
+                Nota             audita stylesheets de tokens, index.html/rendered-dom y CSS de componentes"
+            .to_string();
+    }
+    let mut out = format!(
+        "Design review (checks deterministas, 0 tokens)\n  Findings         {}\n",
+        findings.len()
+    );
+    for finding in findings.iter().take(25) {
+        let _ = writeln!(out, "    {finding}");
+    }
+    if findings.len() > 25 {
+        let _ = writeln!(out, "    … y {} más", findings.len() - 25);
+    }
+    out.push_str(
+        "  Fix              corrige y re-ejecuta /design-review; /review para una revisión con IA",
+    );
+    out.trim_end().to_string()
 }
 
 /// `/privacy-settings`: where claw stores data locally and how to purge it.
@@ -7642,6 +7711,7 @@ fn hint_for_turn_error(error: &str) -> Option<&'static str> {
     }
     if lower.contains("insufficient_quota")
         || lower.contains("insufficient balance")
+        || lower.contains("insufficient credits")
         || lower.contains("billing")
         || lower.contains("quota exceeded")
     {
@@ -8477,6 +8547,7 @@ impl LiveCli {
   Messages         {}
   Turns            {}
   Total tokens     {}
+  Context          {}
   Estimated cost   {}
   Last prompt      {}
   File             {}",
@@ -8489,6 +8560,13 @@ impl LiveCli {
             session.messages.len(),
             tracker.turns(),
             usage.total_tokens(),
+            render_utilization_bar(
+                usage
+                    .input_tokens
+                    .saturating_mul(100)
+                    .checked_div(runtime::auto_compaction_threshold_from_env())
+                    .unwrap_or(0)
+            ),
             format_usd(usage.estimate_cost_usd().total_cost_usd()),
             truncate_retry_error(last_prompt),
             self.session.path.display(),
@@ -9290,8 +9368,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Review { scope } => {
-                let staged = matches!(scope.as_deref().map(str::trim), Some("staged"));
-                match collect_review_diff(staged) {
+                match collect_review_diff(scope.as_deref()) {
                     Ok(diff) => {
                         let prompt = format!(
                             "Review the following git diff like a strict senior engineer: \
@@ -9334,6 +9411,10 @@ impl LiveCli {
             }
             SlashCommand::SecurityReview => {
                 println!("{}", format_security_review_report());
+                false
+            }
+            SlashCommand::DesignReview => {
+                println!("{}", format_design_review_report());
                 false
             }
             SlashCommand::PrivacySettings => {
@@ -18972,6 +19053,11 @@ mod tests {
         assert!(hint_for_turn_error("insufficient_quota for this key")
             .unwrap()
             .contains("saldo"));
+        assert!(
+            hint_for_turn_error("402: insufficient credits on this account")
+                .unwrap()
+                .contains("saldo")
+        );
         assert!(
             hint_for_turn_error("The model `nope-9` does not exist or you do not have access")
                 .unwrap()

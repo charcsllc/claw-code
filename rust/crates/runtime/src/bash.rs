@@ -454,6 +454,18 @@ mod tests {
 /// Maximum output bytes before truncation (16 KiB, matching upstream).
 const MAX_OUTPUT_BYTES: usize = 16_384;
 
+/// Pure parse of the `CLAW_BASH_MAX_OUTPUT_BYTES` override. Clamped to
+/// [4 KiB, 1 MiB]: below the floor tools lose their error context, above
+/// the ceiling a chatty command floods the model's context window.
+fn parse_max_output_bytes(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .map_or(MAX_OUTPUT_BYTES, |value| value.clamp(4_096, 1_048_576))
+}
+
+fn max_output_bytes() -> usize {
+    parse_max_output_bytes(std::env::var("CLAW_BASH_MAX_OUTPUT_BYTES").ok().as_deref())
+}
+
 /// Applied when the caller omits `timeout`: matches the tool's documented
 /// default (120s) so an unattended `sleep`/hung build cannot stall a turn
 /// indefinitely.
@@ -471,16 +483,20 @@ fn default_bash_timeout_ms() -> u64 {
 
 /// Truncate output to `MAX_OUTPUT_BYTES`, appending a marker when trimmed.
 fn truncate_output(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_BYTES {
+    let limit = max_output_bytes();
+    if s.len() <= limit {
         return s.to_string();
     }
-    // Find the last valid UTF-8 boundary at or before MAX_OUTPUT_BYTES
-    let mut end = MAX_OUTPUT_BYTES;
+    // Find the last valid UTF-8 boundary at or before the limit.
+    let mut end = limit;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
     let mut truncated = s[..end].to_string();
-    truncated.push_str("\n\n[output truncated — exceeded 16384 bytes]");
+    let _ = std::fmt::Write::write_fmt(
+        &mut truncated,
+        format_args!("\n\n[output truncated — exceeded {limit} bytes]"),
+    );
     truncated
 }
 
@@ -492,6 +508,16 @@ mod truncation_tests {
     fn short_output_unchanged() {
         let s = "hello world";
         assert_eq!(truncate_output(s), s);
+    }
+
+    #[test]
+    fn max_output_override_parses_and_clamps() {
+        assert_eq!(parse_max_output_bytes(None), MAX_OUTPUT_BYTES);
+        assert_eq!(parse_max_output_bytes(Some("junk")), MAX_OUTPUT_BYTES);
+        assert_eq!(parse_max_output_bytes(Some("65536")), 65_536);
+        // Floor and ceiling protect error context and the context window.
+        assert_eq!(parse_max_output_bytes(Some("1")), 4_096);
+        assert_eq!(parse_max_output_bytes(Some("999999999")), 1_048_576);
     }
 
     #[test]

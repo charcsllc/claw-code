@@ -145,6 +145,10 @@ if ($missing) {
 
 # --------------------------------------------------------------------------
 Write-Step 4 $total "Building the claw workspace ($buildProfile)"
+$freeGB = try { [math]::Round((Get-PSDrive -Name (Get-Location).Drive.Name).Free / 1GB, 1) } catch { $null }
+if ($freeGB -ne $null -and $freeGB -lt 3) {
+    Write-Warning "less than 3GB free on this drive (${freeGB}GB) — the build may fail; free space or run 'cargo clean' in rust\ first"
+}
 $cargoArgs = @('build', '--workspace')
 if ($buildProfile -eq 'release') { $cargoArgs += '--release' }
 Write-Info "running: cargo $($cargoArgs -join ' ')"

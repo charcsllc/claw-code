@@ -98,6 +98,14 @@ pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
         default_model: "",
     },
     ProviderPreset {
+        kind: "groq",
+        label: "Groq (inferencia rápida, OpenAI-compat)",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "https://api.groq.com/openai/v1",
+        default_model: "",
+    },
+    ProviderPreset {
         kind: "ollama",
         label: "Ollama (local, keyless)",
         key_env: "",
@@ -443,6 +451,8 @@ mod tests {
         let openrouter = preset_for("openrouter").expect("openrouter");
         assert_eq!(openrouter.key_env, "OPENAI_API_KEY");
         assert!(openrouter.default_base_url.contains("openrouter.ai"));
+        let groq = preset_for("groq").expect("groq");
+        assert!(groq.default_base_url.contains("api.groq.com/openai"));
         assert!(preset_for("nope").is_none());
     }
 
