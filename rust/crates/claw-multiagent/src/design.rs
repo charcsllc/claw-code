@@ -37,6 +37,12 @@ pub enum DesignArchetype {
     Saas,
     /// Editorial/blog/docs: typography-first, long-form reading comfort.
     Content,
+    /// Money product: precision, trust, dense numbers, zero ambiguity.
+    Fintech,
+    /// Community/social: user content first, feeds, presence, moderation UI.
+    Social,
+    /// Booking/reservations: calendar-driven, availability, confirmation flow.
+    Booking,
     /// Desktop/mobile app or anything that matched no other archetype.
     General,
 }
@@ -50,6 +56,9 @@ impl DesignArchetype {
             Self::Dashboard => "dashboard",
             Self::Saas => "saas",
             Self::Content => "contenido editorial",
+            Self::Fintech => "fintech",
+            Self::Social => "social/comunidad",
+            Self::Booking => "reservas",
             Self::General => "general",
         }
     }
@@ -106,6 +115,35 @@ impl DesignArchetype {
                  images with captions and mandatory alt text; a visible table of contents \
                  for long pages. Avoid: full-width unreadable text lines, justified text, \
                  more than two typefaces."
+            }
+            Self::Fintech => {
+                "Art direction (fintech): precision builds trust — every amount uses \
+                 tabular-nums, explicit currency and sign (never color as the only \
+                 negative indicator: pair --status-critical with a −/▼ glyph); \
+                 timestamps and fees always visible before confirmation; destructive/\
+                 irreversible money actions get a full confirmation step restating the \
+                 amount; conservative motion (--duration-fast only); dense-but-calm \
+                 neutral surfaces. Avoid: playful illustrations near money, rounded \
+                 'fun' numbers, toasts as the only receipt of a transaction."
+            }
+            Self::Social => {
+                "Art direction (social/community): user content is the hero — cards \
+                 sized by content with consistent avatar sizes (--radius-full) and \
+                 timestamps in --text-muted; action bars (like/reply/share) as real \
+                 buttons with labels or aria-labels, 44px targets; optimistic UI with \
+                 visible pending state; empty feeds teach how to follow/post; report/\
+                 moderation affordances discreet but present. Avoid: infinite scroll \
+                 without landmarks, unlabeled icon rows, engagement-bait badges."
+            }
+            Self::Booking => {
+                "Art direction (booking/reservas): the calendar is the interface — \
+                 available/occupied/selected states distinguishable by MORE than color \
+                 (fill + border + glyph); the selected slot summary (date, time, price) \
+                 persists on screen through the whole flow; a visible step indicator \
+                 (1 elegir → 2 datos → 3 confirmar); confirmation screen restates \
+                 everything with an add-to-calendar action; timezone always explicit. \
+                 Avoid: grayed dates that look disabled but are merely unavailable \
+                 without explanation, resets of the flow on validation errors."
             }
             Self::General => {
                 "Art direction (general): platform-native feel — respect OS conventions \
@@ -189,6 +227,49 @@ pub fn detect_archetype(plan: &Plan) -> DesignArchetype {
     ]) {
         DesignArchetype::Content
     } else if matches_any(&[
+        "fintech",
+        "banco",
+        "banking",
+        "pagos",
+        "payments",
+        "billetera",
+        "wallet",
+        "inversión",
+        "inversion",
+        "trading",
+        "finanzas",
+        "facturación",
+        "facturacion",
+        "contabilidad",
+    ]) {
+        DesignArchetype::Fintech
+    } else if matches_any(&[
+        "red social",
+        "social network",
+        "comunidad",
+        "community",
+        "foro",
+        "forum",
+        "chat",
+        "mensajería",
+        "mensajeria",
+        "feed",
+        "seguidores",
+    ]) {
+        DesignArchetype::Social
+    } else if matches_any(&[
+        "reserva",
+        "booking",
+        "citas",
+        "appointment",
+        "agenda",
+        "calendario",
+        "turnos",
+        "disponibilidad",
+        "alquiler",
+    ]) {
+        DesignArchetype::Booking
+    } else if matches_any(&[
         "saas",
         "suscripción",
         "suscripcion",
@@ -218,6 +299,11 @@ const CONTRAST_PAIRS: &[(&str, &str, f64)] = &[
     ("--text-muted", "--surface-page", 3.0), // large text / secondary UI
     ("--color-primary-contrast", "--color-primary", 4.5),
     ("--color-primary", "--surface-page", 3.0), // links / focus ring visibility
+    // Status colors that carry standalone meaning (success/danger text and
+    // borders) must be perceivable on the page surface; warning/serious are
+    // exempt — they always ship with icon + label by contract.
+    ("--status-good", "--surface-page", 3.0),
+    ("--status-critical", "--surface-page", 3.0),
 ];
 
 const LIGHT_TOKENS: &str = "  color-scheme: light dark;\n\
@@ -293,10 +379,24 @@ const LIGHT_TOKENS: &str = "  color-scheme: light dark;\n\
   --z-dropdown: 200;\n\
   --z-modal: 300;\n\
   --z-toast: 400;\n\
+  /* --- layout --- */\n\
+  --container-sm: 640px;\n\
+  --container-md: 768px;\n\
+  --container-lg: 1024px;\n\
+  --container-xl: 1280px;\n\
+  --measure: 68ch;\n\
+  /* --- fine typography --- */\n\
+  --tracking-tight: -0.01em;\n\
+  --tracking-wide: 0.04em;\n\
+  /* --- interaction --- */\n\
+  --tap-target: 44px;\n\
+  --opacity-disabled: 0.5;\n\
+  --backdrop: rgba(11, 11, 11, 0.5);\n\
   /* --- motion --- */\n\
   --duration-fast: 150ms;\n\
   --duration-base: 250ms;\n\
   --ease-out: cubic-bezier(0.2, 0, 0, 1);\n\
+  --transition-base: color var(--duration-base) var(--ease-out), background-color var(--duration-base) var(--ease-out), border-color var(--duration-base) var(--ease-out), box-shadow var(--duration-base) var(--ease-out);\n\
   /* --- focus (keyboard visibility is non-negotiable) --- */\n\
   --focus-ring: 2px solid var(--color-primary);\n\
   --focus-offset: 2px;\n";
@@ -326,7 +426,8 @@ const DARK_TOKENS: &str = "  --surface-page: #0d0d0d;\n\
   --data-8: #d95926;\n\
   --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);\n\
   --shadow-2: 0 2px 8px rgba(0, 0, 0, 0.5);\n\
-  --shadow-3: 0 8px 24px rgba(0, 0, 0, 0.6);\n";
+  --shadow-3: 0 8px 24px rgba(0, 0, 0, 0.6);\n\
+  --backdrop: rgba(0, 0, 0, 0.7);\n";
 
 /// The complete tokens stylesheet: light theme in `:root`, dark theme both
 /// by explicit opt-in (`[data-theme="dark"]`) and by OS preference, plus
@@ -348,6 +449,67 @@ pub fn design_tokens_css() -> String {
          \x20 :root {{\n    --duration-fast: 0ms;\n    --duration-base: 0ms;\n  }}\n\
          }}\n"
     )
+}
+
+/// Base styles that must exist regardless of how diligent the design agent
+/// is: keyboard focus, selection, reduced motion, sane defaults and the
+/// `.visually-hidden` utility are accessibility floor, not taste. Written
+/// deterministically next to the tokens; consumes ONLY token variables.
+const BASE_CSS: &str = "/* Base styles — accessibility floor, generated by claw multiagent.\n\
+\x20  Consumes design-tokens.css exclusively; components build on top. */\n\
+*, *::before, *::after { box-sizing: border-box; }\n\
+* { margin: 0; }\n\
+html { -webkit-text-size-adjust: 100%; }\n\
+body {\n\
+  background: var(--surface-page);\n\
+  color: var(--text-primary);\n\
+  font-family: var(--font-sans);\n\
+  font-size: var(--text-base);\n\
+  line-height: var(--leading-normal);\n\
+}\n\
+h1 { font-size: var(--text-3xl); line-height: var(--leading-tight); letter-spacing: var(--tracking-tight); }\n\
+h2 { font-size: var(--text-2xl); line-height: var(--leading-tight); }\n\
+h3 { font-size: var(--text-xl); line-height: var(--leading-tight); }\n\
+h1, h2, h3, h4 { font-weight: var(--font-bold); text-wrap: balance; }\n\
+p, li { max-width: var(--measure); }\n\
+a { color: var(--color-primary); text-underline-offset: 2px; }\n\
+a:hover { color: var(--color-primary-hover); }\n\
+img, svg, video { max-width: 100%; display: block; }\n\
+button, input, select, textarea { font: inherit; color: inherit; }\n\
+button { cursor: pointer; min-height: var(--tap-target); }\n\
+button:disabled { cursor: not-allowed; opacity: var(--opacity-disabled); }\n\
+:focus-visible {\n\
+  outline: var(--focus-ring);\n\
+  outline-offset: var(--focus-offset);\n\
+  border-radius: var(--radius-sm);\n\
+}\n\
+::selection { background: var(--color-primary-soft); color: var(--text-primary); }\n\
+::placeholder { color: var(--text-muted); }\n\
+table { border-collapse: collapse; }\n\
+th { text-align: inherit; color: var(--text-secondary); font-weight: var(--font-semibold); }\n\
+.visually-hidden {\n\
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;\n\
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;\n\
+}\n\
+@media (prefers-reduced-motion: reduce) {\n\
+  *, *::before, *::after {\n\
+    animation-duration: 0.01ms !important;\n\
+    animation-iteration-count: 1 !important;\n\
+    transition-duration: 0.01ms !important;\n\
+    scroll-behavior: auto !important;\n\
+  }\n\
+}\n";
+
+/// Writes the base stylesheet once (skipped when it already exists).
+pub fn write_base_css(project_dir: &Path) -> Option<String> {
+    let relative = "src/styles/base.css";
+    let target = project_dir.join(relative);
+    if target.exists() {
+        return None;
+    }
+    std::fs::create_dir_all(target.parent()?).ok()?;
+    std::fs::write(&target, BASE_CSS).ok()?;
+    Some(relative.to_string())
 }
 
 /// Writes the validated token foundation into the project (skipped when any
@@ -409,14 +571,15 @@ pub fn design_system_prompt(archetype: DesignArchetype, tokens_path: &str) -> St
          ink, brand, status, 8 CVD-safe data slots, type scale, spacing, radii, \
          shadows, z-index, motion, focus ring — light AND dark). Every text/surface \
          pair in it meets WCAG AA. Build on it NOW:\n\n\
-         1. WIRE IT: import the tokens stylesheet globally (main stylesheet or \
-         Tailwind @theme mapping if tailwindcss is in devDependencies). Add a \
+         1. WIRE IT: import the tokens stylesheet AND `src/styles/base.css` \
+         (already written: focus-visible ring, selection, reduced-motion, \
+         .visually-hidden, sane defaults) globally — or map tokens through a \
+         Tailwind @theme block if tailwindcss is in devDependencies. Add a \
          `data-theme` toggle (persisted to localStorage, defaulting to the OS \
          preference) in the app shell.\n\
-         2. BASE STYLES: body uses --surface-page/--text-primary/--font-sans/\
-         --leading-normal; headings use the scale; `:focus-visible` uses \
-         --focus-ring + --focus-offset on EVERY interactive element; selection \
-         color; ::placeholder uses --text-muted.\n\
+         2. LAYOUT: containers use --container-sm/md/lg/xl; prose respects \
+         --measure; interactive elements respect --tap-target; transitions use \
+         --transition-base; modal backdrops use --backdrop.\n\
          3. COMPONENTS under src/components/ui/ (or the stack's convention), each \
          consuming ONLY tokens (a hardcoded hex/px is a review failure), each with \
          default/hover/focus-visible/active/disabled states:\n\
@@ -468,10 +631,11 @@ pub fn visual_qa_prompt() -> String {
      ink; nothing stays light-on-light or dark-on-dark.\n\
      8. Responsive: at 320px nothing overflows horizontally; nav collapses; \
      tables scroll inside their container, not the page.\n\
-     9. Dead UI: no href=\"#\" links, no buttons that do nothing, no console \
-     errors visible in the DOM (error boundaries triggered).\n\
+     9. Dead UI: no href=\"#\" links, no buttons that do nothing, no clickable \
+     divs, no target=\"_blank\" without rel=\"noopener\", no console errors \
+     visible in the DOM (error boundaries triggered).\n\
      10. Feedback: async actions show loading state; failures surface a Toast \
-     or inline error, never silence."
+     or inline error, never silence; tables have <th> headers."
         .to_string()
 }
 
@@ -670,32 +834,138 @@ pub fn audit_rendered_html(html: &str) -> Vec<String> {
     if !lower.contains("<title>") || lower.contains("<title></title>") {
         findings.push("missing or empty <title>".into());
     }
+    let blank_links =
+        lower.matches("target=\"_blank\"").count() + lower.matches("target='_blank'").count();
+    if blank_links > lower.matches("noopener").count() {
+        findings.push(
+            "target=\"_blank\" link(s) without rel=\"noopener\" — the opened page \
+             can control this one"
+                .into(),
+        );
+    }
+    let clickable_divs =
+        lower.matches("<div onclick").count() + lower.matches("<span onclick").count();
+    if clickable_divs > 0 {
+        findings.push(format!(
+            "{clickable_divs} clickable <div>/<span> — use <button> (keyboard + \
+             screen-reader operable)"
+        ));
+    }
+    for value in 1..=5 {
+        if lower.contains(&format!("tabindex=\"{value}\"")) {
+            findings.push("positive tabindex — breaks the natural focus order; use 0 or -1".into());
+            break;
+        }
+    }
+    if lower.contains("<table") && !lower.contains("<th") {
+        findings.push("<table> without <th> header cells — unreadable by screen readers".into());
+    }
+    if lower.contains(" autoplay") {
+        findings.push("autoplay media — hostile default; require a user gesture".into());
+    }
     findings
 }
 
-/// The whole gate: token contrast + rendered-DOM accessibility. Returns
-/// findings; the orchestrator decides whether to dispatch the Fixer.
+/// Token-discipline audit: component stylesheets must consume variables,
+/// not raw hex. Scans non-token CSS files for color-ish declarations with
+/// hex literals. Advisory by nature (SVG art is legal), so capped and
+/// prefixed as [TOKENS] by the gate.
 #[must_use]
-pub fn run_design_gate(project_dir: &Path, docs: &Path) -> Vec<String> {
+pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
+    const COLOR_PROPS: &[&str] = &[
+        "color",
+        "background",
+        "border",
+        "outline",
+        "box-shadow",
+        "fill",
+        "stroke",
+    ];
+    let mut findings = Vec::new();
+    let mut pending = vec![project_dir.join("src")];
+    let mut budget = 400_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 || findings.len() >= 8 {
+                return findings;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !crate::orchestrator::REPO_SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            // The token foundation itself is the one legitimate home of hex.
+            if !name.ends_with(".css") || name.ends_with(".min.css") || name.contains("token") {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (line_number, line) in content.lines().enumerate() {
+                let Some(hash) = line.find('#') else { continue };
+                let hex_len = line[hash + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_hexdigit)
+                    .count();
+                if !(hex_len == 3 || hex_len == 6) {
+                    continue;
+                }
+                let before_colon = line.split(':').next().unwrap_or("");
+                if COLOR_PROPS
+                    .iter()
+                    .any(|property| before_colon.contains(property))
+                {
+                    findings.push(format!(
+                        "{}:{} hardcodes a color ({}) — use a design token",
+                        path.display(),
+                        line_number + 1,
+                        line.trim()
+                    ));
+                    break; // one finding per file is enough signal
+                }
+            }
+        }
+    }
+    findings
+}
+
+/// The whole gate: token contrast + rendered-DOM accessibility + token
+/// discipline, each finding prefixed by its category. `require_tokens` is
+/// true only for greenfield builds — an /improve run must never demand
+/// that the user's existing project adopt our token foundation.
+#[must_use]
+pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) -> Vec<String> {
     let mut findings = Vec::new();
     let stylesheets = find_token_stylesheets(project_dir);
-    if stylesheets.is_empty() {
+    if stylesheets.is_empty() && require_tokens {
         findings.push(
-            "no design-token stylesheet found (expected CSS defining --surface-page / \
-             --color-primary) — components have no shared foundation"
+            "[TOKENS] no design-token stylesheet found (expected CSS defining \
+             --surface-page / --color-primary) — components have no shared foundation"
                 .to_string(),
         );
     }
     for path in &stylesheets {
         if let Ok(css) = std::fs::read_to_string(path) {
             for finding in audit_token_contrast(&css) {
-                findings.push(format!("{}: {finding}", path.display()));
+                findings.push(format!("[CONTRASTE] {}: {finding}", path.display()));
             }
         }
     }
     if let Ok(html) = std::fs::read_to_string(docs.join("rendered-dom.html")) {
         for finding in audit_rendered_html(&html) {
-            findings.push(format!("rendered-dom.html: {finding}"));
+            findings.push(format!("[A11Y] rendered-dom.html: {finding}"));
+        }
+    }
+    if require_tokens {
+        for finding in audit_hardcoded_colors(project_dir) {
+            findings.push(format!("[TOKENS] {finding}"));
         }
     }
     findings
@@ -800,8 +1070,112 @@ mod tests {
         plan.vision = "un blog con documentación técnica".to_string();
         assert_eq!(detect_archetype(&plan), DesignArchetype::Content);
 
+        plan.vision = "una app de pagos y billetera digital".to_string();
+        assert_eq!(detect_archetype(&plan), DesignArchetype::Fintech);
+
+        plan.vision = "una red social para músicos con feed".to_string();
+        assert_eq!(detect_archetype(&plan), DesignArchetype::Social);
+
+        plan.vision = "sistema de reservas de citas con calendario".to_string();
+        assert_eq!(detect_archetype(&plan), DesignArchetype::Booking);
+
+        // A store that mentions payments is still a store: ecommerce wins.
+        plan.vision = "tienda online con pagos por tarjeta".to_string();
+        assert_eq!(detect_archetype(&plan), DesignArchetype::Ecommerce);
+
         plan.vision = "algo completamente distinto".to_string();
         assert_eq!(detect_archetype(&plan), DesignArchetype::General);
+    }
+
+    #[test]
+    fn html_audit_flags_the_advanced_failures() {
+        let bad = "<html lang=\"es\"><head><title>x</title>\
+                   <meta name=\"viewport\" content=\"w\"></head><body><main><h1>t</h1>\
+                   <a href=\"https://x\" target=\"_blank\">out</a>\
+                   <div onclick=\"go()\">click</div>\
+                   <span tabindex=\"1\">focus me</span>\
+                   <table><tr><td>1</td></tr></table>\
+                   <video autoplay src=v></video></main></body></html>";
+        let joined = audit_rendered_html(bad).join("\n");
+        assert!(joined.contains("noopener"), "{joined}");
+        assert!(joined.contains("clickable"), "{joined}");
+        assert!(joined.contains("tabindex"), "{joined}");
+        assert!(joined.contains("<th>"), "{joined}");
+        assert!(joined.contains("autoplay"), "{joined}");
+    }
+
+    #[test]
+    fn hardcoded_color_audit_respects_the_token_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-discipline-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let styles = dir.join("src/styles");
+        std::fs::create_dir_all(&styles).expect("dirs");
+        // The token foundation may hold hex; a component stylesheet may not.
+        std::fs::write(styles.join("design-tokens.css"), ":root { --x: #ff0000; }")
+            .expect("tokens");
+        std::fs::write(
+            styles.join("button.css"),
+            ".btn { background: #ff0000; }\n.ok { color: var(--text-primary); }",
+        )
+        .expect("component");
+        let findings = audit_hardcoded_colors(&dir);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("button.css"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn improve_mode_gate_never_demands_our_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-improve-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(&docs).expect("docs");
+        // No token stylesheet anywhere: greenfield complains, improve doesn't.
+        assert!(!run_design_gate(&dir, &docs, true).is_empty());
+        assert!(run_design_gate(&dir, &docs, false).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn base_css_is_written_once_and_uses_only_tokens() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-base-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let written = write_base_css(&dir).expect("first write");
+        assert_eq!(written, "src/styles/base.css");
+        assert!(write_base_css(&dir).is_none(), "second write must skip");
+        let content = std::fs::read_to_string(dir.join(written)).expect("read");
+        for needle in [
+            ":focus-visible",
+            "prefers-reduced-motion",
+            ".visually-hidden",
+            "var(--tap-target)",
+            "var(--measure)",
+        ] {
+            assert!(content.contains(needle), "missing {needle}");
+        }
+        // The accessibility floor itself must respect token discipline.
+        assert!(
+            !content.contains(": #"),
+            "base.css must not hardcode colors"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -597,6 +597,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 workflow.phase(&format!(
                     "  tokens validados (WCAG AA, dark mode, slots CVD-safe) → {path}"
                 ));
+                // The accessibility floor ships with the tokens: focus ring,
+                // selection, reduced-motion and .visually-hidden exist even
+                // if the agent under-delivers.
+                if let Some(base) = crate::design::write_base_css(&options.project_dir) {
+                    workflow.phase(&format!("  estilos base de accesibilidad → {base}"));
+                }
                 path
             }
             None => {
@@ -1001,8 +1007,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         // ---- Design gate: deterministic, zero-token — WCAG contrast over
         //      the token stylesheets and an accessibility audit of the
         //      rendered DOM. Computable failures never reach the (paid)
-        //      visual-QA agent unfixed. ----
-        run_design_gate_phase(options, &workflow, &supervision_md, &docs)?;
+        //      visual-QA agent unfixed. Token discipline is only enforced
+        //      on greenfield builds; /improve respects the user's CSS. ----
+        run_design_gate_phase(options, &workflow, &supervision_md, &docs, greenfield)?;
 
         // ---- Visual QA: critique what actually rendered, not the source ----
         if docs.join("rendered-dom.html").exists() {
@@ -1016,6 +1023,26 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 Ok(review) => {
                     save_doc(&docs, "visual-qa-report.md", &review.report)?;
                     let _ = git_commit(&options.project_dir, "visual-qa: UI review fixes");
+                    // Advisory re-check: the QA agent's own fixes must not
+                    // have regressed anything computable. Report-only — a
+                    // second Fixer round here could ping-pong forever.
+                    let regressions =
+                        crate::design::run_design_gate(&options.project_dir, &docs, greenfield);
+                    if regressions.is_empty() {
+                        workflow.phase("  verificación post-QA: diseño OK");
+                    } else {
+                        workflow.phase(&format!(
+                            "  verificación post-QA: {} hallazgo(s) restante(s) — ver SUPERVISION.md",
+                            regressions.len()
+                        ));
+                        append_file(
+                            &supervision_md,
+                            &format!(
+                                "\n## Design gate (post visual-QA, report-only)\n\n- {}\n",
+                                regressions.join("\n- ")
+                            ),
+                        )?;
+                    }
                 }
                 Err(error) => {
                     workflow.phase(&format!("  aviso: QA visual falló ({error})"));
@@ -1835,9 +1862,10 @@ fn run_design_gate_phase(
     workflow: &WorkflowLog,
     supervision_md: &Path,
     docs: &Path,
+    require_tokens: bool,
 ) -> Result<(), String> {
     workflow.phase("Gate de diseño: contraste WCAG y accesibilidad del DOM renderizado");
-    let findings = crate::design::run_design_gate(&options.project_dir, docs);
+    let findings = crate::design::run_design_gate(&options.project_dir, docs, require_tokens);
     if findings.is_empty() {
         workflow.phase("  diseño: OK");
         return Ok(());
