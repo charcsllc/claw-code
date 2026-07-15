@@ -83,11 +83,12 @@ pub use config_validate::{
 pub use conversation::{
     auto_compaction_threshold_from_env, ApiClient, ApiRequest, AssistantEvent, AutoCompactionEvent,
     ConversationRuntime, PromptCacheEvent, RuntimeError, StaticToolExecutor, ToolError,
-    ToolExecutor, TurnSummary,
+    ToolExecutor, TurnSummary, TURN_CANCELLED_MESSAGE,
 };
 pub use file_ops::{
-    closest_match_diff, edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace,
-    grep_search, grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
+    closest_match_diff, edit_file, edit_file_in_workspace, external_modification_warning,
+    glob_search, glob_search_in_workspace, grep_search, grep_search_in_workspace,
+    parse_read_file_max_bytes, read_file, read_file_in_workspace, read_file_max_bytes, write_file,
     write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
     ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
@@ -173,8 +174,9 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    redact_secrets, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
-    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    max_session_mb, parse_max_session_mb, redact_secrets, session_size_exceeds_limit, ContentBlock,
+    ConversationMessage, MessageRole, Session, SessionCompaction, SessionError, SessionFork,
+    SessionHeartbeat, SessionLiveness, SessionPin, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

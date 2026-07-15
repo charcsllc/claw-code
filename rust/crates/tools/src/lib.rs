@@ -4188,18 +4188,69 @@ where
     Ok(manifest)
 }
 
+/// Process-global registry of cooperative cancellation flags for running
+/// agent job threads, keyed by agent id. [`request_agent_stop`] sets a flag;
+/// the job's conversation loop checks it between iterations/tool calls.
+fn agent_cancel_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Registers (or returns the existing) cancellation flag for an agent id.
+fn register_agent_cancel_flag(agent_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(agent_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
+fn unregister_agent_cancel_flag(agent_id: &str) {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(agent_id);
+}
+
+fn registered_agent_cancel_flag(
+    agent_id: &str,
+) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(agent_id)
+        .cloned()
+}
+
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
+    let cancel_flag = register_agent_cancel_flag(&job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&job, &cancel_flag)
+            }));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    // A cancellation request surfaces as a turn error; keep
+                    // the terminal state honest by persisting "cancelled"
+                    // instead of "failed" when the flag is set.
+                    let status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let _ = persist_agent_terminal_state(&job.manifest, status, None, Some(error));
                 }
                 Err(_) => {
                     let _ = persist_agent_terminal_state(
@@ -4210,13 +4261,19 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                 }
             }
+            unregister_agent_cancel_flag(&job.manifest.agent_id);
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+fn run_agent_job(
+    job: &AgentJob,
+    cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let mut runtime = build_agent_runtime(job)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_cancellation_flag(std::sync::Arc::clone(cancel_flag));
     let summary = runtime
         .run_turn(job.prompt.clone(), None)
         .map_err(|error| error.to_string())?;
@@ -5922,6 +5979,105 @@ fn normalize_agent_job_status(status: &str) -> String {
     }
 }
 
+/// Requests cooperative cancellation of a background agent job identified by
+/// a (unique) id prefix.
+///
+/// The job's conversation loop checks the shared flag between iterations and
+/// between tool calls, so cancellation lands "between steps": an in-flight
+/// API request or tool call always finishes first, then the job aborts
+/// cleanly and its manifest is persisted as `cancelled`. Jobs whose manifest
+/// says `running` but whose thread does not live in this process (stale
+/// manifests from a previous run) are marked `cancelled` directly.
+///
+/// Returns a human-readable status message, or an error when the prefix is
+/// empty, matches no job, or is ambiguous.
+pub fn request_agent_stop(id_prefix: &str) -> Result<String, String> {
+    let dir = agent_store_dir()?;
+    request_agent_stop_in(&dir, id_prefix)
+}
+
+/// Directory-injected core of [`request_agent_stop`] so tests can drive it
+/// against a temp store without mutating the process environment.
+fn request_agent_stop_in(dir: &Path, id_prefix: &str) -> Result<String, String> {
+    let prefix = id_prefix.trim();
+    if prefix.is_empty() {
+        return Err(String::from("agent id prefix must not be empty"));
+    }
+
+    let mut matches: Vec<AgentOutput> = agent_manifests_in(dir)
+        .into_iter()
+        .filter(|manifest| manifest.agent_id.starts_with(prefix))
+        .collect();
+    matches.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    if matches.is_empty() {
+        return Err(format!("no agent job matches id prefix `{prefix}`"));
+    }
+    if matches.len() > 1 {
+        let ids: Vec<&str> = matches
+            .iter()
+            .map(|manifest| manifest.agent_id.as_str())
+            .collect();
+        return Err(format!(
+            "agent id prefix `{prefix}` is ambiguous; matches: {}",
+            ids.join(", ")
+        ));
+    }
+    let manifest = matches.remove(0);
+
+    if manifest.status != "running" {
+        return Ok(format!(
+            "agent job {} is already {} — nothing to cancel",
+            manifest.agent_id,
+            normalize_agent_job_status(&manifest.status)
+        ));
+    }
+
+    if let Some(flag) = registered_agent_cancel_flag(&manifest.agent_id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Ok(format!(
+            "cancellation requested for agent job {}; it stops between steps (an in-flight \
+             tool call or API request finishes first)",
+            manifest.agent_id
+        ));
+    }
+
+    // The manifest claims "running" but no thread in this process owns it:
+    // a stale entry from a previous run. Mark it cancelled directly so the
+    // store stops listing it as live.
+    persist_agent_terminal_state(
+        &manifest,
+        "cancelled",
+        None,
+        Some(String::from(
+            "cancelled via request_agent_stop; job was not running in this process",
+        )),
+    )?;
+    Ok(format!(
+        "agent job {} was not running in this process; manifest marked cancelled",
+        manifest.agent_id
+    ))
+}
+
+/// Reads every parseable agent manifest under `dir`.
+fn agent_manifests_in(dir: &Path) -> Vec<AgentOutput> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            serde_json::from_str::<AgentOutput>(&contents).ok()
+        })
+        .collect()
+}
+
 /// Builds a telemetry tracer for a sub-agent when `CLAW_DASHBOARD_EVENTS`
 /// is set, so each parallel agent shows up as its own card (with live token
 /// usage) in `claw-dashboard`. Local JSONL file only.
@@ -7119,8 +7275,10 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        register_agent_cancel_flag, registered_agent_cancel_flag, request_agent_stop_in,
+        run_task_packet, unregister_agent_cancel_flag, AgentInput, AgentJob, AgentOutput,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -7281,6 +7439,123 @@ mod tests {
     fn agent_job_summaries_of_missing_dir_are_empty() {
         let dir = temp_path("agent-jobs-missing");
         assert!(agent_job_summaries_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn request_agent_stop_rejects_empty_and_unknown_prefixes() {
+        let dir = temp_path("agent-stop-unknown");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-77", "running", "2026-07-15T10:00:00Z", None);
+
+        let empty = request_agent_stop_in(&dir, "  ").expect_err("empty prefix must fail");
+        assert!(empty.contains("must not be empty"));
+
+        let unknown =
+            request_agent_stop_in(&dir, "agent-99").expect_err("unknown prefix must fail");
+        assert!(unknown.contains("no agent job matches"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_rejects_ambiguous_prefixes() {
+        let dir = temp_path("agent-stop-ambiguous");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-51", "running", "2026-07-15T10:00:00Z", None);
+        write_agent_manifest_fixture(&dir, "agent-52", "running", "2026-07-15T10:01:00Z", None);
+
+        let error = request_agent_stop_in(&dir, "agent-5").expect_err("ambiguous prefix fails");
+        assert!(error.contains("ambiguous"), "message: {error}");
+        assert!(error.contains("agent-51") && error.contains("agent-52"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_reports_already_terminal_jobs() {
+        let dir = temp_path("agent-stop-terminal");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-61", "completed", "2026-07-15T10:00:00Z", None);
+
+        let message =
+            request_agent_stop_in(&dir, "agent-61").expect("terminal job reports its state");
+        assert!(message.contains("already done"), "message: {message}");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_sets_the_registered_cancellation_flag() {
+        let dir = temp_path("agent-stop-live");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-live-1",
+            "running",
+            "2026-07-15T10:00:00Z",
+            None,
+        );
+        let flag = register_agent_cancel_flag("agent-live-1");
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        let message = request_agent_stop_in(&dir, "agent-live").expect("live job accepts stop");
+        assert!(
+            message.contains("cancellation requested"),
+            "message: {message}"
+        );
+        assert!(message.contains("between steps"), "message: {message}");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the shared flag must be set so the job loop can abort"
+        );
+        // The running thread (not the requester) persists the terminal
+        // state, so the manifest is untouched here.
+        let manifests = super::agent_manifests_in(&dir);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].status, "running");
+
+        unregister_agent_cancel_flag("agent-live-1");
+        assert!(registered_agent_cancel_flag("agent-live-1").is_none());
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_marks_stale_running_manifests_cancelled() {
+        let dir = temp_path("agent-stop-stale");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-stale-1",
+            "running",
+            "2026-07-15T10:00:00Z",
+            None,
+        );
+        // persist_agent_terminal_state appends to the output file; give the
+        // stale job one, as the real spawn path does.
+        fs::write(dir.join("agent-stale-1.md"), "# output\n").expect("output file");
+
+        let message =
+            request_agent_stop_in(&dir, "agent-stale-1").expect("stale job can be cancelled");
+        assert!(message.contains("marked cancelled"), "message: {message}");
+
+        let manifest: AgentOutput = serde_json::from_str(
+            &fs::read_to_string(dir.join("agent-stale-1.json")).expect("manifest readable"),
+        )
+        .expect("manifest parses");
+        assert_eq!(manifest.status, "cancelled");
+        assert!(manifest.completed_at.is_some());
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn cancel_flag_registry_registers_and_unregisters() {
+        assert!(registered_agent_cancel_flag("agent-reg-test").is_none());
+        let flag = register_agent_cancel_flag("agent-reg-test");
+        let same = registered_agent_cancel_flag("agent-reg-test")
+            .expect("flag is registered after registration");
+        assert!(Arc::ptr_eq(&flag, &same), "lookup returns the same flag");
+        // Re-registering returns the existing flag rather than replacing it.
+        let again = register_agent_cancel_flag("agent-reg-test");
+        assert!(Arc::ptr_eq(&flag, &again));
+        unregister_agent_cancel_flag("agent-reg-test");
+        assert!(registered_agent_cancel_flag("agent-reg-test").is_none());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {

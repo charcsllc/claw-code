@@ -40,7 +40,11 @@ const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N]
                             /app <prompt> [same options]\n\
                             /improve <prompt> [same options; opera sobre el proyecto actual]\n\
                      Tips: --approve pauses after planning for a go/no-go;\n\
-                     --dry-run stops after planning entirely.\n\
+                     --dry-run solo planifica: Director → Arquitectos → Subdirector escriben \
+docs/plan.json y docs/backlog.json con el desglose de presupuesto, y se detiene ahí \
+sin desarrollar nada.\n\
+                     --resume reanuda un build interrumpido; sin él, /web y /app detectan \
+el estado pendiente y ofrecen reanudar desde la última fase completada.\n\
                      --max-cost-usd is OFF by default (subscription accounts).\n\
                      --archetype fuerza la dirección de arte (landing, ecommerce, dashboard, \
 saas, content, fintech, social, booking, general) en vez de detectarla del plan.\n\
@@ -84,59 +88,76 @@ pub(crate) fn clamp_parallel(requested: usize) -> (usize, Option<String>) {
     }
 }
 
-/// Parses the slash-command arguments and runs the build. The working
-/// directory and agent store are restored afterwards so the REPL session
-/// continues where it was.
-pub(crate) fn run_multiagent_build(
-    kind: ProjectKind,
-    mode: BuildMode,
-    raw: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let raw = raw.unwrap_or("").trim();
+/// Everything the slash-command arguments configure. Extracted from the
+/// REPL entry point so the flag parsing (`--dry-run`, `--resume`, …) is
+/// unit-testable without launching a build.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BuildArgs {
+    pub(crate) prompt: String,
+    pub(crate) dry_run: bool,
+    pub(crate) resume: bool,
+    pub(crate) scaffold: bool,
+    pub(crate) approve: bool,
+    pub(crate) parallel: usize,
+    pub(crate) output: PathBuf,
+    pub(crate) max_cost_usd: Option<f64>,
+    pub(crate) build_cmd: Option<String>,
+    pub(crate) agent_timeout_secs: u64,
+    pub(crate) archetype: Option<claw_multiagent::DesignArchetype>,
+}
+
+/// Parses the `/web`/`/app`/`/improve` argument string. An empty prompt is
+/// `Ok(None)` (the caller prints the usage text); malformed flag values are
+/// errors.
+pub(crate) fn parse_build_args(raw: &str, mode: BuildMode) -> Result<Option<BuildArgs>, String> {
+    let raw = raw.trim();
     if raw.is_empty() {
-        println!("{USAGE}");
-        return Ok(());
+        return Ok(None);
     }
 
     let mut prompt_words: Vec<&str> = Vec::new();
-    let mut dry_run = false;
-    let mut resume = false;
-    let mut scaffold = true;
-    let mut approve = false;
-    let mut parallel = 4_usize;
-    // Improve works on the project you are already in; greenfield builds
-    // scaffold into a fresh subdirectory.
-    let mut output = if mode.is_improve() {
-        PathBuf::from(".")
-    } else {
-        PathBuf::from("./multiagent-project")
+    let mut args = BuildArgs {
+        prompt: String::new(),
+        dry_run: false,
+        resume: false,
+        scaffold: true,
+        approve: false,
+        parallel: 4,
+        // Improve works on the project you are already in; greenfield
+        // builds scaffold into a fresh subdirectory.
+        output: if mode.is_improve() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from("./multiagent-project")
+        },
+        max_cost_usd: None,
+        build_cmd: None,
+        agent_timeout_secs: 1800,
+        archetype: None,
     };
-    let mut max_cost_usd: Option<f64> = None;
-    let mut build_cmd: Option<String> = None;
-    let mut agent_timeout_secs = 1800_u64;
-    let mut archetype: Option<claw_multiagent::DesignArchetype> = None;
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
         match tokens[index] {
-            "--dry-run" => dry_run = true,
-            "--resume" => resume = true,
-            "--no-scaffold" => scaffold = false,
-            "--approve" => approve = true,
+            "--dry-run" => args.dry_run = true,
+            "--resume" => args.resume = true,
+            "--no-scaffold" => args.scaffold = false,
+            "--approve" => args.approve = true,
             "--parallel" => {
                 index += 1;
-                parallel = tokens
+                args.parallel = tokens
                     .get(index)
                     .and_then(|value| value.parse().ok())
                     .ok_or("--parallel expects a number")?;
             }
             "--output" => {
                 index += 1;
-                output = PathBuf::from(*tokens.get(index).ok_or("--output expects a directory")?);
+                args.output =
+                    PathBuf::from(*tokens.get(index).ok_or("--output expects a directory")?);
             }
             "--max-cost-usd" => {
                 index += 1;
-                max_cost_usd = Some(
+                args.max_cost_usd = Some(
                     tokens
                         .get(index)
                         .and_then(|value| value.parse().ok())
@@ -145,7 +166,7 @@ pub(crate) fn run_multiagent_build(
             }
             "--build-cmd" => {
                 index += 1;
-                build_cmd = Some(
+                args.build_cmd = Some(
                     (*tokens
                         .get(index)
                         .ok_or("--build-cmd expects a command or 'off'")?)
@@ -154,7 +175,7 @@ pub(crate) fn run_multiagent_build(
             }
             "--timeout-secs" => {
                 index += 1;
-                agent_timeout_secs = tokens
+                args.agent_timeout_secs = tokens
                     .get(index)
                     .and_then(|value| value.parse().ok())
                     .filter(|value| *value > 0)
@@ -162,17 +183,79 @@ pub(crate) fn run_multiagent_build(
             }
             word if word == "--archetype" || word.starts_with("--archetype=") => {
                 let name = take_archetype_value(&tokens, &mut index)?;
-                archetype = Some(claw_multiagent::parse_archetype(name)?);
+                args.archetype = Some(claw_multiagent::parse_archetype(name)?);
             }
             word => prompt_words.push(word),
         }
         index += 1;
     }
-    let prompt = prompt_words.join(" ");
-    if prompt.is_empty() {
+    args.prompt = prompt_words.join(" ");
+    if args.prompt.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(args))
+}
+
+/// Affirmative answer to a [s/N] console question (Spanish or English).
+pub(crate) fn parse_yes(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_lowercase().as_str(),
+        "s" | "si" | "sí" | "y" | "yes"
+    )
+}
+
+/// When a greenfield `/web`/`/app` targets a project with a pending
+/// (interrupted) build and `--resume` was not passed, offer to resume from
+/// the last completed phase instead of re-planning everything. Reads the
+/// answer from stdin; any error or non-affirmative answer starts fresh.
+fn offer_resume(project_dir: &std::path::Path) -> bool {
+    use std::io::Write as _;
+    let Some(phase) = claw_multiagent::pending_resume_phase(project_dir) else {
+        return false;
+    };
+    println!(
+        "[multiagent] hay un build interrumpido en {} — última fase completada: {phase}",
+        project_dir.display()
+    );
+    print!("[multiagent] ¿Reanudar desde ahí (plan/backlog y tareas hechas se reutilizan)? [s/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    if parse_yes(&answer) {
+        true
+    } else {
+        println!("[multiagent] empezando de cero (usa --resume si cambias de idea)");
+        false
+    }
+}
+
+/// Parses the slash-command arguments and runs the build. The working
+/// directory and agent store are restored afterwards so the REPL session
+/// continues where it was.
+pub(crate) fn run_multiagent_build(
+    kind: ProjectKind,
+    mode: BuildMode,
+    raw: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(args) = parse_build_args(raw.unwrap_or(""), mode)? else {
         println!("{USAGE}");
         return Ok(());
-    }
+    };
+    let BuildArgs {
+        prompt,
+        dry_run,
+        mut resume,
+        scaffold,
+        approve,
+        parallel,
+        output,
+        max_cost_usd,
+        build_cmd,
+        agent_timeout_secs,
+        archetype,
+    } = args;
     let (parallel, parallel_warning) = clamp_parallel(parallel);
     if let Some(warning) = parallel_warning {
         println!("[multiagent] {warning}");
@@ -182,6 +265,13 @@ pub(crate) fn run_multiagent_build(
     std::fs::create_dir_all(&output)?;
     let project_dir = output.canonicalize()?;
     let catalog = ModelCatalog::load(&original_cwd);
+
+    // Greenfield resume offer: an interrupted /web//app leaves its phase in
+    // .multiagent/state.json; relaunching the same command should not
+    // silently redo the (paid) planning that already succeeded.
+    if !mode.is_improve() && !resume && offer_resume(&project_dir) {
+        resume = true;
+    }
 
     println!(
         "[multiagent] {} → {} (paralelo {}, modelos {}/{}/{})",
@@ -225,7 +315,8 @@ pub(crate) fn run_multiagent_build(
             );
             if dry_run {
                 println!(
-                    "[multiagent] dry-run: plan guardado en docs/plan.json y docs/backlog.json"
+                    "[multiagent] dry-run: planificación completada sin desarrollar; \
+                     plan guardado en docs/plan.json y docs/backlog.json"
                 );
             } else {
                 println!(
@@ -244,17 +335,22 @@ pub(crate) fn run_multiagent_build(
                         summary.blocked_task_ids.join(", ")
                     );
                 }
-                if let Some(cost) = summary.cost_usd {
-                    println!("[multiagent] coste estimado: {cost:.2} USD");
-                }
-                if !summary.role_spend.is_empty() {
-                    let rows: Vec<String> = summary
-                        .role_spend
-                        .iter()
-                        .map(|(role, usd)| format!("{role} {usd:.2} USD"))
-                        .collect();
-                    println!("[multiagent] gasto por rol: {}", rows.join(" · "));
-                }
+            }
+            // Spend is reported for both modes: the dry-run breakdown IS the
+            // deliverable that tells you what planning cost.
+            if let Some(cost) = summary.cost_usd {
+                println!("[multiagent] coste estimado: {cost:.2} USD");
+            }
+            if !summary.role_spend.is_empty() {
+                let rows: Vec<String> = summary
+                    .role_spend
+                    .iter()
+                    .map(|(role, usd)| format!("{role} {usd:.2} USD"))
+                    .collect();
+                println!(
+                    "[multiagent] desglose de presupuesto por rol: {}",
+                    rows.join(" · ")
+                );
             }
             if let Some(branch) = &summary.improve_branch {
                 let base = summary.base_branch.as_deref().unwrap_or("<tu-rama>");
@@ -274,8 +370,103 @@ pub(crate) fn run_multiagent_build(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_parallel, take_archetype_value};
-    use claw_multiagent::{parse_archetype, DesignArchetype};
+    use super::{clamp_parallel, parse_build_args, parse_yes, take_archetype_value};
+    use claw_multiagent::{parse_archetype, BuildMode, DesignArchetype};
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_accepts_dry_run_anywhere_and_keeps_the_prompt() {
+        // Flag after the prompt.
+        let args = parse_build_args("una tienda online --dry-run", BuildMode::Greenfield)
+            .expect("parses")
+            .expect("has prompt");
+        assert!(args.dry_run);
+        assert!(!args.resume);
+        assert_eq!(args.prompt, "una tienda online");
+
+        // Flag before/among the prompt words, combined with other flags.
+        let args = parse_build_args(
+            "--dry-run un dashboard --parallel 2 --archetype=fintech",
+            BuildMode::Greenfield,
+        )
+        .expect("parses")
+        .expect("has prompt");
+        assert!(args.dry_run);
+        assert_eq!(args.prompt, "un dashboard");
+        assert_eq!(args.parallel, 2);
+        assert_eq!(args.archetype, Some(DesignArchetype::Fintech));
+
+        // Without the flag it stays off.
+        let args = parse_build_args("una tienda", BuildMode::Greenfield)
+            .expect("parses")
+            .expect("has prompt");
+        assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn parse_defaults_match_the_mode_and_flags_override() {
+        let greenfield = parse_build_args("x", BuildMode::Greenfield)
+            .expect("parses")
+            .expect("has prompt");
+        assert_eq!(greenfield.output, PathBuf::from("./multiagent-project"));
+        assert_eq!(greenfield.parallel, 4);
+        assert!(greenfield.scaffold);
+        assert_eq!(greenfield.agent_timeout_secs, 1800);
+        assert_eq!(greenfield.max_cost_usd, None);
+
+        let improve = parse_build_args("x", BuildMode::Improve)
+            .expect("parses")
+            .expect("has prompt");
+        assert_eq!(improve.output, PathBuf::from("."));
+
+        let full = parse_build_args(
+            "arregla el login --resume --no-scaffold --approve --output ./demo \
+             --max-cost-usd 2.5 --build-cmd off --timeout-secs 60",
+            BuildMode::Improve,
+        )
+        .expect("parses")
+        .expect("has prompt");
+        assert_eq!(full.prompt, "arregla el login");
+        assert!(full.resume && full.approve && !full.scaffold);
+        assert_eq!(full.output, PathBuf::from("./demo"));
+        assert_eq!(full.max_cost_usd, Some(2.5));
+        assert_eq!(full.build_cmd.as_deref(), Some("off"));
+        assert_eq!(full.agent_timeout_secs, 60);
+    }
+
+    #[test]
+    fn parse_rejects_malformed_values_and_empty_prompts() {
+        // Empty input and flags-without-prompt both mean "print usage".
+        assert_eq!(parse_build_args("", BuildMode::Greenfield), Ok(None));
+        assert_eq!(
+            parse_build_args("  --dry-run  ", BuildMode::Greenfield),
+            Ok(None)
+        );
+
+        for bad in [
+            "tienda --parallel muchos",
+            "tienda --parallel",
+            "tienda --max-cost-usd gratis",
+            "tienda --timeout-secs 0",
+            "tienda --output",
+            "tienda --build-cmd",
+        ] {
+            assert!(
+                parse_build_args(bad, BuildMode::Greenfield).is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_offer_answer_parsing_is_forgiving_but_defaults_to_no() {
+        for yes in ["s", "S", "si", "Sí", " y ", "YES"] {
+            assert!(parse_yes(yes), "`{yes}` must be affirmative");
+        }
+        for no in ["", "n", "no", "nope", "s i", "yess"] {
+            assert!(!parse_yes(no), "`{no}` must NOT be affirmative");
+        }
+    }
 
     #[test]
     fn archetype_flag_accepts_both_token_forms() {

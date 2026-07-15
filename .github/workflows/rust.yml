@@ -19,6 +19,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    # No explicit toolchain step: the runner's rustup picks up
+    # rust/rust-toolchain.toml (channel 1.96.1) automatically, so this job
+    # always builds with the same pinned toolchain as local and rust-ci.yml.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: rust -> target
     - name: Build
       run: cargo build --verbose
     - name: Run tests

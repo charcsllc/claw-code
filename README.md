@@ -121,6 +121,23 @@ La implementación canónica vive en [`rust/`](./rust), y la fuente de verdad ac
 - **Dashboard local (`claw-dashboard`)** — telemetría en vivo en el navegador: tokens de entrada/salida por sesión, coste estimado, y el workflow multiagente con cada agente en ejecución/terminado en tiempo real. 100 % local (lee un JSONL; nada sale de tu máquina).
 - **`claw mcp add` / `claw mcp remove`** — instalación de servidores MCP en un comando (stdio, HTTP, SSE), con validación y rollback seguro de la configuración.
 
+## Características recientes
+
+Una selección de lo último que ha aterrizado — detalles y flags en [`USAGE.md`](./USAGE.md), historial por rondas en [`CHANGELOG.md`](./CHANGELOG.md):
+
+- **Gate de diseño determinista + modo CI** — `/design-review` audita contraste WCAG, accesibilidad del HTML y disciplina de tokens con 0 tokens de IA; `claw design-review --output-format json` sale con código 1 si hay hallazgos, listo para el CI de proyectos web.
+- **Desinstaladores** — `./install.sh --uninstall` (Linux/macOS/WSL) e `.\install.ps1 -Uninstall` (Windows) retiran los binarios compilados con confirmación.
+- **Bench de arranque** — `scripts/bench-startup.sh` mide el tiempo de arranque del binario (min/media/max) y falla si la media supera el umbral (`CLAW_BENCH_MAX_MS`); corre también como job de CI.
+- **E2E multiagente con mock** — test end-to-end de la fase de planificación completa (Director → Arquitectos → Subdirector) contra un mock del API con routing por contenido: cero tokens reales.
+- **Redacción de secretos** — los secretos con prefijo conocido (`sk-ant-`, `ghp_`, `xoxb-`, `AKIA`…) se enmascaran también al persistir la sesión en disco.
+- **Hook pre-push** — replica los gates rápidos de CI (rustfmt, checkers de docs y clippy) antes de que nada salga de tu máquina. Actívalo una vez tras clonar:
+
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
+  `CLAW_PREPUSH_SKIP_CLIPPY=1` se salta solo el paso de clippy; `git push --no-verify` se salta el hook entero.
+
 ## Inicio rápido
 
 > [!NOTE]

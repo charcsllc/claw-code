@@ -340,15 +340,17 @@ impl OpenAiCompatClient {
                 break retryable_error;
             }
 
-            let delay = if let Some(retry_after) = retryable_error.retry_after() {
-                retry_after
-            } else {
-                self.jittered_backoff_for_attempt(attempts)?
+            let server_retry_after = retryable_error.retry_after();
+            let from_retry_after = server_retry_after.is_some();
+            let delay = match server_retry_after {
+                Some(retry_after) => retry_after,
+                None => self.jittered_backoff_for_attempt(attempts)?,
             };
             super::notify_retry(&super::RetryNotice {
                 attempt: attempts,
                 max_retries: self.max_retries,
                 delay,
+                from_retry_after,
                 error: retryable_error.to_string(),
             });
             tokio::time::sleep(delay).await;
@@ -1816,17 +1818,18 @@ async fn expect_success(response: reqwest::Response) -> Result<reqwest::Response
     })
 }
 
+/// Extracts a clamped `Retry-After` delay for 429/503 responses (the two
+/// statuses where servers meaningfully send the header). Delegates the
+/// value parsing (delta-seconds or HTTP-date, clamped to 1..=120s) to
+/// [`super::parse_retry_after`].
 fn parse_retry_after(
     headers: &reqwest::header::HeaderMap,
     status: reqwest::StatusCode,
 ) -> Option<std::time::Duration> {
-    if status != reqwest::StatusCode::TOO_MANY_REQUESTS {
+    if !matches!(status.as_u16(), 429 | 503) {
         return None;
     }
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
+    super::parse_retry_after(headers.get("retry-after").and_then(|v| v.to_str().ok()))
         .map(std::time::Duration::from_secs)
 }
 

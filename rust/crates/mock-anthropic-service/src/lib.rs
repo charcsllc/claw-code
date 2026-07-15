@@ -32,6 +32,18 @@ pub struct CapturedRequest {
 struct ContentRoute {
     pattern: String,
     response_text: String,
+    /// When set, the first matching request (no tool_result yet) is
+    /// answered with this tool call; the follow-up request that carries the
+    /// tool result gets `response_text`. Lets a routed "agent" actually
+    /// exercise the real tool runtime (e.g. `write_file`).
+    tool_use: Option<RoutedToolUse>,
+}
+
+/// The single tool call a tool route emits before its final text.
+#[derive(Debug, Clone)]
+struct RoutedToolUse {
+    tool_name: String,
+    input: Value,
 }
 
 pub struct MockAnthropicService {
@@ -101,6 +113,31 @@ impl MockAnthropicService {
         self.routes.lock().await.push(ContentRoute {
             pattern: pattern.into(),
             response_text: response_text.into(),
+            tool_use: None,
+        });
+    }
+
+    /// Registers a tool route: a matching request that carries no
+    /// tool_result yet is answered with ONE `tool_use` block
+    /// (`tool_name`/`input`, streamed or not to match the request); the
+    /// follow-up request containing the tool result is answered with
+    /// `response_text`. `/v1/messages/count_tokens` preflights always get
+    /// the plain-text shape (they never execute tools). Same precedence and
+    /// ordering rules as [`Self::route`].
+    pub async fn route_tool_use(
+        &self,
+        pattern: impl Into<String>,
+        tool_name: impl Into<String>,
+        input: Value,
+        response_text: impl Into<String>,
+    ) {
+        self.routes.lock().await.push(ContentRoute {
+            pattern: pattern.into(),
+            response_text: response_text.into(),
+            tool_use: Some(RoutedToolUse {
+                tool_name: tool_name.into(),
+                input,
+            }),
         });
     }
 }
@@ -185,6 +222,9 @@ async fn handle_connection(
         .find(|route| raw_body.contains(&route.pattern))
         .cloned();
     if let Some(route) = matched_route {
+        // Token-count preflights never execute tools: they always get the
+        // plain-text shape even on a tool route.
+        let is_preflight = path.ends_with("/count_tokens");
         requests.lock().await.push(CapturedRequest {
             method,
             path,
@@ -193,7 +233,12 @@ async fn handle_connection(
             stream: request.stream,
             raw_body,
         });
-        let response = build_routed_response(&request, &route.response_text);
+        let response = match &route.tool_use {
+            Some(tool_use) if !is_preflight && latest_tool_result(&request).is_none() => {
+                build_routed_tool_response(&request, tool_use)
+            }
+            _ => build_routed_response(&request, &route.response_text),
+        };
         socket.write_all(response.as_bytes()).await?;
         return Ok(());
     }
@@ -213,6 +258,34 @@ async fn handle_connection(
     let response = build_http_response(&request, scenario);
     socket.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+/// The tool_use half of a tool route, in the transport the caller asked
+/// for. Ids are unique per response so parallel routed agents never collide.
+fn build_routed_tool_response(request: &MessageRequest, tool_use: &RoutedToolUse) -> String {
+    let tool_id = format!("toolu_route_{}", unique_message_id());
+    if request.stream {
+        let input_json = tool_use.input.to_string();
+        http_response(
+            "200 OK",
+            "text/event-stream",
+            &tool_use_sse(&tool_id, &tool_use.tool_name, &[input_json.as_str()]),
+            &[("x-request-id", "req_content_route_tool")],
+        )
+    } else {
+        let response = tool_message_response(
+            &unique_message_id(),
+            &tool_id,
+            &tool_use.tool_name,
+            tool_use.input.clone(),
+        );
+        http_response(
+            "200 OK",
+            "application/json",
+            &serde_json::to_string(&response).expect("message response should serialize"),
+            &[("request-id", "req_content_route_tool")],
+        )
+    }
 }
 
 /// A routed request is answered with a plain assistant text message, in the
@@ -1269,6 +1342,81 @@ mod tests {
         assert!(response.contains("text/event-stream"), "{response}");
         assert!(response.contains("documento de diseño"), "{response}");
         assert!(response.contains("message_stop"), "{response}");
+    }
+
+    /// A follow-up body: the assistant's tool_use turn plus the user's
+    /// tool_result, as the runtime would send after executing the tool.
+    fn tool_result_body(prompt: &str, tool_id: &str, tool_name: &str, result: &str) -> String {
+        json!({
+            "model": DEFAULT_MODEL,
+            "max_tokens": 512,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": prompt}]},
+                {"role": "assistant", "content": [{
+                    "type": "tool_use", "id": tool_id, "name": tool_name,
+                    "input": {"path": "src/x.css", "content": "x"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": tool_id,
+                    "content": [{"type": "text", "text": result}]
+                }]}
+            ],
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn tool_route_emits_the_tool_call_then_the_final_text() {
+        let server = MockAnthropicService::spawn().await.expect("spawn mock");
+        server
+            .route_tool_use(
+                "implementa la tarea",
+                "write_file",
+                json!({"path": "src/x.css", "content": "x"}),
+                "archivo entregado",
+            )
+            .await;
+
+        // First request (no tool_result yet): a write_file tool_use.
+        let first = post_messages(
+            &server.base_url(),
+            &request_body("implementa la tarea T1", false),
+        )
+        .await;
+        assert!(first.contains("tool_use"), "{first}");
+        assert!(first.contains("write_file"), "{first}");
+        assert!(first.contains("src/x.css"), "{first}");
+        assert!(!first.contains("archivo entregado"), "{first}");
+
+        // Follow-up carrying the tool result: the final text, no more tools.
+        let second = post_messages(
+            &server.base_url(),
+            &tool_result_body(
+                "implementa la tarea T1",
+                "toolu_route_1",
+                "write_file",
+                r#"{"filePath":"src/x.css"}"#,
+            ),
+        )
+        .await;
+        assert!(second.contains("archivo entregado"), "{second}");
+        assert!(second.contains("end_turn"), "{second}");
+
+        // Streaming first request gets the SSE transport.
+        let streamed = post_messages(
+            &server.base_url(),
+            &request_body("implementa la tarea otra vez", true),
+        )
+        .await;
+        assert!(streamed.contains("text/event-stream"), "{streamed}");
+        assert!(streamed.contains("write_file"), "{streamed}");
+        assert!(streamed.contains("input_json_delta"), "{streamed}");
+
+        let captured = server.captured_requests().await;
+        assert_eq!(captured.len(), 3);
+        assert!(captured
+            .iter()
+            .all(|request| request.scenario.starts_with(ROUTED_SCENARIO_PREFIX)));
     }
 
     #[tokio::test]

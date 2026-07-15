@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# pre-push hook: run the same fast gates as CI before anything leaves your
+# machine. Activate once per clone with:
+#
+#   git config core.hooksPath .githooks
+#
+# Steps (in order):
+#   1. scripts/fmt.sh --check                      (rustfmt, no build)
+#   2. .github/scripts/check_doc_source_of_truth.py
+#   3. .github/scripts/check_release_readiness.py
+#   4. .github/scripts/check_usage_commands.py
+#   5. cargo clippy --workspace --all-targets -- -D warnings
+#
+# Escape hatches:
+#   git push --no-verify           skip the whole hook for one push
+#   CLAW_PREPUSH_SKIP_CLIPPY=1     skip only the (slow) clippy step
+#
+# git invokes this hook with <remote> <url> as arguments and the ref list on
+# stdin; this hook ignores both — it always validates the working tree.
+
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)" || exit 1
+cd "${REPO_ROOT}" || exit 1
+
+PYTHON="${PYTHON:-python3}"
+
+fail() {
+    step="$1"
+    echo "" 1>&2
+    echo "pre-push: FAILED at step: ${step}" 1>&2
+    echo "pre-push: fix the issue above, or skip once with: git push --no-verify" 1>&2
+    exit 1
+}
+
+run_step() {
+    name="$1"
+    shift
+    echo "pre-push: ${name} ..."
+    "$@" || fail "${name}"
+}
+
+run_step "rustfmt check (scripts/fmt.sh --check)" scripts/fmt.sh --check
+run_step "doc source-of-truth check" "${PYTHON}" .github/scripts/check_doc_source_of_truth.py
+run_step "release readiness check" "${PYTHON}" .github/scripts/check_release_readiness.py
+run_step "USAGE.md slash-command check" "${PYTHON}" .github/scripts/check_usage_commands.py
+
+if [ "${CLAW_PREPUSH_SKIP_CLIPPY:-0}" = "1" ]; then
+    echo "pre-push: clippy SKIPPED (CLAW_PREPUSH_SKIP_CLIPPY=1)"
+else
+    echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings ..."
+    ( cd rust && CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets -- -D warnings ) \
+        || fail "cargo clippy (set CLAW_PREPUSH_SKIP_CLIPPY=1 to skip just this step)"
+fi
+
+echo "pre-push: all checks passed"
+exit 0

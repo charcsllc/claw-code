@@ -21,7 +21,105 @@ pub struct RetryNotice {
     pub attempt: u32,
     pub max_retries: u32,
     pub delay: std::time::Duration,
+    /// True when `delay` comes from the server's `Retry-After` response
+    /// header (429/503) rather than the generic exponential backoff, so the
+    /// REPL can render "retrying in Xs (Retry-After)".
+    pub from_retry_after: bool,
     pub error: String,
+}
+
+/// Clamp bounds applied to a server-provided `Retry-After` value so a
+/// malicious or misconfigured server can neither hammer us (0s) nor park a
+/// turn for an hour.
+const RETRY_AFTER_MIN_SECS: u64 = 1;
+const RETRY_AFTER_MAX_SECS: u64 = 120;
+
+/// Parses an HTTP `Retry-After` header value into a delay in seconds,
+/// clamped to `1..=120`. Supports both wire forms from RFC 9110:
+/// delta-seconds (`"30"`) and an HTTP-date (IMF-fixdate, e.g.
+/// `"Wed, 21 Oct 2015 07:28:00 GMT"`, resolved against the current wall
+/// clock). Missing, empty, or unparseable values return `None` so callers
+/// fall back to the generic backoff.
+#[must_use]
+pub fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    let now_unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    parse_retry_after_at(value, now_unix_secs)
+}
+
+/// Pure, clock-injected core of [`parse_retry_after`], testable without
+/// touching the wall clock.
+pub(crate) fn parse_retry_after_at(value: Option<&str>, now_unix_secs: u64) -> Option<u64> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let seconds = if let Ok(delta_seconds) = raw.parse::<u64>() {
+        delta_seconds
+    } else {
+        parse_http_date_unix(raw)?.saturating_sub(now_unix_secs)
+    };
+    Some(seconds.clamp(RETRY_AFTER_MIN_SECS, RETRY_AFTER_MAX_SECS))
+}
+
+/// Parses an IMF-fixdate (`"Sun, 06 Nov 1994 08:49:37 GMT"`) into unix
+/// seconds. Only the GMT fixdate form is supported; the obsolete RFC 850
+/// and asctime forms return `None`.
+fn parse_http_date_unix(raw: &str) -> Option<u64> {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    // ["Sun,", "06", "Nov", "1994", "08:49:37", "GMT"]
+    if parts.len() != 6 || !parts[5].eq_ignore_ascii_case("GMT") {
+        return None;
+    }
+    let day: u64 = parts[1].parse().ok()?;
+    let month: u64 = match parts[2].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts[3].parse().ok()?;
+    let mut clock = parts[4].split(':');
+    let hour: u64 = clock.next()?.parse().ok()?;
+    let minute: u64 = clock.next()?.parse().ok()?;
+    let second: u64 = clock.next()?.parse().ok()?;
+    if clock.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    let unix_seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::try_from(hour * 3_600 + minute * 60 + second).ok()?)?;
+    u64::try_from(unix_seconds).ok()
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian civil date
+/// (Howard Hinnant's `days_from_civil` algorithm).
+fn days_from_civil(year: i64, month: u64, day: u64) -> i64 {
+    let adjusted_year = if month <= 2 { year - 1 } else { year };
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400; // [0, 399]
+    let month_prime = i64::try_from((month + 9) % 12).unwrap_or(0); // [0, 11]
+    let day = i64::try_from(day).unwrap_or(1);
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1; // [0, 365]
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 type RetryNotifierFn = dyn Fn(&RetryNotice) + Send + Sync;
@@ -2084,5 +2182,82 @@ NO_EQUALS_LINE
         let payload = parts.next().unwrap();
         let padded = format!("{header}.{payload}==.sig");
         assert_eq!(jwt_expiry_unix(&padded), Some(42));
+    }
+
+    #[test]
+    fn parse_retry_after_handles_missing_empty_and_garbage() {
+        assert_eq!(super::parse_retry_after(None), None);
+        assert_eq!(super::parse_retry_after(Some("")), None);
+        assert_eq!(super::parse_retry_after(Some("   ")), None);
+        assert_eq!(super::parse_retry_after(Some("soon")), None);
+        assert_eq!(super::parse_retry_after(Some("-5")), None);
+        assert_eq!(super::parse_retry_after(Some("2.5")), None);
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_and_clamps_delta_seconds() {
+        assert_eq!(super::parse_retry_after(Some("30")), Some(30));
+        assert_eq!(super::parse_retry_after(Some(" 45 ")), Some(45));
+        // Clamped to the 1..=120 window.
+        assert_eq!(super::parse_retry_after(Some("0")), Some(1));
+        assert_eq!(super::parse_retry_after(Some("999999")), Some(120));
+        assert_eq!(super::parse_retry_after(Some("1")), Some(1));
+        assert_eq!(super::parse_retry_after(Some("120")), Some(120));
+    }
+
+    #[test]
+    fn parse_retry_after_at_supports_http_dates() {
+        // "Sun, 06 Nov 1994 08:49:37 GMT" == unix 784111777 (RFC 9110 example).
+        let header = "Sun, 06 Nov 1994 08:49:37 GMT";
+        // 60 seconds in the future.
+        assert_eq!(
+            super::parse_retry_after_at(Some(header), 784_111_777 - 60),
+            Some(60)
+        );
+        // In the past → clamped up to the 1s floor.
+        assert_eq!(
+            super::parse_retry_after_at(Some(header), 784_111_777 + 500),
+            Some(1)
+        );
+        // Far future → clamped down to 120s.
+        assert_eq!(
+            super::parse_retry_after_at(Some(header), 784_111_777 - 100_000),
+            Some(120)
+        );
+        // Case-insensitive GMT, exact boundary.
+        assert_eq!(
+            super::parse_retry_after_at(Some("Sun, 06 Nov 1994 08:49:37 gmt"), 784_111_777),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_at_rejects_malformed_http_dates() {
+        let now = 1_700_000_000;
+        assert_eq!(
+            super::parse_retry_after_at(Some("Sun, 06 Nov 1994 08:49:37 PST"), now),
+            None
+        );
+        assert_eq!(
+            super::parse_retry_after_at(Some("Sun, 06 Foo 1994 08:49:37 GMT"), now),
+            None
+        );
+        assert_eq!(
+            super::parse_retry_after_at(Some("Sun, 06 Nov 1994 08:49 GMT"), now),
+            None
+        );
+        assert_eq!(
+            super::parse_retry_after_at(Some("Sun, 32 Nov 1994 08:49:37 GMT"), now),
+            None
+        );
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_epochs() {
+        assert_eq!(super::days_from_civil(1970, 1, 1), 0);
+        assert_eq!(super::days_from_civil(1970, 1, 2), 1);
+        assert_eq!(super::days_from_civil(1969, 12, 31), -1);
+        // 2000-03-01 (leap year boundary) is unix day 11017.
+        assert_eq!(super::days_from_civil(2000, 3, 1), 11_017);
     }
 }

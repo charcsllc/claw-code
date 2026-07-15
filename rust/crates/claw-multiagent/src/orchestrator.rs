@@ -517,6 +517,10 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
 
         (plan, tasks)
     };
+    // Planning artifacts are on disk (either freshly generated or reused):
+    // from here on, relaunching the same command can resume instead of
+    // re-planning.
+    record_phase(&options.project_dir, PHASE_PLANNING);
 
     // Instruction files per model family (CLAUDE.md / AGENTS.md / GROK.md).
     // In Improve mode, never overwrite the user's existing files.
@@ -674,6 +678,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         "Fundación (contratos y design system)",
         &workflow,
     );
+    if greenfield {
+        record_phase(&options.project_dir, PHASE_FOUNDATION);
+    }
 
     // ---- Developer waves + Supervisor per delivery ----
     let mut state = BuildState::load(&options.project_dir);
@@ -967,6 +974,11 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         "Desarrollo y supervisión",
         &workflow,
     );
+    // An abort leaves the phase at its last completed value, so the resume
+    // offer names where the interrupted build actually stopped.
+    if !budget_aborted && !user_aborted {
+        record_phase(&options.project_dir, PHASE_DEVELOPMENT);
+    }
 
     // Full build gate at the end: per-delivery quick checks ran throughout,
     // this is the cross-module confirmation (with Fixer retry on failure).
@@ -1237,6 +1249,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         improve_branch: improve_branch.as_deref(),
     });
     let _ = save_doc(&docs, "SUMMARY.md", &summary_md);
+    if !budget_aborted && !user_aborted {
+        record_phase(&options.project_dir, PHASE_FINISHED);
+    }
 
     Ok(RunSummary {
         plan,
@@ -2480,15 +2495,48 @@ pub fn escalate(complexity: Complexity) -> Option<Complexity> {
 
 // ---------- Resume state (#5) ----------
 
+/// Pipeline phases persisted in `.multiagent/state.json` after each major
+/// stage, so relaunching the same greenfield command can offer to resume
+/// from the last completed phase instead of redoing everything. The values
+/// are user-facing (shown in the resume offer).
+pub const PHASE_PLANNING: &str = "planificación (plan.json y backlog.json guardados)";
+pub const PHASE_FOUNDATION: &str = "fundación (contratos y design system)";
+pub const PHASE_DEVELOPMENT: &str = "desarrollo (olas de desarrolladores)";
+pub const PHASE_FINISHED: &str = "finalizado";
+
+/// Records the last completed phase into the persisted build state
+/// (atomic temp+rename via [`BuildState::save`]).
+fn record_phase(project_dir: &Path, phase: &str) {
+    let mut state = BuildState::load(project_dir);
+    state.phase = Some(phase.to_string());
+    state.save(project_dir);
+}
+
+/// The phase a previous, interrupted build of `project_dir` reached, or
+/// `None` when there is nothing to resume (no saved state, or the build
+/// finished cleanly). Callers (the `/web`/`/app` REPL commands) use this to
+/// offer `--resume` before re-planning from scratch: the saved
+/// `docs/plan.json` / `docs/backlog.json` plus the completed-task set in
+/// `.multiagent/state.json` are the artifacts a resumed run reuses.
+#[must_use]
+pub fn pending_resume_phase(project_dir: &Path) -> Option<String> {
+    BuildState::load(project_dir)
+        .phase
+        .filter(|phase| phase != PHASE_FINISHED)
+}
+
 /// Tasks already completed (persisted after every supervised delivery so an
 /// interrupted build can resume without repeating work), plus the Improve
 /// work branch so a resumed run continues on the SAME branch instead of
-/// orphaning it with a fresh checkout.
+/// orphaning it with a fresh checkout, plus the last completed pipeline
+/// phase (greenfield resume offer).
 #[derive(Default)]
 pub struct BuildState {
     pub completed: BTreeSet<String>,
     pub improve_branch: Option<String>,
     pub base_branch: Option<String>,
+    /// Last completed pipeline phase (one of the `PHASE_*` constants).
+    pub phase: Option<String>,
 }
 
 impl BuildState {
@@ -2524,6 +2572,7 @@ impl BuildState {
             completed,
             improve_branch: field("improve_branch"),
             base_branch: field("base_branch"),
+            phase: field("phase"),
         }
     }
 
@@ -2546,6 +2595,12 @@ impl BuildState {
                     serde_json::Value::String(base.clone()),
                 );
             }
+        }
+        if let (Some(map), Some(phase)) = (payload.as_object_mut(), &self.phase) {
+            map.insert(
+                "phase".to_string(),
+                serde_json::Value::String(phase.clone()),
+            );
         }
         // Atomic temp+rename: a crash mid-write must not corrupt the resume
         // state — a truncated state.json would silently restart every task.
@@ -2701,8 +2756,17 @@ impl RoleSpendLedger {
     }
 }
 
-/// Attributes the spend since the last checkpoint to `role` and leaves an
-/// audit trail (log + dashboard event) for any role newly over its
+/// The live spend line printed when a phase checkpoint closes: this phase's
+/// spend plus the running total. Extracted so the exact format is testable
+/// (it is user-facing progress output).
+#[must_use]
+pub fn phase_spend_line(role: &str, delta_usd: f64, total_usd: f64) -> String {
+    format!("Gasto de la fase «{role}»: {delta_usd:.2} USD · total acumulado: {total_usd:.2} USD")
+}
+
+/// Attributes the spend since the last checkpoint to `role`, reports it
+/// live (this phase + running total, via the workflow log and a dashboard
+/// event), and leaves an audit trail for any role newly over its
 /// proportional quota. A no-op without telemetry (`spent()` is `None`).
 fn attribute_role_spend(
     budget: &Budget,
@@ -2717,6 +2781,18 @@ fn attribute_role_spend(
     let delta = total - *cursor;
     *cursor = total;
     ledger.record(role, delta);
+    // Live per-phase spend: printed at every checkpoint (even a 0.00 delta
+    // is signal — it says the phase was free), so the user watches the
+    // budget move instead of discovering the breakdown at the end.
+    workflow.phase(&phase_spend_line(role, delta.max(0.0), total));
+    workflow.event(
+        "phase_spend",
+        &[
+            ("phase", role.to_string()),
+            ("delta_usd", format!("{:.2}", delta.max(0.0))),
+            ("total_usd", format!("{total:.2}")),
+        ],
+    );
     let Some(ceiling) = budget.ceiling() else {
         return;
     };
@@ -3920,6 +3996,83 @@ mod tests {
         assert_eq!(reloaded.improve_branch, None);
         assert_eq!(reloaded.base_branch, None);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_state_round_trips_phase_and_offers_resume_only_when_pending() {
+        let dir = improve_temp_dir("phase");
+
+        // No state at all: nothing to resume.
+        assert_eq!(pending_resume_phase(&dir), None);
+        assert_eq!(BuildState::load(&dir).phase, None);
+
+        // A recorded phase round-trips and is offered for resume.
+        record_phase(&dir, PHASE_PLANNING);
+        assert_eq!(
+            BuildState::load(&dir).phase.as_deref(),
+            Some(PHASE_PLANNING)
+        );
+        assert_eq!(pending_resume_phase(&dir), Some(PHASE_PLANNING.to_string()));
+
+        // Recording a later phase must preserve the completed-task set
+        // (record_phase is load-modify-save, not overwrite).
+        let mut state = BuildState::load(&dir);
+        state.completed.insert("T1".to_string());
+        state.save(&dir);
+        record_phase(&dir, PHASE_DEVELOPMENT);
+        let loaded = BuildState::load(&dir);
+        assert!(loaded.completed.contains("T1"), "completed set preserved");
+        assert_eq!(loaded.phase.as_deref(), Some(PHASE_DEVELOPMENT));
+
+        // A finished build must NOT trigger the resume offer.
+        record_phase(&dir, PHASE_FINISHED);
+        assert_eq!(pending_resume_phase(&dir), None);
+
+        // The write is atomic: no stray temp file is left behind.
+        assert!(!dir.join(".multiagent/state.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_spend_is_reported_live_at_each_checkpoint() {
+        let dir = improve_temp_dir("phasespend");
+        let events = dir.join("events.jsonl");
+        let event = |cost: f64| {
+            format!(
+                r#"{{"type":"session_trace","session_id":"x","sequence":0,"name":"analytics","timestamp_ms":1,"attributes":{{"namespace":"api","action":"message_usage","estimated_cost_usd_value":{cost}}}}}"#
+            )
+        };
+        std::fs::write(&events, format!("{}\n", event(0.25))).expect("events");
+        let budget = Budget {
+            ceiling: None,
+            events_path: Some(events.clone()),
+            baseline: 0.0,
+        };
+        let workflow = WorkflowLog { tracer: None };
+        let mut ledger = RoleSpendLedger::default();
+        let mut cursor = 0.0;
+
+        // First checkpoint: 0.25 USD attributed to the Director.
+        attribute_role_spend(&budget, &mut cursor, &mut ledger, "Director", &workflow);
+        assert!((cursor - 0.25).abs() < 1e-9, "cursor advances to the total");
+
+        // Second checkpoint: 0.50 more, attributed to the Arquitectos.
+        let mut content = std::fs::read_to_string(&events).expect("read");
+        content.push_str(&format!("{}\n", event(0.5)));
+        std::fs::write(&events, content).expect("append");
+        attribute_role_spend(&budget, &mut cursor, &mut ledger, "Arquitectos", &workflow);
+        assert!((cursor - 0.75).abs() < 1e-9);
+        let breakdown = ledger.breakdown();
+        assert_eq!(breakdown.len(), 2, "{breakdown:?}");
+        assert!((breakdown[0].1 - 0.50).abs() < 1e-9, "{breakdown:?}");
+
+        // The live line format is a user-facing contract: phase spend AND
+        // running total, both to two decimals.
+        assert_eq!(
+            phase_spend_line("Arquitectos", 0.5, 0.75),
+            "Gasto de la fase «Arquitectos»: 0.50 USD · total acumulado: 0.75 USD"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

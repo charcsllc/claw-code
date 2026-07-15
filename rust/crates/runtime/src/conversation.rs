@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -17,6 +19,11 @@ use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+
+/// Error message used when a turn is aborted by a cancellation flag, so
+/// callers can recognise cooperative cancellation without a dedicated error
+/// variant.
+pub const TURN_CANCELLED_MESSAGE: &str = "conversation turn cancelled by cancellation request";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    cancellation_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -189,6 +197,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            cancellation_flag: None,
         }
     }
 
@@ -230,6 +239,22 @@ where
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
         self
+    }
+
+    /// Installs a shared cancellation flag. `run_turn` checks it between
+    /// loop iterations and between tool calls and aborts cooperatively
+    /// (with [`TURN_CANCELLED_MESSAGE`]) when it is set; an in-flight API
+    /// request or tool call always finishes first.
+    #[must_use]
+    pub fn with_cancellation_flag(mut self, cancellation_flag: Arc<AtomicBool>) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
+        self
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -353,6 +378,11 @@ where
 
         loop {
             iterations += 1;
+            if self.cancellation_requested() {
+                let error = RuntimeError::new(TURN_CANCELLED_MESSAGE);
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
@@ -416,6 +446,13 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                // Cooperative cancellation between tool calls: pending tools
+                // that have not started yet are skipped when the flag flips.
+                if self.cancellation_requested() {
+                    let error = RuntimeError::new(TURN_CANCELLED_MESSAGE);
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -851,6 +888,7 @@ mod tests {
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        TURN_CANCELLED_MESSAGE,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -935,6 +973,33 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    /// API client that must never be reached (cancellation aborts first).
+    struct UnreachableApiClient;
+
+    impl ApiClient for UnreachableApiClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            panic!("cancelled turn must not call the API");
+        }
+    }
+
+    #[test]
+    fn run_turn_aborts_between_iterations_when_cancellation_flag_is_set() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnreachableApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec![String::from("system prompt")],
+        )
+        .with_cancellation_flag(Arc::clone(&flag));
+
+        let error = runtime
+            .run_turn("do things", None)
+            .expect_err("pre-set cancellation flag must abort the turn");
+        assert_eq!(error.to_string(), TURN_CANCELLED_MESSAGE);
     }
 
     #[test]
