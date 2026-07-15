@@ -2470,7 +2470,16 @@ mod tests {
                 } => {
                     assert_eq!(server_name, "alpha");
                     assert_eq!(method, "tools/call");
-                    assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
+                    // Depending on write-vs-exit timing the dead child
+                    // surfaces as EOF (read side) or BrokenPipe (write side).
+                    assert!(
+                        matches!(
+                            source.kind(),
+                            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
+                        ),
+                        "expected EOF or broken pipe, got {:?}",
+                        source.kind()
+                    );
                 }
                 other => panic!("expected transport error, got {other:?}"),
             }
@@ -2600,7 +2609,16 @@ mod tests {
                 } => {
                     assert_eq!(server_name, "alpha");
                     assert_eq!(method, "tools/call");
-                    assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
+                    // Depending on write-vs-exit timing the dead child
+                    // surfaces as EOF (read side) or BrokenPipe (write side).
+                    assert!(
+                        matches!(
+                            source.kind(),
+                            ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe
+                        ),
+                        "expected EOF or broken pipe, got {:?}",
+                        source.kind()
+                    );
                 }
                 other => panic!("expected transport error, got {other:?}"),
             }

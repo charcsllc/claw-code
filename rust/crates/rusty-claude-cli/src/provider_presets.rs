@@ -1,0 +1,568 @@
+//! Provider presets: one-command configuration for every supported backend
+//! (`/provider use zhipu <token>`) and the startup glue that makes the
+//! provider saved in `~/.claw/settings.json` actually take effect.
+//!
+//! Historically `/setup` persisted `provider.{kind,apiKey,baseUrl}` but
+//! nothing consumed it: the API clients read only environment variables, so
+//! the wizard's promise was empty. [`apply_saved_provider_settings`] closes
+//! that gap by exporting the saved credentials as env vars at startup —
+//! with the environment always winning over the file, so `ANTHROPIC_API_KEY=x
+//! claw` still behaves as expected.
+
+use runtime::{save_user_provider_settings, ConfigLoader, RuntimeProviderConfig};
+
+/// A supported provider preset: which env vars carry its credentials and
+/// the defaults that make `use <preset> <key>` a one-liner.
+pub(crate) struct ProviderPreset {
+    /// The `provider.kind` value persisted in settings.json.
+    pub kind: &'static str,
+    /// Human-readable label for `/provider` output.
+    pub label: &'static str,
+    /// Env var that receives the API key/token (empty = keyless, e.g. ollama).
+    pub key_env: &'static str,
+    /// Env var that receives the base URL (empty = provider has none).
+    pub base_url_env: &'static str,
+    /// Base URL applied when the user does not pass one (empty = none).
+    pub default_base_url: &'static str,
+    /// Suggested default model (persisted unless the user names one).
+    pub default_model: &'static str,
+}
+
+/// Every preset `/provider use` understands. The Chinese coding providers
+/// (zhipu/kimi) speak the Anthropic protocol, so their tokens ride
+/// `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`; deepseek is
+/// OpenAI-compatible.
+pub(crate) const PROVIDER_PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        kind: "anthropic",
+        label: "Anthropic",
+        key_env: "ANTHROPIC_API_KEY",
+        base_url_env: "ANTHROPIC_BASE_URL",
+        default_base_url: "",
+        default_model: "",
+    },
+    ProviderPreset {
+        kind: "zhipu",
+        label: "Zhipu / Z.ai (GLM)",
+        key_env: "ANTHROPIC_AUTH_TOKEN",
+        base_url_env: "ANTHROPIC_BASE_URL",
+        default_base_url: "https://api.z.ai/api/anthropic",
+        default_model: "glm-4.6",
+    },
+    ProviderPreset {
+        kind: "kimi",
+        label: "Moonshot / Kimi",
+        key_env: "ANTHROPIC_AUTH_TOKEN",
+        base_url_env: "ANTHROPIC_BASE_URL",
+        default_base_url: "https://api.moonshot.ai/anthropic",
+        default_model: "kimi-k2-0905-preview",
+    },
+    ProviderPreset {
+        kind: "deepseek",
+        label: "DeepSeek",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "https://api.deepseek.com",
+        default_model: "deepseek-chat",
+    },
+    ProviderPreset {
+        kind: "dashscope",
+        label: "Alibaba DashScope (Qwen)",
+        key_env: "DASHSCOPE_API_KEY",
+        base_url_env: "",
+        default_base_url: "",
+        default_model: "qwen-max",
+    },
+    ProviderPreset {
+        kind: "openai",
+        label: "OpenAI",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "",
+        default_model: "",
+    },
+    ProviderPreset {
+        kind: "xai",
+        label: "xAI / Grok",
+        key_env: "XAI_API_KEY",
+        base_url_env: "XAI_BASE_URL",
+        default_base_url: "",
+        default_model: "grok",
+    },
+    ProviderPreset {
+        kind: "openrouter",
+        label: "OpenRouter (multi-modelo, OpenAI-compat)",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "https://openrouter.ai/api/v1",
+        default_model: "",
+    },
+    ProviderPreset {
+        kind: "groq",
+        label: "Groq (inferencia rápida, OpenAI-compat)",
+        key_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: "https://api.groq.com/openai/v1",
+        default_model: "",
+    },
+    ProviderPreset {
+        kind: "ollama",
+        label: "Ollama (local, keyless)",
+        key_env: "",
+        base_url_env: "OLLAMA_HOST",
+        default_base_url: "http://127.0.0.1:11434",
+        default_model: "",
+    },
+];
+
+pub(crate) fn preset_for(kind: &str) -> Option<&'static ProviderPreset> {
+    let normalized = kind.trim().to_ascii_lowercase();
+    // Common aliases users will reasonably try.
+    let normalized = match normalized.as_str() {
+        "z.ai" | "zai" | "glm" => "zhipu",
+        "moonshot" => "kimi",
+        "qwen" | "alibaba" => "dashscope",
+        "grok" => "xai",
+        "or" => "openrouter",
+        other => other,
+    };
+    PROVIDER_PRESETS
+        .iter()
+        .find(|preset| preset.kind == normalized)
+}
+
+/// Distinct provider credential env vars that are set right now (saved
+/// settings are exported to env at startup, so this sees both sources).
+/// Several presets share a var (e.g. OPENAI_API_KEY), hence vars, not kinds.
+pub(crate) fn credentialed_env_vars() -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| preset.key_env)
+        .filter(|var| !var.is_empty())
+        .collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.retain(|var| env_is_set(var));
+    vars
+}
+
+fn env_is_set(name: &str) -> bool {
+    !name.is_empty()
+        && std::env::var(name)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+}
+
+/// Exports a provider's credentials as env vars. With `force` false (startup
+/// path) an already-set env var always wins over the saved file; with
+/// `force` true (`/provider use` in-session) the new choice takes effect
+/// immediately.
+pub(crate) fn apply_provider_env(
+    preset: &ProviderPreset,
+    api_key: Option<&str>,
+    base_url: Option<&str>,
+    force: bool,
+) {
+    if !preset.key_env.is_empty() {
+        if let Some(key) = api_key.map(str::trim).filter(|key| !key.is_empty()) {
+            if force || !env_is_set(preset.key_env) {
+                std::env::set_var(preset.key_env, key);
+            }
+        }
+    }
+    if !preset.base_url_env.is_empty() {
+        let url = base_url
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(preset.default_base_url);
+        if !url.is_empty() && (force || !env_is_set(preset.base_url_env)) {
+            std::env::set_var(preset.base_url_env, url);
+        }
+    }
+}
+
+/// Startup glue: reads the provider saved in the merged settings and exports
+/// it to the environment so the API clients (which are env-driven) see it.
+/// Env vars already present always win. Silent on every failure — a broken
+/// settings file must not stop the CLI from starting (it is reported by
+/// /doctor and the config loader elsewhere).
+pub(crate) fn apply_saved_provider_settings() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(config) = ConfigLoader::default_for(&cwd).load() else {
+        return;
+    };
+    let provider: &RuntimeProviderConfig = config.provider();
+    let Some(kind) = provider.kind() else {
+        return;
+    };
+    let Some(preset) = preset_for(kind) else {
+        return;
+    };
+    apply_provider_env(preset, provider.api_key(), provider.base_url(), false);
+}
+
+/// Handles the `/provider` REPL command. Returns the message to print.
+pub(crate) fn handle_provider_command(args: Option<&str>) -> String {
+    let args = args.unwrap_or("").trim();
+    let mut tokens = args.split_whitespace();
+    match tokens.next() {
+        None | Some("show") => render_provider_show(),
+        Some("list") => render_provider_list(),
+        Some("clear") => match runtime::clear_user_provider_settings() {
+            Ok(()) => "Provider\n  Action           clear\n  Status           ok\n  Note             saved provider removed; env vars (if any) still apply".to_string(),
+            Err(error) => format!("Provider\n  Error            {error}"),
+        },
+        Some("use") => {
+            let Some(kind) = tokens.next() else {
+                return format!("Provider\n  Error            'use' expects a provider\n{}", provider_usage());
+            };
+            let Some(preset) = preset_for(kind) else {
+                return format!(
+                    "Provider\n  Error            unknown provider '{kind}'\n{}",
+                    provider_usage()
+                );
+            };
+            let key = tokens.next().map(ToString::to_string);
+            let model = tokens.next().map(ToString::to_string);
+            if preset.key_env.is_empty() {
+                // Keyless providers (ollama): the "key" slot, if present,
+                // is actually a base URL override.
+                let base_override = key.clone();
+                apply_provider_env(preset, None, base_override.as_deref(), true);
+                let base = base_override.unwrap_or_else(|| preset.default_base_url.to_string());
+                match save_user_provider_settings(preset.kind, "", Some(&base), model.as_deref()) {
+                    Ok(()) => {}
+                    Err(error) => return format!("Provider\n  Error            {error}"),
+                }
+                return format!(
+                    "Provider\n  Action           use\n  Status           ok\n  Provider         {} ({})\n  Base URL         {}\n  Applied          now + persisted (~/.claw/settings.json)",
+                    preset.label, preset.kind, base
+                );
+            }
+            let Some(key) = key.filter(|key| !key.trim().is_empty()) else {
+                return format!(
+                    "Provider\n  Error            'use {}' expects an API key/token\n{}",
+                    preset.kind,
+                    provider_usage()
+                );
+            };
+            // Catch pasted placeholders before persisting them: "<token>",
+            // "TU-TOKEN", "..." would silently poison the saved settings.
+            if key.contains('<') || key.contains('>') || key == "..." || key.len() < 8 {
+                return format!(
+                    "Provider\n  Error            '{}' parece un placeholder, no una clave real — pega el token completo de tu cuenta",
+                    mask_key(&key)
+                );
+            }
+            let model_to_save = model.clone().or_else(|| {
+                (!preset.default_model.is_empty()).then(|| preset.default_model.to_string())
+            });
+            let base_url = (!preset.default_base_url.is_empty())
+                .then_some(preset.default_base_url);
+            if let Err(error) =
+                save_user_provider_settings(preset.kind, &key, base_url, model_to_save.as_deref())
+            {
+                return format!("Provider\n  Error            {error}");
+            }
+            apply_provider_env(preset, Some(&key), base_url, true);
+            format!(
+                "Provider\n  Action           use\n  Status           ok\n  Provider         {} ({})\n  Credential       {} = {}\n  Base URL         {}\n  Model            {}\n  Applied          now + persisted (~/.claw/settings.json, 0600)",
+                preset.label,
+                preset.kind,
+                preset.key_env,
+                mask_key(&key),
+                base_url.unwrap_or("provider default"),
+                model_to_save.as_deref().unwrap_or("(unchanged)")
+            )
+        }
+        Some(other) => format!(
+            "Provider\n  Error            unknown action '{other}'\n{}",
+            provider_usage()
+        ),
+    }
+}
+
+fn provider_usage() -> String {
+    let kinds = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| preset.kind)
+        .collect::<Vec<_>>()
+        .join("|");
+    format!(
+        "  Usage            /provider [show|list]\n                   /provider use <{kinds}> <api-key> [model]\n                   /provider use ollama [base-url] [model]\n                   /provider test [model]   (live 1-token connectivity check)\n                   /provider clear"
+    )
+}
+
+fn render_provider_list() -> String {
+    let saved_kind = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .and_then(|config| config.provider().kind().map(ToString::to_string));
+    let mut out = String::from("Provider\n  Presets:\n");
+    for preset in PROVIDER_PRESETS {
+        let marker = if saved_kind.as_deref() == Some(preset.kind) {
+            "  ← saved"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "    {:<10} {} — {}{}{}{marker}\n",
+            preset.kind,
+            preset.label,
+            if preset.key_env.is_empty() {
+                "keyless".to_string()
+            } else {
+                preset.key_env.to_string()
+            },
+            if preset.default_base_url.is_empty() {
+                String::new()
+            } else {
+                format!(" @ {}", preset.default_base_url)
+            },
+            if preset.default_model.is_empty() {
+                String::new()
+            } else {
+                format!(" · modelo {}", preset.default_model)
+            }
+        ));
+    }
+    out.push_str(&provider_usage());
+    out
+}
+
+fn render_provider_show() -> String {
+    let saved = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(&cwd).load().ok())
+        .map(|config| config.provider().clone());
+    let mut out = String::from("Provider\n");
+    match saved {
+        Some(provider) if provider.kind().is_some() => {
+            let kind = provider.kind().unwrap_or("?");
+            let label = preset_for(kind).map_or(kind, |preset| preset.label);
+            out.push_str(&format!("  Saved            {label} ({kind})\n"));
+            // The startup wiring never overwrites an env var the user set
+            // themselves — make that priority visible instead of implied.
+            if let Some(preset) = preset_for(kind) {
+                if !preset.key_env.is_empty() && env_is_set(preset.key_env) {
+                    out.push_str(&format!(
+                        "  Note             {} is set in your shell and takes priority over the saved key\n",
+                        preset.key_env
+                    ));
+                }
+            }
+            if let Some(url) = provider.base_url() {
+                out.push_str(&format!("  Base URL         {url}\n"));
+            }
+            if let Some(model) = provider.model() {
+                out.push_str(&format!("  Model            {model}\n"));
+            }
+            if let Some(key) = provider.api_key() {
+                out.push_str(&format!("  Key              {}\n", mask_key(key)));
+            }
+        }
+        _ => out.push_str("  Saved            (none)\n"),
+    }
+    // Live environment view: what the API clients will actually use.
+    out.push_str("  Active env:\n");
+    for env in [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "DASHSCOPE_API_KEY",
+        "XAI_API_KEY",
+        "OLLAMA_HOST",
+    ] {
+        if let Ok(value) = std::env::var(env) {
+            if !value.trim().is_empty() {
+                let shown = if env.ends_with("URL") || env == "OLLAMA_HOST" {
+                    value
+                } else {
+                    mask_key(&value)
+                };
+                out.push_str(&format!("    {env} = {shown}\n"));
+            }
+        }
+    }
+    if let Some(warning) = jwt_expiry_warning() {
+        out.push_str(&format!("  {warning}\n"));
+    }
+    out.push_str(&provider_usage());
+    out
+}
+
+/// Some providers issue JWT credentials with an embedded expiry (Z.ai
+/// coding-plan tokens, for example). Warn before the first failed turn,
+/// not after: expired now, or expiring within a week.
+pub(crate) fn jwt_expiry_warning() -> Option<String> {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+    .ok()?;
+    let mut vars: Vec<&'static str> = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| preset.key_env)
+        .filter(|var| !var.is_empty())
+        .collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.into_iter().find_map(|var| {
+        let value = std::env::var(var).ok()?;
+        let exp = api::jwt_expiry_unix(value.trim())?;
+        jwt_expiry_message(var, exp, now)
+    })
+}
+
+/// Pure core of [`jwt_expiry_warning`], testable without env or clock.
+fn jwt_expiry_message(var: &str, exp_unix: i64, now_unix: i64) -> Option<String> {
+    if exp_unix <= now_unix {
+        return Some(format!(
+            "⚠ el token en {var} es un JWT ya expirado — renueva la credencial (/provider use)"
+        ));
+    }
+    let days = (exp_unix - now_unix) / 86_400;
+    (days < 7).then(|| {
+        format!("⚠ el token en {var} expira en {days} día(s) — renueva pronto (/provider use)")
+    })
+}
+
+/// One-line description of the credential source the API clients will pick
+/// up, plus the effective base URL — mirrors the env-first resolution order
+/// (auth token, then per-protocol keys). Surfaced by `/status`.
+pub(crate) fn active_provider_summary() -> (String, String) {
+    let set = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let anthropic_url =
+        || set("ANTHROPIC_BASE_URL").unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    if set("ANTHROPIC_AUTH_TOKEN").is_some() {
+        return (
+            "Anthropic protocol (ANTHROPIC_AUTH_TOKEN)".to_string(),
+            anthropic_url(),
+        );
+    }
+    if set("ANTHROPIC_API_KEY").is_some() {
+        return ("Anthropic (ANTHROPIC_API_KEY)".to_string(), anthropic_url());
+    }
+    if set("OPENAI_API_KEY").is_some() {
+        return (
+            "OpenAI-compatible (OPENAI_API_KEY)".to_string(),
+            set("OPENAI_BASE_URL").unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+        );
+    }
+    if set("XAI_API_KEY").is_some() {
+        return (
+            "xAI (XAI_API_KEY)".to_string(),
+            set("XAI_BASE_URL").unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
+        );
+    }
+    if set("DASHSCOPE_API_KEY").is_some() {
+        return (
+            "DashScope (DASHSCOPE_API_KEY)".to_string(),
+            set("DASHSCOPE_BASE_URL")
+                .unwrap_or_else(|| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()),
+        );
+    }
+    if let Some(host) = set("OLLAMA_HOST") {
+        return ("Ollama (OLLAMA_HOST)".to_string(), host);
+    }
+    (
+        "none — set an API key or run /provider use <preset> <key>".to_string(),
+        "-".to_string(),
+    )
+}
+
+/// Masks a credential to its last four characters (char-safe).
+fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 4 {
+        return "****".to_string();
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("****{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_resolve_by_kind_and_alias() {
+        assert_eq!(preset_for("zhipu").expect("zhipu").kind, "zhipu");
+        assert_eq!(preset_for("z.ai").expect("alias").kind, "zhipu");
+        assert_eq!(preset_for("GLM").expect("case+alias").kind, "zhipu");
+        assert_eq!(preset_for("qwen").expect("qwen").kind, "dashscope");
+        assert_eq!(preset_for("moonshot").expect("moonshot").kind, "kimi");
+        assert_eq!(preset_for("or").expect("alias").kind, "openrouter");
+        let openrouter = preset_for("openrouter").expect("openrouter");
+        assert_eq!(openrouter.key_env, "OPENAI_API_KEY");
+        assert!(openrouter.default_base_url.contains("openrouter.ai"));
+        let groq = preset_for("groq").expect("groq");
+        assert!(groq.default_base_url.contains("api.groq.com/openai"));
+        assert!(preset_for("nope").is_none());
+    }
+
+    #[test]
+    fn zhipu_and_kimi_ride_the_anthropic_protocol() {
+        for kind in ["zhipu", "kimi"] {
+            let preset = preset_for(kind).expect(kind);
+            assert_eq!(preset.key_env, "ANTHROPIC_AUTH_TOKEN");
+            assert_eq!(preset.base_url_env, "ANTHROPIC_BASE_URL");
+            assert!(!preset.default_base_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn provider_use_rejects_placeholder_keys() {
+        for placeholder in ["<token>", "TU-<CLAVE>", "...", "corta"] {
+            let output = handle_provider_command(Some(&format!("use zhipu {placeholder}")));
+            assert!(
+                output.contains("placeholder"),
+                "'{placeholder}' should be rejected: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_key_is_char_safe_and_short() {
+        assert_eq!(mask_key("abc"), "****");
+        assert_eq!(mask_key("sk-ant-123456"), "****3456");
+        // Multibyte: must not panic and must keep the last 4 chars.
+        assert_eq!(mask_key("clave€€€€"), "****€€€€");
+    }
+
+    #[test]
+    fn usage_mentions_every_preset() {
+        let usage = provider_usage();
+        for preset in PROVIDER_PRESETS {
+            assert!(usage.contains(preset.kind), "usage lists {}", preset.kind);
+        }
+    }
+
+    #[test]
+    fn jwt_expiry_message_warns_only_near_or_past_expiry() {
+        let now = 1_750_000_000;
+        let day = 86_400;
+        // Expired: hard warning.
+        let expired = jwt_expiry_message("ANTHROPIC_AUTH_TOKEN", now - day, now)
+            .expect("expired token warns");
+        assert!(expired.contains("expirado"));
+        assert!(expired.contains("ANTHROPIC_AUTH_TOKEN"));
+        // Expiring in 3 days: soft warning with the count.
+        let soon =
+            jwt_expiry_message("OPENAI_API_KEY", now + 3 * day, now).expect("soon token warns");
+        assert!(soon.contains("3 día(s)"));
+        // Comfortable margin: silence.
+        assert!(jwt_expiry_message("OPENAI_API_KEY", now + 30 * day, now).is_none());
+    }
+}

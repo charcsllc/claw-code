@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claw · tokens y agentes</title>
+<style>
+  :root {
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --series-in: #2a78d6;   /* entrada: azul, slot 1 */
+    --series-out: #1baf7a;  /* salida: aqua, slot 2 */
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-serious: #ec835a;
+    --status-critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-in: #3987e5;
+      --series-out: #199e70;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--page);
+    color: var(--text-primary);
+    padding: 20px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  header h1 { font-size: 18px; font-weight: 650; }
+  #conn { font-size: 12.5px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px; }
+  #conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--status-good); }
+  #conn.offline .dot { background: var(--status-critical); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .tile .k { font-size: 12px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+  .tile .k .swatch { width: 9px; height: 9px; border-radius: 2px; }
+  .tile .v { font-size: 24px; font-weight: 650; margin-top: 2px; }
+  .tile .s { font-size: 11.5px; color: var(--text-muted); margin-top: 2px; }
+
+  .panel {
+    background: var(--surface-1);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend { display: flex; gap: 14px; font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .sw { width: 14px; height: 3px; border-radius: 2px; }
+
+  #chartwrap { position: relative; overflow-x: auto; }
+  #tooltip {
+    position: absolute; pointer-events: none; display: none;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; font-size: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.12);
+    white-space: nowrap; z-index: 3;
+  }
+  #tooltip .t { color: var(--text-muted); margin-bottom: 3px; }
+  #tooltip .row { display: flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+  #tooltip .row b { color: var(--text-primary); font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 12px; }
+  #tooltip .sw { width: 8px; height: 8px; border-radius: 2px; }
+
+  .counts { font-size: 12.5px; color: var(--text-secondary); display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+  .counts b { color: var(--text-primary); }
+
+  .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; display: flex; flex-direction: column; gap: 8px;
+  }
+  .card .top { display: flex; align-items: center; gap: 8px; }
+  .card .name { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .badge {
+    font-size: 11.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+  .badge .ic { font-size: 11px; line-height: 1; }
+  .badge.running .ic { color: var(--series-in); animation: pulse 1.2s ease-in-out infinite; }
+  .badge.completed .ic { color: var(--status-good); }
+  .badge.failed .ic { color: var(--status-critical); }
+  .badge.blocked .ic { color: var(--status-serious); }
+  .badge.idle .ic { color: var(--text-muted); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .card .meta { font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .card td { padding: 2px 0; color: var(--text-secondary); }
+  .card td:last-child { text-align: right; color: var(--text-primary); font-variant-numeric: tabular-nums; }
+  .card .action { font-size: 11.5px; color: var(--text-muted); border-top: 1px solid var(--grid); padding-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stalewarn { color: var(--status-warning); }
+
+  .wf-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .wf-kind {
+    font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+    background: var(--series-in); color: #fff; border-radius: 6px; padding: 2px 8px;
+  }
+  #workflow.done .wf-kind { background: var(--status-good); }
+  .wf-phase { font-size: 14px; font-weight: 600; }
+  #workflow:not(.done) .wf-phase::after {
+    content: "…"; animation: pulse 1.2s ease-in-out infinite; display: inline-block;
+  }
+  .wf-meta { font-size: 12px; color: var(--text-muted); margin-top: 6px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #empty { text-align: center; color: var(--text-secondary); padding: 30px 10px; font-size: 13.5px; line-height: 1.7; }
+  #empty code {
+    background: var(--page); border: 1px solid var(--border); border-radius: 6px;
+    padding: 2px 7px; font-size: 12px; color: var(--text-primary);
+  }
+  svg text { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  svg .endlabel { font-size: 11.5px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>claw · consumo de tokens y agentes</h1>
+  <span id="conn"><span class="dot"></span><span id="connText">conectando…</span></span>
+</header>
+
+<div class="panel" id="workflow" hidden>
+  <h2>Workflow multiagente</h2>
+  <div class="wf-top">
+    <span class="wf-kind" id="wfKind"></span>
+    <span class="wf-phase" id="wfPhase"></span>
+  </div>
+  <div class="wf-meta" id="wfMeta"></div>
+</div>
+
+<div class="tiles">
+  <div class="tile"><div class="k"><span class="swatch" style="background:var(--series-in)"></span>Tokens de entrada</div><div class="v" id="tIn">–</div><div class="s" id="tInSub"></div></div>
+  <div class="tile"><div class="k"><span class="swatch" style="background:var(--series-out)"></span>Tokens de salida</div><div class="v" id="tOut">–</div><div class="s" id="tOutSub"></div></div>
+  <div class="tile"><div class="k">Caché (lectura)</div><div class="v" id="tCacheR">–</div><div class="s" id="tCacheC"></div></div>
+  <div class="tile"><div class="k">Coste estimado</div><div class="v" id="tCost">–</div><div class="s" id="tTotals"></div></div>
+</div>
+
+<div class="panel">
+  <h2>Tokens acumulados en el tiempo</h2>
+  <div class="legend">
+    <span><span class="sw" style="background:var(--series-in)"></span>Entrada (incl. caché)</span>
+    <span><span class="sw" style="background:var(--series-out)"></span>Salida</span>
+  </div>
+  <div id="chartwrap">
+    <svg id="chart" width="100%" height="220" role="img" aria-label="Tokens acumulados de entrada y salida en el tiempo"></svg>
+    <div id="tooltip"></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Agentes</h2>
+  <div class="counts" id="counts"></div>
+  <div class="agents" id="agents"></div>
+  <div id="empty" hidden>
+    Sin actividad todavía.<br>
+    Arranca claw con <code>CLAW_DASHBOARD_EVENTS=.claw/telemetry/events.jsonl claw</code><br>
+    y este panel se actualizará en vivo. Varios claw en paralelo aparecerán como tarjetas separadas.
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const nfmt = new Intl.NumberFormat("es-ES");
+const compact = n => n >= 1e6 ? (n / 1e6).toFixed(2) + " M" : n >= 1e4 ? (n / 1e3).toFixed(1) + " k" : nfmt.format(n);
+const timeFmt = new Intl.DateTimeFormat("es-ES", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+const STATUS = {
+  running:   { ic: "●", label: "Ejecutando" },
+  completed: { ic: "✓", label: "Finalizado" },
+  failed:    { ic: "✕", label: "Fallido" },
+  blocked:   { ic: "⏸", label: "Bloqueado" },
+  idle:      { ic: "○", label: "Inactivo" },
+};
+
+let history = [];
+let pollTimer = null;
+
+function markOnline(snap) {
+  $("conn").classList.remove("offline");
+  $("connText").textContent = "en vivo · " + timeFmt.format(new Date(snap.generated_ms));
+}
+function markOffline() {
+  $("conn").classList.add("offline");
+  $("connText").textContent = "sin conexión con claw-dashboard";
+}
+
+async function tick() {
+  let snap;
+  try {
+    const res = await fetch("/api/state", { cache: "no-store" });
+    snap = await res.json();
+    markOnline(snap);
+  } catch {
+    markOffline();
+    return;
+  }
+  render(snap);
+}
+
+// Preferred transport: SSE push (the server emits only on changes).
+// Falls back to 1s polling if EventSource fails or is unavailable.
+function startPolling() {
+  if (!pollTimer) {
+    tick();
+    pollTimer = setInterval(tick, 1000);
+  }
+}
+function connect() {
+  if (!window.EventSource) { startPolling(); return; }
+  const source = new EventSource("/api/stream");
+  source.onmessage = ev => {
+    try {
+      const snap = JSON.parse(ev.data);
+      markOnline(snap);
+      render(snap);
+    } catch { /* ignore malformed frame */ }
+  };
+  source.onerror = () => {
+    markOffline();
+    source.close();
+    startPolling();
+  };
+}
+
+function render(snap) {
+  const wf = snap.workflow;
+  $("workflow").hidden = !wf;
+  if (wf) {
+    $("workflow").classList.toggle("done", wf.finished);
+    $("wfKind").textContent = wf.kind || "build";
+    $("wfPhase").textContent = wf.phase;
+    $("wfMeta").textContent = `«${wf.prompt}» → ${wf.project}`;
+    $("wfMeta").title = wf.prompt;
+  }
+  $("tIn").textContent = compact(snap.totals.input_tokens);
+  $("tIn").title = nfmt.format(snap.totals.input_tokens);
+  $("tInSub").textContent = nfmt.format(snap.totals.input_tokens) + " exactos";
+  $("tOut").textContent = compact(snap.totals.output_tokens);
+  $("tOut").title = nfmt.format(snap.totals.output_tokens);
+  $("tOutSub").textContent = nfmt.format(snap.totals.output_tokens) + " exactos";
+  $("tCacheR").textContent = compact(snap.totals.cache_read_input_tokens);
+  $("tCacheC").textContent = "creación: " + compact(snap.totals.cache_creation_input_tokens);
+  $("tCost").textContent = "$" + snap.estimated_cost_usd.toFixed(4);
+  $("tTotals").textContent = compact(snap.total_tokens) + " tokens · " + snap.requests + " peticiones · " + snap.turns + " turnos";
+
+  history = snap.history;
+  drawChart();
+
+  const counts = $("counts");
+  counts.innerHTML =
+    `<span>Total: <b>${snap.agents.length}</b></span>` +
+    `<span style="color:var(--series-in)">Ejecutando: <b>${snap.running}</b></span>` +
+    `<span style="color:var(--status-good)">Finalizados: <b>${snap.completed}</b></span>` +
+    (snap.failed ? `<span style="color:var(--status-critical)">Fallidos: <b>${snap.failed}</b></span>` : "");
+
+  const grid = $("agents");
+  $("empty").hidden = snap.agents.length > 0;
+  grid.replaceChildren(...snap.agents.map(agentCard));
+}
+
+function agentCard(a) {
+  const st = STATUS[a.status] || STATUS.idle;
+  const card = document.createElement("div");
+  card.className = "card";
+  const started = timeFmt.format(new Date(a.first_seen_ms));
+  const last = timeFmt.format(new Date(a.last_event_ms));
+  card.innerHTML = `
+    <div class="top">
+      <span class="name" title="${esc(a.id)}">${esc(a.label)}</span>
+      <span class="badge ${a.status}"><span class="ic">${st.ic}</span>${st.label}${a.stale ? ' <span class="stalewarn" title="sin eventos recientes">⚠ estancado</span>' : ""}</span>
+    </div>
+    <div class="meta">${esc(a.model || "modelo desconocido")} · inicio ${started} · último evento ${last}</div>
+    <table>
+      <tr><td>Entrada</td><td>${nfmt.format(a.tokens.input_tokens)}</td></tr>
+      <tr><td>Salida</td><td>${nfmt.format(a.tokens.output_tokens)}</td></tr>
+      <tr><td>Caché lectura</td><td>${nfmt.format(a.tokens.cache_read_input_tokens)}</td></tr>
+      <tr><td>Coste</td><td>$${a.estimated_cost_usd.toFixed(4)}</td></tr>
+      <tr><td>Turnos / peticiones</td><td>${a.turns} / ${a.requests}</td></tr>
+    </table>
+    <div class="action" title="${esc(a.last_action)}">${esc(a.last_action)}</div>`;
+  return card;
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ---- gráfica: líneas acumuladas de entrada/salida, con crosshair ---- */
+const PAD = { l: 56, r: 84, t: 10, b: 22 };
+let points = []; // [{t, cin, cout, x, yin, yout}]
+
+function drawChart() {
+  const svg = $("chart");
+  const W = svg.clientWidth || 800, H = 220;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = "";
+
+  let cin = 0, cout = 0;
+  points = history.map(s => {
+    cin += s.input_tokens; cout += s.output_tokens;
+    return { t: s.timestamp_ms, cin, cout };
+  });
+  if (points.length < 2) {
+    svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle">Aún no hay muestras suficientes</text>`;
+    return;
+  }
+
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const ymax = Math.max(points[points.length - 1].cin, points[points.length - 1].cout, 1);
+  const x = t => PAD.l + (W - PAD.l - PAD.r) * (t - t0) / Math.max(t1 - t0, 1);
+  const y = v => H - PAD.b - (H - PAD.t - PAD.b) * v / ymax;
+  points.forEach(p => { p.x = x(p.t); p.yin = y(p.cin); p.yout = y(p.cout); });
+
+  let g = "";
+  // rejilla horizontal recesiva + etiquetas de eje (un solo eje Y)
+  for (let i = 0; i <= 3; i++) {
+    const v = ymax * i / 3, gy = y(v);
+    g += `<line x1="${PAD.l}" y1="${gy}" x2="${W - PAD.r}" y2="${gy}" stroke="var(--grid)" stroke-width="1"/>`;
+    g += `<text x="${PAD.l - 8}" y="${gy + 4}" text-anchor="end">${compact(Math.round(v))}</text>`;
+  }
+  g += `<line x1="${PAD.l}" y1="${H - PAD.b}" x2="${W - PAD.r}" y2="${H - PAD.b}" stroke="var(--baseline)" stroke-width="1"/>`;
+  g += `<text x="${PAD.l}" y="${H - 6}">${timeFmt.format(new Date(t0))}</text>`;
+  g += `<text x="${W - PAD.r}" y="${H - 6}" text-anchor="end">${timeFmt.format(new Date(t1))}</text>`;
+
+  const path = key => points.map((p, i) => (i ? "L" : "M") + p.x.toFixed(1) + " " + p[key].toFixed(1)).join(" ");
+  g += `<path d="${path("yin")}" fill="none" stroke="var(--series-in)" stroke-width="2" stroke-linejoin="round"/>`;
+  g += `<path d="${path("yout")}" fill="none" stroke="var(--series-out)" stroke-width="2" stroke-linejoin="round"/>`;
+
+  // etiquetas directas al final de cada línea (relevo de contraste)
+  const lastp = points[points.length - 1];
+  g += `<text class="endlabel" x="${lastp.x + 6}" y="${lastp.yin + 4}" style="fill:var(--series-in)">Entrada</text>`;
+  g += `<text class="endlabel" x="${lastp.x + 6}" y="${lastp.yout + 4}" style="fill:var(--series-out)">Salida</text>`;
+
+  g += `<g id="cross" style="display:none">
+    <line id="crossline" y1="${PAD.t}" y2="${H - PAD.b}" stroke="var(--baseline)" stroke-width="1" stroke-dasharray="3 3"/>
+    <circle id="dotin" r="4" fill="var(--series-in)" stroke="var(--surface-1)" stroke-width="2"/>
+    <circle id="dotout" r="4" fill="var(--series-out)" stroke="var(--surface-1)" stroke-width="2"/>
+  </g>`;
+  svg.innerHTML = g;
+}
+
+$("chart").addEventListener("mousemove", ev => {
+  if (points.length < 2) return;
+  const svg = $("chart");
+  const rect = svg.getBoundingClientRect();
+  const mx = ev.clientX - rect.left;
+  let best = points[0];
+  for (const p of points) if (Math.abs(p.x - mx) < Math.abs(best.x - mx)) best = p;
+  const cross = svg.querySelector("#cross");
+  if (!cross) return;
+  cross.style.display = "";
+  cross.querySelector("#crossline").setAttribute("x1", best.x);
+  cross.querySelector("#crossline").setAttribute("x2", best.x);
+  const din = cross.querySelector("#dotin"), dout = cross.querySelector("#dotout");
+  din.setAttribute("cx", best.x); din.setAttribute("cy", best.yin);
+  dout.setAttribute("cx", best.x); dout.setAttribute("cy", best.yout);
+  const tip = $("tooltip");
+  tip.style.display = "block";
+  tip.innerHTML = `<div class="t">${timeFmt.format(new Date(best.t))}</div>
+    <div class="row"><span class="sw" style="background:var(--series-in)"></span>Entrada <b>${nfmt.format(best.cin)}</b></div>
+    <div class="row"><span class="sw" style="background:var(--series-out)"></span>Salida <b>${nfmt.format(best.cout)}</b></div>`;
+  const wrap = $("chartwrap").getBoundingClientRect();
+  const left = Math.min(ev.clientX - wrap.left + 14, wrap.width - tip.offsetWidth - 8);
+  tip.style.left = Math.max(left, 0) + "px";
+  tip.style.top = (ev.clientY - wrap.top + 14) + "px";
+});
+$("chart").addEventListener("mouseleave", () => {
+  const cross = $("chart").querySelector("#cross");
+  if (cross) cross.style.display = "none";
+  $("tooltip").style.display = "none";
+});
+
+tick();
+connect();
+window.addEventListener("resize", drawChart);
+</script>
+</body>
+</html>

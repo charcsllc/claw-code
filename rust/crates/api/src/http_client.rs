@@ -6,6 +6,34 @@ const HTTP_PROXY_KEYS: [&str; 2] = ["HTTP_PROXY", "http_proxy"];
 const HTTPS_PROXY_KEYS: [&str; 2] = ["HTTPS_PROXY", "https_proxy"];
 const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 
+/// Bounds and default for `CLAW_NET_TIMEOUT_MS` (overall request timeout in
+/// milliseconds). The default matches the historical `TimeoutConfig` request
+/// timeout of 300 seconds.
+const NET_TIMEOUT_MS_MIN: u64 = 5_000;
+const NET_TIMEOUT_MS_MAX: u64 = 600_000;
+const NET_TIMEOUT_MS_DEFAULT: u64 = 300_000;
+
+/// Parses a raw `CLAW_NET_TIMEOUT_MS` value into a request timeout in
+/// milliseconds, clamped to `5_000..=600_000`. Missing, empty, or
+/// unparseable values fall back to the default (300 000 ms, the same
+/// request timeout the HTTP clients used before this knob existed).
+#[must_use]
+pub fn parse_net_timeout_ms(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(NET_TIMEOUT_MS_DEFAULT, |value| {
+            value.clamp(NET_TIMEOUT_MS_MIN, NET_TIMEOUT_MS_MAX)
+        })
+}
+
+/// Thin env wrapper over [`parse_net_timeout_ms`]: reads
+/// `CLAW_NET_TIMEOUT_MS` from the process environment.
+#[must_use]
+pub fn net_timeout_ms() -> u64 {
+    parse_net_timeout_ms(std::env::var("CLAW_NET_TIMEOUT_MS").ok().as_deref())
+}
+
 /// Timeout configuration for outbound HTTP requests.
 ///
 /// When set, the `reqwest::Client` will abort requests that take longer
@@ -35,19 +63,34 @@ impl Default for TimeoutConfig {
 impl TimeoutConfig {
     /// Read timeout settings from the process environment.
     /// - `CLAW_API_CONNECT_TIMEOUT` — connect timeout in seconds
+    /// - `CLAW_NET_TIMEOUT_MS` — overall request timeout in milliseconds
+    ///   (clamped to 5 000..=600 000; takes precedence over
+    ///   `CLAW_API_REQUEST_TIMEOUT` when set)
     /// - `CLAW_API_REQUEST_TIMEOUT` — overall request timeout in seconds
     #[must_use]
     pub fn from_env() -> Self {
-        let connect_timeout = std::env::var("CLAW_API_CONNECT_TIMEOUT")
-            .ok()
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// Pure counterpart of [`TimeoutConfig::from_env`], driven by an
+    /// arbitrary key lookup so tests never mutate the process environment.
+    fn from_lookup<F>(mut lookup: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        let connect_timeout = lookup("CLAW_API_CONNECT_TIMEOUT")
             .and_then(|v| v.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or(Duration::from_secs(30));
-        let request_timeout = std::env::var("CLAW_API_REQUEST_TIMEOUT")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
+        let net_timeout_ms = lookup("CLAW_NET_TIMEOUT_MS").filter(|v| !v.trim().is_empty());
+        let request_timeout = if let Some(raw) = net_timeout_ms {
+            Duration::from_millis(parse_net_timeout_ms(Some(&raw)))
+        } else {
+            lookup("CLAW_API_REQUEST_TIMEOUT")
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(Duration::from_secs)
+                .unwrap_or(Duration::from_secs(300))
+        };
         Self {
             connect_timeout,
             request_timeout,
@@ -382,5 +425,68 @@ mod tests {
         let timeout = TimeoutConfig::from_seconds(5, 120);
         let result = build_http_client_with_opts(&config, &timeout);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_net_timeout_ms_defaults_when_missing_or_invalid() {
+        assert_eq!(super::parse_net_timeout_ms(None), 300_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("")), 300_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("   ")), 300_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("not-a-number")), 300_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("-5")), 300_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("12.5")), 300_000);
+    }
+
+    #[test]
+    fn parse_net_timeout_ms_accepts_and_clamps_values() {
+        assert_eq!(super::parse_net_timeout_ms(Some("120000")), 120_000);
+        assert_eq!(super::parse_net_timeout_ms(Some(" 60000 ")), 60_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("1")), 5_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("0")), 5_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("999999999")), 600_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("5000")), 5_000);
+        assert_eq!(super::parse_net_timeout_ms(Some("600000")), 600_000);
+    }
+
+    fn timeout_from_map(pairs: &[(&str, &str)]) -> TimeoutConfig {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        TimeoutConfig::from_lookup(|key| map.get(key).cloned())
+    }
+
+    #[test]
+    fn timeout_config_lookup_honours_claw_net_timeout_ms() {
+        let config = timeout_from_map(&[("CLAW_NET_TIMEOUT_MS", "45000")]);
+        assert_eq!(
+            config.request_timeout,
+            std::time::Duration::from_millis(45_000)
+        );
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn timeout_config_lookup_prefers_net_timeout_ms_over_request_seconds() {
+        let config = timeout_from_map(&[
+            ("CLAW_NET_TIMEOUT_MS", "45000"),
+            ("CLAW_API_REQUEST_TIMEOUT", "10"),
+        ]);
+        assert_eq!(
+            config.request_timeout,
+            std::time::Duration::from_millis(45_000)
+        );
+    }
+
+    #[test]
+    fn timeout_config_lookup_falls_back_to_request_seconds_when_ms_unset() {
+        let config = timeout_from_map(&[("CLAW_API_REQUEST_TIMEOUT", "10")]);
+        assert_eq!(config.request_timeout, std::time::Duration::from_secs(10));
+
+        let default_config = timeout_from_map(&[]);
+        assert_eq!(
+            default_config.request_timeout,
+            std::time::Duration::from_secs(300)
+        );
     }
 }

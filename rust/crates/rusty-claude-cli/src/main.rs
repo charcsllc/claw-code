@@ -14,8 +14,11 @@
     clippy::unnecessary_wraps,
     clippy::unused_self
 )]
+mod dashboard;
 mod init;
 mod input;
+mod multiagent_build;
+mod provider_presets;
 mod render;
 mod setup_wizard;
 
@@ -35,11 +38,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use log::debug;
 
 use api::{
-    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnthropicClient,
-    AuthSource, ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest,
-    MessageResponse, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
-    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    detect_provider_kind, model_family_identity_for, resolve_startup_auth_source, AnalyticsEvent,
+    AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock, InputMessage,
+    JsonlTelemetrySink, MessageRequest, MessageResponse, OutputContentBlock, PromptCache,
+    ProviderClient as ApiProviderClient, ProviderKind, SessionTracer,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -50,6 +53,7 @@ use commands::{
     slash_command_specs, validate_slash_command_input, PluginsCommandResult, SkillSlashDispatch,
     SlashCommand,
 };
+use dashboard::{dashboard_session_tracer, setup_dashboard};
 use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
@@ -307,6 +311,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--print",
     "--compact",
     "--base-commit",
+    "--dashboard",
     "-p",
 ];
 
@@ -993,7 +998,14 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
+    // --dashboard is a process-level side effect (spawn claw-dashboard,
+    // point CLAW_DASHBOARD_EVENTS at a shared file, open the browser); it
+    // never alters CliAction routing, so strip it before parse_args.
+    if let Some(position) = args.iter().position(|arg| arg == "--dashboard") {
+        args.remove(position);
+        setup_dashboard();
+    }
     // #824: suppress config deprecation prose warnings to stderr when JSON
     // output mode is active.  Scan the raw argv before parse_args so the
     // suppression is in place before any settings file is loaded.
@@ -1003,6 +1015,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let (args, cwd) = split_global_cwd_args(&args)?;
     apply_global_cwd(cwd)?;
+    // Make the provider saved by /setup or /provider actually take effect:
+    // export its credentials as env vars (env always wins over the file).
+    // Runs AFTER the JSON-mode warning suppression and --cwd handling, so
+    // loading the settings here cannot leak deprecation prose into JSON
+    // surfaces and resolves against the effective working directory.
+    provider_presets::apply_saved_provider_settings();
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,
@@ -1118,9 +1136,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             action,
             output_format,
         } => print_models(action.as_deref(), output_format)?,
-        CliAction::Diff { output_format } => match output_format {
+        CliAction::Diff {
+            path,
+            output_format,
+        } => match output_format {
             CliOutputFormat::Text => {
-                println!("{}", render_diff_report()?);
+                println!("{}", render_diff_report(path.as_deref())?);
             }
             CliOutputFormat::Json => {
                 let cwd = friendly_cwd(env::current_dir()?);
@@ -1130,6 +1151,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        CliAction::DesignReview { output_format } => {
+            let findings = collect_design_review_findings();
+            match output_format {
+                CliOutputFormat::Text => println!("{}", format_design_review_report()),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "design-review",
+                        "action": "audit",
+                        "status": if findings.is_empty() { "ok" } else { "findings" },
+                        "finding_count": findings.len(),
+                        "findings": findings,
+                    }))?
+                ),
+            }
+            // CI contract: a non-zero exit code when the gate finds problems,
+            // so `claw design-review --output-format json` works as a check.
+            if !findings.is_empty() {
+                std::process::exit(1);
+            }
+        }
         CliAction::Export {
             session_reference,
             output_path,
@@ -1254,6 +1296,10 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Diff {
+        path: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    DesignReview {
         output_format: CliOutputFormat,
     },
     Export {
@@ -1939,9 +1985,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // Only reject for known top-level subcommands that don't use compact.
         let first = rest[0].as_str();
         if is_known_top_level_subcommand(first) && first != "prompt" {
-            return Err(format!(
-                "invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact"
-            ));
+            return Err("invalid_flag_value: --compact is only supported with prompt mode.\nUsage: claw --compact \"<prompt>\" or echo \"<prompt>\" | claw --compact".to_string());
         }
     }
 
@@ -2016,7 +2060,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // before Usage is part of the JSON hint contract.
                 return Err(unexpected_diff_args_error(&rest[1..]));
             }
-            Ok(CliAction::Diff { output_format })
+            Ok(CliAction::Diff {
+                path: None,
+                output_format,
+            })
+        }
+        // The deterministic design gate is pure-local too (WCAG token
+        // contrast + HTML audit); exit code 1 on findings makes it usable
+        // as a CI check.
+        "design-review" => {
+            if rest.len() > 1 {
+                return Err(
+                    "Usage: claw design-review [--output-format json]\n  (sin argumentos; 'fix' solo existe dentro del REPL)"
+                        .to_string(),
+                );
+            }
+            Ok(CliAction::DesignReview { output_format })
         }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
@@ -2477,7 +2536,7 @@ fn parse_single_word_command_alias(
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
         // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
+        "config" | "diff" | "design-review" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -2594,9 +2653,18 @@ fn parse_direct_slash_cli_action(
             allowed_tools,
         }),
         Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
-        Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
+        Ok(Some(SlashCommand::Diff { path })) => Ok(CliAction::Diff {
+            path,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::DesignReview { fix: false })) => {
+            Ok(CliAction::DesignReview { output_format })
+        }
+        Ok(Some(SlashCommand::DesignReview { fix: true })) => Err(
+            "design-review fix necesita una sesión con modelo. Arranca `claw` y ejecuta /design-review fix en el REPL.".to_string(),
+        ),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
-        Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor {
+        Ok(Some(SlashCommand::Doctor { online: _ })) => Ok(CliAction::Doctor {
             output_format,
             permission_mode,
         }),
@@ -3213,9 +3281,7 @@ fn parse_system_prompt_args(
                 })?;
                 // #99: validate --date is a plausible date string (no newlines, reasonable length)
                 if value.contains('\n') || value.contains('\r') {
-                    return Err(format!(
-                        "invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>"
-                    ));
+                    return Err("invalid_flag_value: --date value contains invalid characters.\nUsage: --date <YYYY-MM-DD>".to_string());
                 }
                 if value.len() > 20 {
                     return Err(format!(
@@ -3452,11 +3518,7 @@ impl DiagnosticCheck {
 
     fn json_value(&self) -> Value {
         // Derive a stable snake_case id from the check name for machine-readable keying (#704).
-        let id = self
-            .name
-            .to_ascii_lowercase()
-            .replace(' ', "_")
-            .replace('-', "_");
+        let id = self.name.to_ascii_lowercase().replace([' ', '-'], "_");
         let mut value = Map::from_iter([
             ("id".to_string(), Value::String(id.clone())),
             (
@@ -3721,9 +3783,77 @@ fn render_doctor_report(
             check_boot_preflight_health(&context),
             check_sandbox_health(&context.sandbox_status),
             check_permission_health(permission_mode),
+            check_settings_permissions_health(),
             check_system_health(&cwd, config.as_ref().ok()),
         ],
     })
+}
+
+/// Warns when files that can hold credentials or conversations are readable
+/// by other users. `claw` always writes them 0600; a loose mode means they
+/// were created or chmodded by something else.
+fn check_settings_permissions_health() -> DiagnosticCheck {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let settings_path = runtime::default_config_home().join("settings.json");
+        let Ok(metadata) = std::fs::metadata(&settings_path) else {
+            return DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Ok,
+                "no settings.json yet — nothing to protect",
+            );
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        // Sessions hold the full conversations; a loose sessions dir leaks
+        // as much as a loose settings file.
+        let sessions_note = sessions_dir()
+            .ok()
+            .and_then(|dir| std::fs::metadata(&dir).ok().map(|meta| (dir, meta)))
+            .map(|(dir, meta)| {
+                let dir_mode = meta.permissions().mode() & 0o777;
+                if dir_mode & 0o077 == 0 {
+                    format!("sessions dir {} is owner-only", dir.display())
+                } else {
+                    format!(
+                        "sessions dir {} is accessible to other users (mode {dir_mode:o}); run chmod 700 on it",
+                        dir.display()
+                    )
+                }
+            });
+        if mode & 0o077 == 0 {
+            let mut check = DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Ok,
+                format!("{} is owner-only ({mode:o})", settings_path.display()),
+            );
+            if let Some(note) = sessions_note {
+                check = check.with_details(vec![note]);
+            }
+            check
+        } else {
+            DiagnosticCheck::new(
+                "Secrets file permissions",
+                DiagnosticLevel::Warn,
+                format!(
+                    "{} is readable by other users (mode {mode:o})",
+                    settings_path.display()
+                ),
+            )
+            .with_hint(format!(
+                "run: chmod 600 {} — it can contain your API key",
+                settings_path.display()
+            ))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        DiagnosticCheck::new(
+            "Secrets file permissions",
+            DiagnosticLevel::Ok,
+            "not applicable on this platform",
+        )
+    }
 }
 
 fn run_doctor(
@@ -3841,8 +3971,9 @@ fn check_auth_health() -> DiagnosticCheck {
         .is_some_and(|value| !value.trim().is_empty());
     let any_auth_present = api_key_present || auth_token_present || openai_key_present;
     let prompt_ready = any_auth_present;
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
     let env_details = format!(
-        "Environment       api_key={} auth_token={} openai_key={}",
+        "Environment       api_key={} auth_token={} openai_key={}\nProvider          {provider_summary}\nProvider URL      {provider_url}",
         if api_key_present { "present" } else { "absent" },
         if auth_token_present {
             "present"
@@ -4654,6 +4785,10 @@ fn check_system_health(cwd: &Path, config: Option<&runtime::RuntimeConfig>) -> D
             "Logging env      CLAW_LOG={} RUST_LOG={}",
             env::var("CLAW_LOG").unwrap_or_else(|_| "<unset>".to_string()),
             env::var("RUST_LOG").unwrap_or_else(|_| "<unset>".to_string())
+        ),
+        format!(
+            "Bash timeout     CLAW_BASH_TIMEOUT_MS={} (default 120000)",
+            env::var("CLAW_BASH_TIMEOUT_MS").unwrap_or_else(|_| "<unset>".to_string())
         ),
     ];
     if let Some(model) = default_model {
@@ -6083,6 +6218,7 @@ fn format_model_report(model: &str, message_count: usize, turns: u32) -> String 
   Current model    {model}
   Session messages {message_count}
   Session turns    {turns}
+  Common aliases   opus, sonnet, haiku, glm, kimi, deepseek, qwen, grok
 
 Usage
   Inspect current model with /model
@@ -6169,6 +6305,100 @@ fn format_cost_report(usage: TokenUsage) -> String {
         usage.cache_read_input_tokens,
         usage.total_tokens(),
         format_usd(estimated_cost.total_cost_usd()),
+    )
+}
+
+/// `/usage`: the per-session token breakdown, including the last turn — a
+/// finer-grained view than `/cost`'s cumulative-only report.
+fn format_usage_report(tracker: &UsageTracker) -> String {
+    let last = tracker.current_turn_usage();
+    let total = tracker.cumulative_usage();
+    format!(
+        "Usage
+  Turns            {}
+  Last turn        in {} · out {} · cache r/w {}/{}
+  Input tokens     {}
+  Output tokens    {}
+  Cache create     {}
+  Cache read       {}
+  Cache hit rate   {}
+  Total tokens     {}
+  Avg per turn     {}
+  Estimated cost   {}",
+        tracker.turns(),
+        last.input_tokens,
+        last.output_tokens,
+        last.cache_read_input_tokens,
+        last.cache_creation_input_tokens,
+        total.input_tokens,
+        total.output_tokens,
+        total.cache_creation_input_tokens,
+        total.cache_read_input_tokens,
+        format_cache_hit_rate(total.input_tokens, total.cache_read_input_tokens),
+        total.total_tokens(),
+        u64::from(total.total_tokens())
+            .checked_div(u64::from(tracker.turns()))
+            .unwrap_or(0),
+        format_usd(total.estimate_cost_usd().total_cost_usd()),
+    )
+}
+
+/// Share of prompt tokens served from the prompt cache — the single number
+/// that says whether caching is working (cache reads cost ~10% of fresh
+/// input tokens).
+fn format_cache_hit_rate(input_tokens: u32, cache_read_tokens: u32) -> String {
+    let denominator = u64::from(input_tokens) + u64::from(cache_read_tokens);
+    if denominator == 0 {
+        return "n/a (no requests yet)".to_string();
+    }
+    let percent = u64::from(cache_read_tokens) * 100 / denominator;
+    format!("{percent}% of prompt tokens from cache")
+}
+
+/// A ten-slot text gauge: `[####------] 40%` — readable in any terminal,
+/// no colors required.
+fn render_utilization_bar(percent: u32) -> String {
+    let clamped = percent.min(100) as usize;
+    let filled = clamped / 10;
+    format!(
+        "[{}{}] {percent}%",
+        "#".repeat(filled),
+        "-".repeat(10 - filled)
+    )
+}
+
+/// `/context`: how full the session is — against the model's real context
+/// window and against the auto-compaction trigger — so the user can
+/// `/compact` deliberately instead of being surprised mid-task.
+fn format_context_report(
+    model: &str,
+    estimated_session_tokens: usize,
+    cumulative_input_tokens: u32,
+) -> String {
+    let threshold = runtime::auto_compaction_threshold_from_env();
+    let percent = cumulative_input_tokens
+        .saturating_mul(100)
+        .checked_div(threshold)
+        .unwrap_or(0);
+    let window_lines = api::model_token_limit(&api::resolve_model_alias(model)).map_or_else(
+        || "\n  Context window   unknown for this model".to_string(),
+        |limit| {
+            let window = limit.context_window_tokens as usize;
+            let used = estimated_session_tokens
+                .saturating_mul(100)
+                .checked_div(window)
+                .unwrap_or(0);
+            format!("\n  Context window   {window} tokens\n  Window used      {used}% (session estimate)")
+        },
+    );
+    format!(
+        "Context
+  Session tokens   {estimated_session_tokens} (estimated from message content){window_lines}
+  Cumulative input {cumulative_input_tokens}
+  Auto-compact at  {threshold} cumulative input tokens
+  Utilization      {} of the auto-compact trigger
+  Tip              /compact shrinks the session now; auto-compaction fires at 100%",
+        render_utilization_bar(percent)
     )
 }
 
@@ -6666,9 +6896,9 @@ fn run_resume_command(
                 json: Some(init_json_value(&report, &message)),
             })
         }
-        SlashCommand::Diff => {
+        SlashCommand::Diff { path } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let message = render_diff_report_for(&cwd)?;
+            let message = render_diff_report_for(&cwd, path.as_deref())?;
             let json = render_diff_json_for(&cwd)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -6730,16 +6960,15 @@ fn run_resume_command(
         }
         SlashCommand::Plugins { action, target } => {
             // Only list is supported in resume mode (no runtime to reload)
-            match action.as_deref() {
-                Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) => {
-                    // #777: use interactive_only: prefix + \n hint so #776's classify/split
-                    // emits error_kind:interactive_only + non-null hint instead of unknown+null.
-                    // Orchestrators can now detect this and switch to a live REPL instead of retrying.
-                    return Err(format!(
-                        "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
-                    ).into());
-                }
-                _ => {}
+            if let Some(action @ ("install" | "uninstall" | "enable" | "disable" | "update")) =
+                action.as_deref()
+            {
+                // #777: use interactive_only: prefix + \n hint so #776's classify/split
+                // emits error_kind:interactive_only + non-null hint instead of unknown+null.
+                // Orchestrators can now detect this and switch to a live REPL instead of retrying.
+                return Err(format!(
+                    "interactive_only: /plugins {action} requires a live session to reload the plugin runtime.\nStart `claw` and run `/plugins {action}` inside the REPL, or use `claw plugins {action}` as a direct CLI command."
+                ).into());
             }
             let cwd = env::current_dir()?;
             let payload = plugins_command_payload_for(
@@ -6781,14 +7010,19 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
-        SlashCommand::Doctor => {
+        SlashCommand::Doctor { online } => {
             let report = render_doctor_report(
                 ConfigWarningMode::EmitStderr,
                 permission_mode_provenance_for_current_dir(),
             )?;
+            let mut message = report.render();
+            if *online {
+                message.push('\n');
+                message.push_str(&doctor_online_section());
+            }
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(report.render()),
+                message: Some(message),
                 json: Some(report.json_value()),
             })
         }
@@ -6888,6 +7122,10 @@ fn run_resume_command(
         | SlashCommand::Teleport { .. }
         | SlashCommand::DebugToolCall { .. }
         | SlashCommand::Resume { .. }
+        | SlashCommand::Web { .. }
+        | SlashCommand::App { .. }
+        | SlashCommand::Improve { .. }
+        | SlashCommand::Provider { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
@@ -6907,6 +7145,8 @@ fn run_resume_command(
         | SlashCommand::Thinkback
         | SlashCommand::ReleaseNotes
         | SlashCommand::SecurityReview
+        | SlashCommand::DesignReview { .. }
+        | SlashCommand::Retry
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
@@ -7045,6 +7285,612 @@ fn run_stale_base_preflight(flag_value: Option<&str>) {
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// `/upgrade`: this fork installs by building locally (install.sh /
+/// install.ps1), so upgrading = pull + rebuild. Reports what's running and
+/// the exact commands, flagging when the binary already lags the checkout.
+fn format_upgrade_report() -> String {
+    let cwd = std::env::current_dir().ok();
+    let provenance = binary_provenance_for(cwd.as_deref());
+    let commit = provenance
+        .git_sha_short
+        .as_deref()
+        .unwrap_or("unknown")
+        .to_string();
+    let dirty = if provenance.is_dirty { " (dirty)" } else { "" };
+    let sync_line = match provenance.workspace_match {
+        Some(true) => "binary matches the current checkout — pull first, then rebuild",
+        Some(false) => "binary was built from a DIFFERENT commit than this checkout — rebuild to pick up your changes",
+        None => "run /upgrade from the claw-code checkout to compare against the workspace",
+    };
+    format!(
+        "Upgrade
+  Version          {VERSION}
+  Built from       {commit}{dirty} ({})
+  Binary           {}
+  Sync             {sync_line}
+  Update (Linux/macOS)  cd <claw-code> && git pull && ./install.sh
+  Update (Windows)      cd <claw-code>; git pull; .\\install.ps1
+  Source           https://github.com/charcsllc/claw-code",
+        provenance.commit_date,
+        provenance.executable_path.as_deref().unwrap_or("unknown"),
+    )
+}
+
+/// Pure core of `/rewind`: removes the last `steps` user exchanges (each
+/// user message and everything after it). When the session holds fewer
+/// exchanges than requested, it cuts at the earliest user message found so
+/// the command still does something sane. Returns how many messages were
+/// removed.
+fn truncate_last_exchanges(messages: &mut Vec<ConversationMessage>, steps: usize) -> usize {
+    let mut user_seen = 0_usize;
+    let mut cut_at = None;
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role == MessageRole::User {
+            user_seen += 1;
+            cut_at = Some(index);
+            if user_seen >= steps {
+                break;
+            }
+        }
+    }
+    match cut_at {
+        Some(index) => {
+            let removed = messages.len() - index;
+            messages.truncate(index);
+            removed
+        }
+        None => 0,
+    }
+}
+
+/// First non-empty text line of a message, flattened to one terminal line.
+fn message_first_text_line(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text { text } => text
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .map(truncate_retry_error),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(sin texto)".to_string())
+}
+
+/// The text of the last assistant message in the session.
+fn last_assistant_text(session: &Session) -> String {
+    session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)
+        .map(|message| {
+            message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// The whole conversation as plain markdown (`/copy all`). Tool blocks are
+/// skipped — the transcript is for humans, not for replay.
+fn render_session_transcript(session: &Session) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for message in &session.messages {
+        let speaker = match message.role {
+            MessageRole::User => "## Usuario",
+            MessageRole::Assistant => "## Asistente",
+            MessageRole::System | MessageRole::Tool => continue,
+        };
+        let text = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let _ = write!(out, "{speaker}\n\n{text}\n\n");
+    }
+    out
+}
+
+/// Pipes text into the first available system clipboard tool. Returns the
+/// tool used, or an actionable error naming what to install.
+fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+        ("pbcopy", &[]),
+        ("clip.exe", &[]),
+    ];
+    for (tool, args) in CANDIDATES {
+        let spawned = std::process::Command::new(tool)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = spawned else {
+            continue; // tool not installed — try the next one
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            if stdin.write_all(text.as_bytes()).is_err() {
+                continue;
+            }
+        }
+        match child.wait() {
+            Ok(status) if status.success() => return Ok(tool),
+            _ => {}
+        }
+    }
+    Err(
+        "no clipboard tool found — install wl-clipboard (Wayland), xclip/xsel (X11), \
+         or use pbcopy (macOS) / clip.exe (Windows)"
+            .to_string(),
+    )
+}
+
+/// `/files`: the working tree's changed files, straight from git.
+fn format_files_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(status) = run_git_capture_in(&cwd, &["status", "--short"]) else {
+        return "Files\n  Error            not inside a git repository (or git unavailable)"
+            .to_string();
+    };
+    let branch = run_git_capture_in(&cwd, &["branch", "--show-current"])
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "(detached)".to_string());
+    // "## main...origin/main [ahead 2, behind 1]" → keep the bracket part.
+    let upstream = run_git_capture_in(&cwd, &["status", "--short", "--branch"])
+        .and_then(|out| out.lines().next().map(ToString::to_string))
+        .and_then(|head| {
+            head.find('[')
+                .map(|start| format!(" — {}", head[start..].trim_end()))
+        })
+        .unwrap_or_default();
+    let lines: Vec<&str> = status.lines().collect();
+    if lines.is_empty() {
+        return format!(
+            "Files\n  Branch           {branch}{upstream}\n  Working tree     clean (no changes)"
+        );
+    }
+    let mut out = format!("Files ({} changed on {branch}{upstream})\n", lines.len());
+    for line in lines.iter().take(100) {
+        let _ = writeln!(out, "  {line}");
+    }
+    if lines.len() > 100 {
+        let _ = write!(out, "  … and {} more (see git status)", lines.len() - 100);
+    }
+    out.trim_end().to_string()
+}
+
+/// `/review`: the working-tree (or staged) diff, capped so a huge refactor
+/// doesn't blow the context window before the review starts.
+fn collect_review_diff(scope: Option<&str>) -> Result<String, String> {
+    const MAX_DIFF_CHARS: usize = 60_000;
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let scope = scope.map(str::trim).filter(|value| !value.is_empty());
+    // `/review` → working tree; `/review staged` → index; `/review <ref>` →
+    // what this branch adds over <ref> (e.g. `/review main` before a PR).
+    let range;
+    let (args, empty_message): (Vec<&str>, &str) = match scope {
+        None => (
+            vec!["diff"],
+            "working tree is clean — nothing to review (try /review staged or /review <rama-base>)",
+        ),
+        Some("staged") => (
+            vec!["diff", "--staged"],
+            "no staged changes to review (try /review for unstaged ones)",
+        ),
+        Some(reference) => {
+            if !reference
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+            {
+                return Err(format!("invalid git reference '{reference}'"));
+            }
+            range = format!("{reference}...HEAD");
+            (
+                vec!["diff", range.as_str()],
+                "no differences against that base — the branch adds nothing over it",
+            )
+        }
+    };
+    let diff = run_git_capture_in(&cwd, &args)
+        .ok_or("not inside a git repository, unknown reference, or git unavailable")?;
+    if diff.trim().is_empty() {
+        return Err(empty_message.to_string());
+    }
+    if diff.chars().count() > MAX_DIFF_CHARS {
+        let truncated: String = diff.chars().take(MAX_DIFF_CHARS).collect();
+        Ok(format!(
+            "{truncated}\n… (diff truncated at {MAX_DIFF_CHARS} chars; review the rest separately)"
+        ))
+    } else {
+        Ok(diff)
+    }
+}
+
+/// `/release-notes`: what changed recently in the checkout this binary
+/// serves — the local-build equivalent of hosted release notes.
+fn format_release_notes_report() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Some(log) = run_git_capture_in(&cwd, &["log", "--oneline", "-n", "20"]) else {
+        return format!(
+            "Release notes\n  Version          {VERSION}\n  Error            not inside a git checkout; see https://github.com/charcsllc/claw-code/commits"
+        );
+    };
+    let mut out = format!("Release notes (últimos 20 commits)\n  Version          {VERSION}\n");
+    for line in log.lines().take(20) {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("  Full history     git log  ·  https://github.com/charcsllc/claw-code/commits");
+    out
+}
+
+/// `/security-review`: deterministic, zero-token checks over the working
+/// tree — hardcoded credentials and committed .env files.
+fn format_security_review_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let findings = claw_multiagent::orchestrator::scan_for_secrets(&cwd);
+    let tracked_env = run_git_capture_in(&cwd, &["ls-files", ".env", "*/.env", ".env.*"])
+        .map(|out| {
+            out.lines()
+                .filter(|line| !line.trim().is_empty() && !line.ends_with(".env.example"))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut out = String::from("Security review (checks deterministas, 0 tokens)\n");
+    if findings.is_empty() {
+        out.push_str("  Secret scan      ok — sin credenciales hardcodeadas detectadas\n");
+    } else {
+        let _ = writeln!(out, "  Secret scan      {} hallazgo(s):", findings.len());
+        for finding in findings.iter().take(20) {
+            let _ = writeln!(out, "    {finding}");
+        }
+    }
+    if tracked_env.is_empty() {
+        out.push_str("  .env tracking    ok — ningún .env commiteado\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "  .env tracking    ⚠ commiteados: {} (muévelos a .gitignore y rota las claves)",
+            tracked_env.join(", ")
+        );
+    }
+    out.push_str("  Deep review      /review — revisión con IA del diff actual");
+    out
+}
+
+/// `/design-review`: the multiagent design gate, standalone over the
+/// current project — WCAG contrast of any token stylesheet, accessibility
+/// audit of `docs/rendered-dom.html`/`index.html` if present, and token
+/// discipline. Deterministic, zero tokens.
+fn collect_design_review_findings() -> Vec<String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut findings = claw_multiagent::design::run_design_gate(&cwd, &cwd.join("docs"), false);
+    // Outside a multiagent build there is rarely a rendered DOM capture;
+    // fall back to auditing the source index.html so the command is useful
+    // on any web project.
+    if !cwd.join("docs/rendered-dom.html").exists() {
+        for candidate in ["index.html", "public/index.html", "src/index.html"] {
+            if let Ok(html) = std::fs::read_to_string(cwd.join(candidate)) {
+                for finding in claw_multiagent::design::audit_rendered_html(&html) {
+                    findings.push(format!("[A11Y] {candidate}: {finding}"));
+                }
+                break;
+            }
+        }
+    }
+    for finding in claw_multiagent::design::audit_hardcoded_colors(&cwd) {
+        findings.push(format!("[TOKENS] {finding}"));
+    }
+    findings
+}
+
+/// Turns the design-gate findings into the one-turn prompt `/design-review fix`
+/// hands to the model — the audit is deterministic, the repair is not.
+fn design_review_fix_prompt(findings: &[String]) -> String {
+    let mut prompt = String::from(
+        "La auditoría determinista de diseño (/design-review) ha encontrado estos problemas en el proyecto actual. \
+         Corrígelos editando los archivos afectados, sin rediseñar nada más. \
+         [CONTRASTE] = par de tokens que no cumple WCAG, [A11Y] = HTML, [TOKENS] = color hardcodeado que debe usar var(--token), [PESO] = asset demasiado pesado.\n\n",
+    );
+    for finding in findings.iter().take(25) {
+        prompt.push_str("- ");
+        prompt.push_str(finding);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nAl terminar, resume qué cambiaste por archivo.");
+    prompt
+}
+
+fn format_design_review_report() -> String {
+    use std::fmt::Write as _;
+    let findings = collect_design_review_findings();
+    if findings.is_empty() {
+        return "Design review (checks deterministas, 0 tokens)\n  Result           ok — \
+                sin fallos de contraste WCAG, accesibilidad HTML ni disciplina de tokens\n  \
+                Nota             audita stylesheets de tokens, index.html/rendered-dom y CSS de componentes"
+            .to_string();
+    }
+    let mut out = format!(
+        "Design review (checks deterministas, 0 tokens)\n  Findings         {}\n",
+        findings.len()
+    );
+    for finding in findings.iter().take(25) {
+        let _ = writeln!(out, "    {finding}");
+    }
+    if findings.len() > 25 {
+        let _ = writeln!(out, "    … y {} más", findings.len() - 25);
+    }
+    out.push_str(
+        "  Fix              corrige y re-ejecuta /design-review; /review para una revisión con IA",
+    );
+    out.trim_end().to_string()
+}
+
+/// `/privacy-settings`: where claw stores data locally and how to purge it.
+fn format_privacy_report() -> String {
+    let config_home = runtime::default_config_home();
+    let sessions = sessions_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "(no disponible)".to_string());
+    let telemetry = std::env::var("CLAW_DASHBOARD_EVENTS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            "desactivada (solo con --dashboard o CLAW_DASHBOARD_EVENTS)".to_string()
+        });
+    format!(
+        "Privacy
+  Todo es local — este fork no envía datos a ningún servicio salvo tu proveedor de IA.
+  Settings         {} (0600; puede contener tu API key)
+  Sesiones         {sessions} (0600; conversaciones completas)
+  Telemetría       {telemetry}
+  Prompts          se envían solo al proveedor configurado (/provider show)
+  Purgar           borra ~/.claw/ y el directorio de sesiones para eliminarlo todo",
+        config_home.join("settings.json").display(),
+    )
+}
+
+/// `/hooks`: every configured hook by event, plus config entries that
+/// failed to parse (silently-dropped hooks are debugging quicksand).
+fn format_hooks_report() -> String {
+    use std::fmt::Write as _;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let hooks = match ConfigLoader::default_for(&cwd).load() {
+        Ok(config) => config.hooks().clone(),
+        Err(error) => return format!("Hooks\n  Error            could not load config: {error}"),
+    };
+    let sections: [(&str, &[runtime::RuntimeHookCommand]); 3] = [
+        ("PreToolUse", hooks.pre_tool_use_entries()),
+        ("PostToolUse", hooks.post_tool_use_entries()),
+        ("PostToolUseFailure", hooks.post_tool_use_failure_entries()),
+    ];
+    let total: usize = sections.iter().map(|(_, entries)| entries.len()).sum();
+    if total == 0 && hooks.invalid_hooks().is_empty() {
+        return "Hooks\n  Configured       none\n  Add some         hooks.preToolUse / hooks.postToolUse in .claw.json"
+            .to_string();
+    }
+    let mut out = format!("Hooks ({total} configured)\n");
+    for (event, entries) in sections {
+        for entry in entries {
+            let matcher = entry
+                .matcher()
+                .map_or(String::new(), |matcher| format!(" [matcher: {matcher}]"));
+            let _ = writeln!(out, "  {event:<19}{}{matcher}", entry.command());
+        }
+    }
+    for invalid in hooks.invalid_hooks() {
+        let _ = writeln!(
+            out,
+            "  INVALID ({})     {} — {}",
+            invalid.event, invalid.error_field, invalid.reason
+        );
+    }
+    out.trim_end().to_string()
+}
+
+/// Saves the `/color` choice so the next session starts with it.
+fn persist_color_mode(mode: &str) {
+    if let Err(error) = runtime::save_user_settings_field("colorMode", mode) {
+        eprintln!("warning: could not persist color mode: {error}");
+    }
+}
+
+/// Applies the persisted `/color` choice at REPL startup.
+fn apply_saved_color_mode() {
+    match runtime::load_user_settings_field("colorMode").as_deref() {
+        Some("on") => render::set_color_override(Some(true)),
+        Some("off") => render::set_color_override(Some(false)),
+        _ => {}
+    }
+}
+
+/// `/color` and `/theme`: the effective color state and how to change it.
+fn format_color_report() -> String {
+    let override_state = match render::color_override() {
+        Some(true) => "forced ON (/color on)",
+        Some(false) => "forced OFF (/color off)",
+        None => "auto (TTY + NO_COLOR detection)",
+    };
+    let no_color = if std::env::var_os("NO_COLOR").is_some() {
+        "set (colors suppressed in auto mode)"
+    } else {
+        "not set"
+    };
+    format!(
+        "Color
+  Mode             {override_state}
+  NO_COLOR         {no_color}
+  Usage            /color on|off|auto  (also /theme)
+  Note             theming follows your terminal palette; claw only decides whether to emit ANSI colors"
+    )
+}
+
+/// `/keybindings`: the line editor's actual bindings (rustyline Emacs mode
+/// plus the two explicit newline bindings in input.rs).
+fn format_keybindings_report() -> String {
+    "Keybindings
+  Enter            send prompt
+  Shift+Enter      insert newline (also Ctrl+J)
+  Tab              complete slash commands and @file paths
+  Up / Down        browse prompt history
+  Ctrl+R           reverse-search history
+  Ctrl+A / Ctrl+E  start / end of line
+  Ctrl+W           delete previous word
+  Ctrl+U / Ctrl+K  delete to start / end of line
+  Ctrl+L           clear screen (keeps the current line)
+  Ctrl+C           cancel current line
+  Ctrl+D           exit (on an empty line)"
+        .to_string()
+}
+
+/// Maps a failed turn's error text to the one command that actually fixes
+/// it — a raw provider error tells the user WHAT broke, never what to do.
+fn hint_for_turn_error(error: &str) -> Option<&'static str> {
+    let lower = error.to_lowercase();
+    if lower.contains("401")
+        || lower.contains("403")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key")
+        || lower.contains("unauthorized")
+    {
+        return Some("pista: credenciales rechazadas — verifica con /provider test o reconfigura con /provider use");
+    }
+    if lower.contains("retries exhausted") || lower.contains("429") || lower.contains("rate limit")
+    {
+        return Some(
+            "pista: el proveedor está limitando peticiones — espera un poco o cambia de modelo/proveedor (/provider)",
+        );
+    }
+    if lower.contains("context window") || lower.contains("context_window") {
+        return Some("pista: la sesión no cabe en el contexto — ejecuta /compact (o /rewind)");
+    }
+    if lower.contains("insufficient_quota")
+        || lower.contains("insufficient balance")
+        || lower.contains("insufficient credits")
+        || lower.contains("billing")
+        || lower.contains("quota exceeded")
+    {
+        return Some(
+            "pista: cuota o saldo agotado en el proveedor — revisa tu plan/billing o cambia de proveedor (/provider)",
+        );
+    }
+    if lower.contains("model_not_found")
+        || lower.contains("model not found")
+        || lower.contains("unknown model")
+        || lower.contains("does not exist or you do not have access")
+    {
+        return Some(
+            "pista: el proveedor no reconoce el modelo — mira los nombres con /provider list y cambia con /model",
+        );
+    }
+    if lower.contains("overloaded") || lower.contains("529") {
+        return Some(
+            "pista: el proveedor está sobrecargado — reintenta en unos segundos o cambia de modelo",
+        );
+    }
+    if lower.contains("certificate") || lower.contains("ssl") || lower.contains("tls") {
+        return Some(
+            "pista: fallo TLS/certificado — típico de proxies corporativos; revisa HTTPS_PROXY y el bundle de CA",
+        );
+    }
+    if lower.contains("dns")
+        || lower.contains("connection refused")
+        || lower.contains("connect error")
+        || lower.contains("timed out")
+    {
+        return Some(
+            "pista: problema de red hacia el proveedor — comprueba la Base URL con /provider show y prueba /provider test",
+        );
+    }
+    None
+}
+
+/// A pasted wall of text is the most common accidental send in a REPL;
+/// above this many lines the loop asks once before spending tokens on it.
+const LARGE_PASTE_LINES: usize = 50;
+
+fn large_paste_line_count(input: &str) -> Option<usize> {
+    let lines = input.lines().count();
+    (lines > LARGE_PASTE_LINES).then_some(lines)
+}
+
+/// Second-line hint after a provider outage error: the fix for "their
+/// servers are down" is switching providers, but only worth saying when
+/// the user actually has alternative credentials configured.
+fn failover_hint(error: &str) -> Option<String> {
+    let lower = error.to_lowercase();
+    let outage = lower.contains("overloaded")
+        || lower.contains("529")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("internal server error")
+        || lower.contains("insufficient");
+    if !outage {
+        return None;
+    }
+    let vars = provider_presets::credentialed_env_vars();
+    if vars.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "pista: tienes más credenciales configuradas ({}) — cambia de proveedor con /provider use <preset>",
+        vars.join(", ")
+    ))
+}
+
+/// `/doctor online`: the doctor report is static analysis; this appends one
+/// live 1-token probe of the active provider plus the credential env vars
+/// that are actually set.
+fn doctor_online_section() -> String {
+    let model =
+        resolve_repl_model(DEFAULT_MODEL.to_string()).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let mut out = run_provider_probe(&model);
+    let vars = provider_presets::credentialed_env_vars();
+    out.push_str("\n  Credentials      ");
+    if vars.is_empty() {
+        out.push_str("ninguna variable de entorno de proveedor detectada");
+    } else {
+        out.push_str(&vars.join(", "));
+    }
+    out
+}
+
+/// One terminal line: API error strings can embed whole JSON response
+/// bodies, and a retry notice must not scroll the conversation away.
+fn truncate_retry_error(error: &str) -> String {
+    let flat = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(140).collect();
+    if flat.chars().count() > 140 {
+        out.push('…');
+    }
+    out
+}
+
 fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -7055,14 +7901,49 @@ fn run_repl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
+    // Interactive-only: without this, a rate-limited turn silently backs off
+    // for up to minutes and the REPL looks frozen. Print/JSON modes never
+    // install it, so machine-readable output stays clean.
+    apply_saved_color_mode();
+    api::set_retry_notifier(|notice| {
+        eprintln!(
+            "⟳ error transitorio del proveedor — reintento {}/{} en {}s ({})",
+            notice.attempt,
+            notice.max_retries + 1,
+            notice.delay.as_secs().max(1),
+            truncate_retry_error(&notice.error),
+        );
+    });
     let resolved_model = resolve_repl_model(model)?;
     let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    // Seed Up-arrow / Ctrl-R with the session's persisted prompt history:
+    // /history could already show these entries, but the editor never
+    // recalled them across restarts or --resume.
+    for entry in &cli.runtime.session().prompt_history {
+        editor.push_history(entry.text.clone());
+    }
     println!("{}", cli.startup_banner());
     println!("{}", format_connected_line(&cli.model));
+    // No credentials at all: say it now, in one line, instead of letting the
+    // first turn fail with a provider error.
+    if provider_presets::active_provider_summary()
+        .0
+        .starts_with("none")
+    {
+        println!(
+            "⚠ sin credenciales configuradas — ejecuta /provider use <preset> <clave> (verifica con /provider test)"
+        );
+    }
+    // A JWT credential that is already expired fails every turn with an
+    // opaque 401; say it before the first prompt instead.
+    if let Some(warning) = provider_presets::jwt_expiry_warning() {
+        println!("{warning}");
+    }
 
+    let mut exit_hint_shown = false;
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
         match editor.read_line()? {
@@ -7071,14 +7952,37 @@ fn run_repl(
                 if trimmed.is_empty() {
                     continue;
                 }
-                if matches!(trimmed.as_str(), "/exit" | "/quit") {
+                // Everything typed is recallable with Up/Ctrl-R — including
+                // slash commands and lines that later fail to parse.
+                editor.push_history(input);
+                // Bare exit words work too: "exit" typed without the slash is
+                // an exit request, not a prompt for the model.
+                if matches!(
+                    trimmed.as_str(),
+                    "/exit" | "/quit" | "exit" | "quit" | "salir"
+                ) {
                     cli.persist_session()?;
                     break;
                 }
+                // "?" is the universal help reflex.
+                let trimmed = if trimmed == "?" {
+                    "/help".to_string()
+                } else {
+                    trimmed
+                };
                 match SlashCommand::parse(&trimmed) {
                     Ok(Some(command)) => {
-                        if cli.handle_repl_command(command)? {
-                            cli.persist_session()?;
+                        // A failed command (bad flag, missing session, IO
+                        // error) returns to the prompt; it must never
+                        // terminate the whole session.
+                        match cli.handle_repl_command(command) {
+                            Ok(true) => {
+                                if let Err(error) = cli.persist_session() {
+                                    eprintln!("warning: could not persist session: {error}");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => eprintln!("{error}"),
                         }
                         continue;
                     }
@@ -7092,17 +7996,43 @@ fn run_repl(
                 // matches a known skill name, invoke it as `/skills <input>`
                 // rather than forwarding raw text to the LLM (ROADMAP #36).
                 let cwd = std::env::current_dir().unwrap_or_default();
-                if let Some(prompt) = try_resolve_bare_skill_prompt(&cwd, &trimmed) {
-                    editor.push_history(input);
-                    cli.record_prompt_history(&trimmed);
-                    cli.run_turn(&prompt)?;
-                    continue;
+                let prompt = try_resolve_bare_skill_prompt(&cwd, &trimmed)
+                    .unwrap_or_else(|| trimmed.clone());
+                // A 50+ line submit is almost always a paste; confirm before
+                // spending tokens on it. Enter (default) discards.
+                if let Some(lines) = large_paste_line_count(&prompt) {
+                    eprint!("El mensaje tiene {lines} líneas — ¿enviarlo al modelo? [s/N]: ");
+                    let mut answer = String::new();
+                    let confirmed = io::stdin().read_line(&mut answer).is_ok()
+                        && matches!(
+                            answer.trim().to_ascii_lowercase().as_str(),
+                            "s" | "si" | "sí" | "y" | "yes"
+                        );
+                    if !confirmed {
+                        eprintln!("(descartado — recupéralo con ↑ si era intencionado)");
+                        continue;
+                    }
                 }
-                editor.push_history(input);
                 cli.record_prompt_history(&trimmed);
-                cli.run_turn(&trimmed)?;
+                // A failed turn (network blip, 429, expired key) also returns
+                // to the prompt instead of exiting the REPL.
+                if let Err(error) = cli.run_turn(&prompt) {
+                    eprintln!("{error}");
+                    if let Some(hint) = hint_for_turn_error(&error.to_string()) {
+                        eprintln!("{hint}");
+                    }
+                    if let Some(hint) = failover_hint(&error.to_string()) {
+                        eprintln!("{hint}");
+                    }
+                }
             }
-            input::ReadOutcome::Cancel => {}
+            input::ReadOutcome::Cancel => {
+                // A first Ctrl+C often means "how do I leave?" — say it once.
+                if !exit_hint_shown {
+                    exit_hint_shown = true;
+                    eprintln!("(usa /exit o Ctrl+D para salir)");
+                }
+            }
             input::ReadOutcome::Exit => {
                 cli.persist_session()?;
                 break;
@@ -7140,6 +8070,16 @@ struct LiveCli {
     runtime: BuiltRuntime,
     session: SessionHandle,
     prompt_history: Vec<PromptHistoryEntry>,
+    /// Stored here (not only on the runtime's api client) because every turn
+    /// builds a FRESH runtime: without re-applying, `--effort`/`/effort`
+    /// silently stopped working after the first turn.
+    reasoning_effort: Option<String>,
+    /// `/plan`: the next turn runs with tools DISABLED so the model can only
+    /// plan, never execute. Consumed (reset) by `prepare_turn_runtime`.
+    plan_mode_once: std::cell::Cell<bool>,
+    /// `/fast`: the model that was active before switching to the fast
+    /// (subagent) model, so a second `/fast` switches back.
+    fast_model_stash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7168,6 +8108,8 @@ struct BuiltRuntime {
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     mcp_active: bool,
+    /// Emits agent_finished/agent_failed dashboard telemetry on drop.
+    agent_tracer: Option<SessionTracer>,
 }
 
 impl BuiltRuntime {
@@ -7182,7 +8124,15 @@ impl BuiltRuntime {
             plugins_active: true,
             mcp_state,
             mcp_active: true,
+            agent_tracer: None,
         }
+    }
+
+    /// Registers the dashboard tracer whose session shows up as an agent
+    /// card; the matching agent_started event is emitted by the caller.
+    fn with_agent_tracer(mut self, tracer: SessionTracer) -> Self {
+        self.agent_tracer = Some(tracer);
+        self
     }
 
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
@@ -7236,6 +8186,14 @@ impl DerefMut for BuiltRuntime {
 
 impl Drop for BuiltRuntime {
     fn drop(&mut self) {
+        if let Some(tracer) = &self.agent_tracer {
+            let event = if std::thread::panicking() {
+                AnalyticsEvent::agent_failed(tracer.session_id(), "session aborted")
+            } else {
+                AnalyticsEvent::agent_finished(tracer.session_id())
+            };
+            tracer.record_analytics(event);
+        }
         let _ = self.shutdown_mcp();
         let _ = self.shutdown_plugins();
     }
@@ -7654,15 +8612,26 @@ impl LiveCli {
             runtime,
             session,
             prompt_history: Vec::new(),
+            reasoning_effort: None,
+            plan_mode_once: std::cell::Cell::new(false),
+            fast_model_stash: None,
         };
         cli.persist_session()?;
         Ok(cli)
     }
 
     fn set_reasoning_effort(&mut self, effort: Option<String>) {
+        self.reasoning_effort.clone_from(&effort);
         if let Some(rt) = self.runtime.runtime.as_mut() {
             rt.api_client_mut().set_reasoning_effort(effort);
         }
+    }
+
+    /// Drops the last `steps` user exchanges (each user message plus
+    /// everything after it) from the live session. Returns how many
+    /// messages were removed.
+    fn rewind_exchanges(&mut self, steps: usize) -> usize {
+        truncate_last_exchanges(&mut self.runtime.session_mut().messages, steps)
     }
 
     fn startup_banner(&self) -> String {
@@ -7691,7 +8660,9 @@ impl LiveCli {
 ██║     ██║     ██╔══██║██║███╗██║\n\
 ╚██████╗███████╗██║  ██║╚███╔███╔╝\n\
  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝\x1b[0m \x1b[38;5;208mCode\x1b[0m 🦞\n\n\
+  \x1b[2mVersion\x1b[0m          {VERSION}\n\
   \x1b[2mModel\x1b[0m            {}\n\
+  \x1b[2mProvider\x1b[0m         {}\n\
   \x1b[2mPermissions\x1b[0m      {}\n\
   \x1b[2mBranch\x1b[0m           {}\n\
   \x1b[2mWorkspace\x1b[0m        {}\n\
@@ -7700,12 +8671,58 @@ impl LiveCli {
   \x1b[2mAuto-save\x1b[0m        {}\n\n\
   Type \x1b[1m/help\x1b[0m for commands · \x1b[1m/status\x1b[0m for live context · \x1b[2m/resume latest\x1b[0m jumps back to the newest session · \x1b[1m/diff\x1b[0m then \x1b[1m/commit\x1b[0m to ship · \x1b[2mTab\x1b[0m for workflow completions · \x1b[2mShift+Enter\x1b[0m for newline",
             self.model,
+            provider_presets::active_provider_summary().0,
             self.permission_mode.as_str(),
             git_branch,
             workspace,
             cwd,
             self.session.id,
             session_path,
+        )
+    }
+
+    /// `/summary`: the session at a glance — one block instead of stitching
+    /// together /status, /cost and /history.
+    fn format_session_summary(&self) -> String {
+        let session = self.runtime.session();
+        let tracker = UsageTracker::from_session(session);
+        let usage = tracker.cumulative_usage();
+        let last_prompt = session
+            .prompt_history
+            .last()
+            .map_or("(none)", |entry| entry.text.as_str());
+        format!(
+            "Summary
+  Model            {}
+  Provider         {}
+  Effort           {}
+  Session          {}
+  Messages         {}
+  Turns            {}
+  Total tokens     {}
+  Context          {}
+  Estimated cost   {}
+  Last prompt      {}
+  File             {}",
+            self.model,
+            provider_presets::active_provider_summary().0,
+            self.reasoning_effort
+                .as_deref()
+                .unwrap_or("(provider default)"),
+            session.session_id,
+            session.messages.len(),
+            tracker.turns(),
+            usage.total_tokens(),
+            render_utilization_bar(
+                usage
+                    .input_tokens
+                    .saturating_mul(100)
+                    .checked_div(runtime::auto_compaction_threshold_from_env())
+                    .unwrap_or(0)
+            ),
+            format_usd(usage.estimate_cost_usd().total_cost_usd()),
+            truncate_retry_error(last_prompt),
+            self.session.path.display(),
         )
     }
 
@@ -7725,18 +8742,27 @@ impl LiveCli {
         emit_output: bool,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        // `/plan` disables tools for exactly one turn; consuming the flag
+        // here (not in the handler) keeps it correct even if the turn errors.
+        let enable_tools = !self.plan_mode_once.replace(false);
+        let mut runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
             self.model.clone(),
             self.system_prompt.clone(),
-            true,
+            enable_tools,
             emit_output,
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
+        // Re-apply the session's effort: this runtime is brand new and would
+        // otherwise silently reset to the provider default.
+        if let Some(rt) = runtime.runtime.as_mut() {
+            rt.api_client_mut()
+                .set_reasoning_effort(self.reasoning_effort.clone());
+        }
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
         Ok((runtime, hook_abort_monitor))
@@ -7752,25 +8778,34 @@ impl LiveCli {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
+        let effort_suffix = self
+            .reasoning_effort
+            .as_deref()
+            .map_or(String::new(), |effort| format!(", effort {effort}"));
         spinner.tick(
-            "🦀 Thinking...",
+            &format!("🦀 Thinking... ({}{effort_suffix})", self.model),
             TerminalRenderer::new().color_theme(),
             &mut stdout,
         )?;
+        let turn_started = Instant::now();
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
                 self.replace_runtime(runtime)?;
-                spinner.finish(
-                    "✨ Done",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
                 let final_text = final_assistant_text(&summary);
-                if !final_text.is_empty() {
-                    println!("{final_text}");
+                let theme = *TerminalRenderer::new().color_theme();
+                let done_label = format!("✨ Done ({:.1}s)", turn_started.elapsed().as_secs_f32());
+                if final_text.is_empty() {
+                    // Tool-only turn: the spinner line is untouched, clear it.
+                    spinner.finish(&done_label, &theme, &mut stdout)?;
+                } else {
+                    // The response was already rendered by the streaming path;
+                    // do NOT print it again as raw markdown. Terminate its
+                    // last line and place the marker below, without erasing it.
+                    let _ = writeln!(stdout);
+                    spinner.finish_below(&done_label, &theme, &mut stdout)?;
                 }
                 println!();
                 if let Some(event) = summary.auto_compaction {
@@ -7852,8 +8887,7 @@ impl LiveCli {
                     let max_compact_rounds = 4;
                     let preserve_schedule = [4, 2, 1, 0];
 
-                    for round in 0..max_compact_rounds {
-                        let preserve = preserve_schedule[round];
+                    for (round, &preserve) in preserve_schedule.iter().enumerate() {
                         println!(
                             "  Auto-compacting session (round {}/{}, preserving {} recent messages)...",
                             round + 1,
@@ -8106,6 +9140,60 @@ impl LiveCli {
                 Self::print_sandbox_status();
                 false
             }
+            SlashCommand::Web { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::Web,
+                    claw_multiagent::BuildMode::Greenfield,
+                    prompt.as_deref(),
+                )?;
+                false
+            }
+            SlashCommand::App { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::App,
+                    claw_multiagent::BuildMode::Greenfield,
+                    prompt.as_deref(),
+                )?;
+                false
+            }
+            SlashCommand::Improve { prompt } => {
+                multiagent_build::run_multiagent_build(
+                    claw_multiagent::ProjectKind::Web,
+                    claw_multiagent::BuildMode::Improve,
+                    prompt.as_deref(),
+                )?;
+                false
+            }
+            SlashCommand::Provider { args } => {
+                // `test` needs the active model to resolve the provider, so
+                // it dispatches here instead of inside the presets module.
+                let trimmed = args.as_deref().map(str::trim).unwrap_or_default();
+                if trimmed == "test" || trimmed.starts_with("test ") {
+                    let model = trimmed
+                        .strip_prefix("test")
+                        .map(str::trim)
+                        .filter(|rest| !rest.is_empty())
+                        .unwrap_or(&self.model)
+                        .to_string();
+                    println!("{}", run_provider_probe(&model));
+                } else {
+                    let output = provider_presets::handle_provider_command(args.as_deref());
+                    println!("{output}");
+                    // After a successful `use`, verify the new credentials
+                    // with a live 1-token request so a typo'd key or wrong
+                    // base URL surfaces immediately, not on the next turn.
+                    if trimmed.starts_with("use ") && output.contains("Status           ok") {
+                        let cwd = std::env::current_dir().unwrap_or_default();
+                        let model = ConfigLoader::default_for(&cwd)
+                            .load()
+                            .ok()
+                            .and_then(|config| config.provider().model().map(ToString::to_string))
+                            .unwrap_or_else(|| self.model.clone());
+                        println!("{}", run_provider_probe(&model));
+                    }
+                }
+                false
+            }
             SlashCommand::Compact => {
                 self.compact()?;
                 false
@@ -8140,8 +9228,8 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
-            SlashCommand::Diff => {
-                Self::print_diff()?;
+            SlashCommand::Diff { path } => {
+                Self::print_diff(path.as_deref())?;
                 false
             }
             SlashCommand::Version => {
@@ -8177,7 +9265,7 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Doctor => {
+            SlashCommand::Doctor { online } => {
                 println!(
                     "{}",
                     render_doctor_report(
@@ -8186,6 +9274,9 @@ impl LiveCli {
                     )?
                     .render()
                 );
+                if online {
+                    println!("{}", doctor_online_section());
+                }
                 false
             }
             SlashCommand::Setup => {
@@ -8203,40 +9294,373 @@ impl LiveCli {
                 println!("{}", format_cost_report(usage));
                 false
             }
+            SlashCommand::Usage { scope } => {
+                let tracker = UsageTracker::from_session(self.runtime.session());
+                if matches!(scope.as_deref().map(str::trim), Some("last")) {
+                    let last = tracker.current_turn_usage();
+                    println!(
+                        "Usage (last turn)\n  Input tokens     {}\n  Output tokens    {}\n  Cache create     {}\n  Cache read       {}\n  Total tokens     {}\n  Estimated cost   {}",
+                        last.input_tokens,
+                        last.output_tokens,
+                        last.cache_creation_input_tokens,
+                        last.cache_read_input_tokens,
+                        last.total_tokens(),
+                        format_usd(last.estimate_cost_usd().total_cost_usd()),
+                    );
+                } else {
+                    println!("{}", format_usage_report(&tracker));
+                }
+                false
+            }
+            SlashCommand::Context { .. } => {
+                let tracker = UsageTracker::from_session(self.runtime.session());
+                println!(
+                    "{}",
+                    format_context_report(
+                        &self.model,
+                        self.runtime.estimated_tokens(),
+                        tracker.cumulative_usage().input_tokens,
+                    )
+                );
+                false
+            }
+            SlashCommand::Upgrade => {
+                println!("{}", format_upgrade_report());
+                false
+            }
+            SlashCommand::Effort { level } => {
+                match level.as_deref().map(str::trim) {
+                    None | Some("") => println!(
+                        "Effort\n  Current          {}\n  Usage            /effort low|medium|high|off",
+                        self.reasoning_effort.as_deref().unwrap_or("(provider default)")
+                    ),
+                    Some("off" | "default") => {
+                        self.set_reasoning_effort(None);
+                        println!("Effort\n  Current          (provider default)\n  Applies          next turn onward");
+                    }
+                    Some(level @ ("low" | "medium" | "high")) => {
+                        self.set_reasoning_effort(Some(level.to_string()));
+                        println!("Effort\n  Current          {level}\n  Applies          next turn onward");
+                    }
+                    Some(other) => {
+                        eprintln!("unsupported effort '{other}'. Usage: /effort low|medium|high|off");
+                    }
+                }
+                false
+            }
+            SlashCommand::Copy { target } => {
+                let all = matches!(target.as_deref().map(str::trim), Some("all"));
+                let text = if all {
+                    render_session_transcript(self.runtime.session())
+                } else {
+                    last_assistant_text(self.runtime.session())
+                };
+                if text.trim().is_empty() {
+                    eprintln!("nothing to copy yet — no assistant response in this session");
+                } else {
+                    match copy_to_clipboard(&text) {
+                        Ok(tool) => println!(
+                            "Copy\n  Copied           {} ({} líneas, {} chars, via {tool})",
+                            if all {
+                                "whole conversation"
+                            } else {
+                                "last response"
+                            },
+                            text.lines().count(),
+                            text.chars().count()
+                        ),
+                        Err(error) => eprintln!("{error}"),
+                    }
+                }
+                false
+            }
+            SlashCommand::Branch { name } => {
+                // Branch names end up in filenames and resume references:
+                // reject separators before they produce a broken handle.
+                if let Some(name) = name.as_deref() {
+                    if name.contains(['/', '\\']) || name.chars().any(char::is_whitespace) {
+                        eprintln!(
+                            "invalid branch name '{name}': use letters, numbers, - and _ only"
+                        );
+                        return Ok(false);
+                    }
+                }
+                let forked = self.runtime.session().fork(name);
+                let forked_id = forked.session_id.clone();
+                match create_managed_session_handle(&forked_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|handle| {
+                        forked
+                            .save_to_path(&handle.path)
+                            .map(|()| handle.path)
+                            .map_err(|error| error.to_string())
+                    }) {
+                    Ok(path) => println!(
+                        "Branch\n  Forked to        {forked_id}\n  File             {}\n  Resume           claw --resume {forked_id}\n  Note             current session continues here unchanged",
+                        path.display()
+                    ),
+                    Err(error) => eprintln!("could not fork session: {error}"),
+                }
+                false
+            }
+            SlashCommand::Rewind { steps } => {
+                let steps = steps
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map_or(Some(1), |value| value.parse::<usize>().ok());
+                match steps {
+                    Some(steps) if steps > 0 => {
+                        // Capture what is about to disappear so the report can
+                        // name it — "removed 4 messages" alone is unverifiable.
+                        let doomed_first_line = {
+                            let messages = &self.runtime.session().messages;
+                            let mut probe = messages.clone();
+                            let removed = truncate_last_exchanges(&mut probe, steps);
+                            messages
+                                .get(probe.len())
+                                .filter(|_| removed > 0)
+                                .map(message_first_text_line)
+                        };
+                        let removed = self.rewind_exchanges(steps);
+                        if removed == 0 {
+                            println!("Rewind\n  Result           nothing to rewind (no user exchange in session)");
+                        } else {
+                            if let Err(error) = self.persist_session() {
+                                eprintln!("warning: could not persist session: {error}");
+                            }
+                            println!(
+                                "Rewind\n  Removed          {removed} message(s), starting at: {}\n  Messages left    {}\n  Note             the model will not see the removed exchange(s)",
+                                doomed_first_line.as_deref().unwrap_or("(sin texto)"),
+                                self.runtime.session().messages.len()
+                            );
+                        }
+                    }
+                    _ => {
+                        eprintln!("Usage: /rewind [n]  (n = how many exchanges to drop, default 1)")
+                    }
+                }
+                false
+            }
+            SlashCommand::Files => {
+                println!("{}", format_files_report());
+                false
+            }
+            SlashCommand::Keybindings => {
+                println!("{}", format_keybindings_report());
+                false
+            }
+            SlashCommand::Summary => {
+                println!("{}", self.format_session_summary());
+                false
+            }
+            SlashCommand::Hooks { .. } => {
+                println!("{}", format_hooks_report());
+                false
+            }
+            SlashCommand::Color { .. } | SlashCommand::Theme { .. } => {
+                let arg = match &command {
+                    SlashCommand::Color { scheme } => scheme.clone(),
+                    SlashCommand::Theme { name } => name.clone(),
+                    _ => None,
+                };
+                match arg.as_deref().map(str::trim) {
+                    None | Some("") => println!("{}", format_color_report()),
+                    Some("on" | "always") => {
+                        render::set_color_override(Some(true));
+                        persist_color_mode("on");
+                        println!("{}", format_color_report());
+                    }
+                    Some("off" | "never") => {
+                        render::set_color_override(Some(false));
+                        persist_color_mode("off");
+                        println!("{}", format_color_report());
+                    }
+                    Some("auto") => {
+                        render::set_color_override(None);
+                        persist_color_mode("auto");
+                        println!("{}", format_color_report());
+                    }
+                    Some("dark" | "light") => {
+                        println!(
+                            "claw no impone paletas: los colores los decide tu terminal. \
+                             Cambia el tema del terminal para dark/light; /color on|off|auto \
+                             controla si claw emite ANSI."
+                        );
+                    }
+                    Some(other) => {
+                        eprintln!("unsupported mode '{other}'. Usage: /color on|off|auto");
+                    }
+                }
+                false
+            }
+            SlashCommand::Exit => {
+                // Reached when /exit carries arguments or arrives via a
+                // dispatch path that skips the REPL's literal string match.
+                self.persist_session()?;
+                println!("Session saved. Bye!");
+                std::process::exit(0);
+            }
+            SlashCommand::Plan { mode } => {
+                match mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(request) => {
+                        // Tools off for one turn: the model can read nothing
+                        // and write nothing — it can only think out loud.
+                        self.plan_mode_once.set(true);
+                        let prompt = format!(
+                            "PLANNING MODE (tools are disabled this turn). Produce a concrete, \
+                             step-by-step implementation plan for the request below: files to \
+                             touch, functions/interfaces, risks, and how to verify. Do NOT \
+                             write final code.\n\nRequest:\n{request}"
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    None => eprintln!("Usage: /plan <qué quieres planificar>"),
+                }
+                false
+            }
+            SlashCommand::Tasks { args } => {
+                let args = args.as_deref().map(str::trim).unwrap_or("");
+                let jobs = tools::list_agent_jobs();
+                match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+                    [] | ["list"] => {
+                        if jobs.is_empty() {
+                            println!(
+                                "Tasks\n  Result           sin agentes en background en este workspace\n  Nota             los lanza la herramienta Agent; los manifiestos viven en .clawd-agents/"
+                            );
+                        } else {
+                            println!("Tasks ({} job(s), workspace store)", jobs.len());
+                            for job in jobs.iter().rev().take(20) {
+                                let id: String = job.id.chars().take(12).collect();
+                                println!(
+                                    "  {id:<13} {:<8} {}  {}",
+                                    job.status,
+                                    job.created_at,
+                                    truncate_retry_error(&job.name)
+                                );
+                            }
+                            if jobs.len() > 20 {
+                                println!("  … y {} más (/tasks get <id>)", jobs.len() - 20);
+                            }
+                        }
+                    }
+                    ["get", id] => match jobs.iter().find(|job| job.id.starts_with(id)) {
+                        Some(job) => println!(
+                            "Task {}\n  Name             {}\n  Type             {}\n  Status           {}\n  Created          {}\n  Description      {}",
+                            job.id,
+                            job.name,
+                            job.subagent_type.as_deref().unwrap_or("general-purpose"),
+                            job.status,
+                            job.created_at,
+                            truncate_retry_error(&job.description),
+                        ),
+                        None => eprintln!("No hay ningún job cuyo id empiece por '{id}'."),
+                    },
+                    _ => eprintln!("Usage: /tasks [list|get <id>]"),
+                }
+                false
+            }
+            SlashCommand::Retry => {
+                // Only real prompts land in prompt_history (slash commands
+                // are filtered in the REPL loop), so the last entry is the
+                // last model-bound message.
+                let last = self
+                    .runtime
+                    .session()
+                    .prompt_history
+                    .last()
+                    .map(|entry| entry.text.clone());
+                match last {
+                    Some(prompt) => {
+                        println!(
+                            "Retry\n  Reenviando       {}",
+                            truncate_retry_error(&prompt)
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    None => eprintln!("No hay ningún prompt previo que reintentar en esta sesión."),
+                }
+                false
+            }
+            SlashCommand::Review { scope } => {
+                match collect_review_diff(scope.as_deref()) {
+                    Ok(diff) => {
+                        let prompt = format!(
+                            "Review the following git diff like a strict senior engineer: \
+                             point out real bugs, security issues, and risky patterns with \
+                             file:line references; skip style nitpicks. End with a verdict \
+                             (ship / fix first).\n\n```diff\n{diff}\n```"
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    Err(message) => eprintln!("{message}"),
+                }
+                false
+            }
+            SlashCommand::Fast => match self.fast_model_stash.take() {
+                Some(previous) => {
+                    println!("Fast mode OFF — volviendo a {previous}");
+                    self.set_model(Some(previous))?
+                }
+                None => match runtime::load_user_settings_field("subagentModel") {
+                    Some(fast) if fast != self.model => {
+                        self.fast_model_stash = Some(self.model.clone());
+                        println!("Fast mode ON — usando {fast} (repite /fast para volver)");
+                        self.set_model(Some(fast))?
+                    }
+                    Some(_) => {
+                        eprintln!("el modelo rápido configurado es el actual; nada que cambiar");
+                        false
+                    }
+                    None => {
+                        eprintln!(
+                            "no hay modelo rápido configurado; define subagentModel con /setup"
+                        );
+                        false
+                    }
+                },
+            },
+            SlashCommand::ReleaseNotes => {
+                println!("{}", format_release_notes_report());
+                false
+            }
+            SlashCommand::SecurityReview => {
+                println!("{}", format_security_review_report());
+                false
+            }
+            SlashCommand::DesignReview { fix } => {
+                println!("{}", format_design_review_report());
+                if fix {
+                    let findings = collect_design_review_findings();
+                    if findings.is_empty() {
+                        println!("  Fix              nada que corregir — la auditoría está limpia");
+                    } else {
+                        self.run_turn(&design_review_fix_prompt(&findings))?;
+                    }
+                }
+                false
+            }
+            SlashCommand::PrivacySettings => {
+                println!("{}", format_privacy_report());
+                false
+            }
             SlashCommand::Login
             | SlashCommand::Logout
             | SlashCommand::Vim
-            | SlashCommand::Upgrade
             | SlashCommand::Share
             | SlashCommand::Feedback
-            | SlashCommand::Files
-            | SlashCommand::Fast
-            | SlashCommand::Exit
-            | SlashCommand::Summary
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
             | SlashCommand::Stickers
             | SlashCommand::Insights
             | SlashCommand::Thinkback
-            | SlashCommand::ReleaseNotes
-            | SlashCommand::SecurityReview
-            | SlashCommand::Keybindings
-            | SlashCommand::PrivacySettings
-            | SlashCommand::Plan { .. }
-            | SlashCommand::Review { .. }
-            | SlashCommand::Tasks { .. }
-            | SlashCommand::Theme { .. }
             | SlashCommand::Voice { .. }
-            | SlashCommand::Usage { .. }
             | SlashCommand::Rename { .. }
-            | SlashCommand::Copy { .. }
-            | SlashCommand::Hooks { .. }
-            | SlashCommand::Context { .. }
-            | SlashCommand::Color { .. }
-            | SlashCommand::Effort { .. }
-            | SlashCommand::Branch { .. }
-            | SlashCommand::Rewind { .. }
             | SlashCommand::Ide { .. }
             | SlashCommand::Tag { .. }
             | SlashCommand::OutputStyle { .. }
@@ -8259,6 +9683,15 @@ impl LiveCli {
     }
 
     fn print_status(&self) {
+        // status_context reads the cwd; if it was deleted out from under the
+        // REPL, report it instead of panicking (which would abort the CLI).
+        let context = match status_context(Some(&self.session.path)) {
+            Ok(context) => context,
+            Err(error) => {
+                eprintln!("could not load status: {error}");
+                return;
+            }
+        };
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
         println!(
@@ -8273,7 +9706,7 @@ impl LiveCli {
                     estimated_tokens: self.runtime.estimated_tokens(),
                 },
                 self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
+                &context,
                 None, // #148: REPL /status doesn't carry flag provenance
                 None,
             )
@@ -8298,6 +9731,37 @@ impl LiveCli {
     }
 
     fn print_prompt_history(&self, count: Option<&str>) {
+        // `/history search <term>`: filter instead of tail.
+        if let Some(term) = count
+            .and_then(|value| value.trim().strip_prefix("search"))
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+        {
+            let needle = term.to_lowercase();
+            let matches: Vec<&runtime::SessionPromptEntry> = self
+                .runtime
+                .session()
+                .prompt_history
+                .iter()
+                .filter(|entry| entry.text.to_lowercase().contains(&needle))
+                .collect();
+            if matches.is_empty() {
+                println!("History search\n  Term             {term}\n  Matches          0");
+            } else {
+                println!(
+                    "History search ({} match(es) for \"{term}\")",
+                    matches.len()
+                );
+                for entry in matches.iter().rev().take(20) {
+                    println!(
+                        "  {}  {}",
+                        format_history_timestamp(entry.timestamp_ms),
+                        truncate_retry_error(&entry.text)
+                    );
+                }
+            }
+            return;
+        }
         let limit = match parse_history_count(count) {
             Ok(limit) => limit,
             Err(message) => {
@@ -8331,7 +9795,13 @@ impl LiveCli {
     }
 
     fn print_sandbox_status() {
-        let cwd = env::current_dir().expect("current dir");
+        let cwd = match env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                eprintln!("could not read the current directory: {error}");
+                return;
+            }
+        };
         let loader = ConfigLoader::default_for(&cwd);
         let runtime_config = loader
             .load()
@@ -8355,7 +9825,33 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let model = resolve_model_alias_with_config(&model);
+        let requested = model;
+        let resolved = resolve_model_alias_with_config(&requested);
+        // Config aliases and the exact registry go first; if neither
+        // recognized the name, a unique substring of a canonical ID still
+        // resolves (`/model sonnet-5` → the full ID). Unknown names pass
+        // through verbatim — custom/ollama models are legitimate.
+        let model = if resolved == requested.trim() {
+            match api::resolve_model_fuzzy(&requested) {
+                Ok(id) => {
+                    if id != resolved {
+                        println!("  Nota             '{}' → {id}", requested.trim());
+                    }
+                    id.to_string()
+                }
+                Err(candidates) if candidates.len() > 1 => {
+                    eprintln!(
+                        "'{}' es ambiguo — coincide con: {}",
+                        requested.trim(),
+                        candidates.join(", ")
+                    );
+                    return Ok(false);
+                }
+                Err(_) => resolved,
+            }
+        } else {
+            resolved
+        };
 
         if model == self.model {
             println!(
@@ -8389,6 +9885,15 @@ impl LiveCli {
             "{}",
             format_model_switch_report(&previous, &model, message_count)
         );
+        // Crossing provider families (e.g. glm → gpt) changes which env
+        // credentials are used; say so before the next turn fails.
+        let previous_kind = detect_provider_kind(&api::resolve_model_alias(&previous));
+        let next_kind = detect_provider_kind(&api::resolve_model_alias(&model));
+        if previous_kind != next_kind {
+            println!(
+                "  Note             el nuevo modelo usa otro proveedor ({next_kind:?}); verifica con /provider test"
+            );
+        }
         Ok(true)
     }
 
@@ -8474,7 +9979,14 @@ impl LiveCli {
 
     fn print_cost(&self) {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
+        let estimate = cumulative.estimate_cost_usd();
+        println!(
+            "{}\n  Input cost       {}\n  Output cost      {}\n  Turns            {}",
+            format_cost_report(cumulative),
+            format_usd(estimate.input_cost_usd),
+            format_usd(estimate.output_cost_usd),
+            self.runtime.usage().turns()
+        );
     }
 
     fn resume_session(
@@ -8611,8 +10123,8 @@ impl LiveCli {
         let cwd = env::current_dir()?;
         // #803: reject flag-shaped tokens in list filter for BOTH text and JSON modes.
         // Previously the guard was JSON-only (#793); text mode silently returned empty success.
-        if action.as_deref() == Some("list") {
-            if let Some(filter) = target.as_deref() {
+        if action == Some("list") {
+            if let Some(filter) = target {
                 if filter.starts_with('-') {
                     if matches!(output_format, CliOutputFormat::Json) {
                         // ROADMAP #817: this is a handled local inventory parse error.
@@ -8785,8 +10297,8 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_diff_report()?);
+    fn print_diff(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_diff_report(path)?);
         Ok(())
     }
 
@@ -8799,9 +10311,11 @@ impl LiveCli {
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        let rendered = render_export_text(self.runtime.session());
+        let bytes = rendered.len();
+        fs::write(&export_path, rendered)?;
         println!(
-            "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
+            "Export\n  Result           wrote transcript\n  File             {}\n  Size             {bytes} bytes\n  Messages         {}",
             export_path.display(),
             self.runtime.session().messages.len(),
         );
@@ -9006,6 +10520,12 @@ impl LiveCli {
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
+        if !skipped {
+            println!(
+                "  Estimated tokens {} (after compaction)",
+                self.runtime.estimated_tokens()
+            );
+        }
         Ok(())
     }
 
@@ -9577,6 +11097,7 @@ fn print_status_snapshot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_json_value(
     model: Option<&str>,
     usage: StatusUsage,
@@ -9889,10 +11410,15 @@ fn format_status_report(
             format!("\n  Permission source {}{env_suffix}", p.source.as_str())
         })
         .unwrap_or_default();
+    // Multi-provider support means the active endpoint is no longer implied
+    // by the model name; show what the API clients will actually use.
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
     blocks.extend([
         format!(
             "{status_line}
   Model            {model}{model_source_line}
+  Provider         {provider_summary}
+  Provider URL     {provider_url}
   Permission mode  {permission_mode}{permission_source_line}
   Messages         {}
   Turns            {}
@@ -10073,15 +11599,12 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
     //        (#731: "not supported on macOS" is a degraded state, not a hard error;
     //         filesystem_active:true means partial containment is working)
     // error = enabled but unsupported AND no filesystem sandbox either (nothing active)
-    let top_status = if !status.enabled {
+    let top_status = if !status.enabled || status.active {
         "ok"
-    } else if status.active {
-        "ok"
-    } else if status.supported {
-        "warn"
-    } else if status.filesystem_active {
-        // Platform doesn't support namespace isolation but filesystem sandbox is active:
-        // this is a degraded/partial state, not a hard error.
+    } else if status.supported || status.filesystem_active {
+        // supported-but-not-active is degraded; likewise a platform without
+        // namespace isolation where the filesystem sandbox is active is a
+        // degraded/partial state, not a hard error.
         "warn"
     } else {
         "error"
@@ -10450,6 +11973,7 @@ fn render_doctor_help_json() -> serde_json::Value {
 }
 
 /// #683-#692: extract structured metadata from help prose
+#[allow(clippy::type_complexity)]
 fn extract_help_metadata(
     topic: LocalHelpTopic,
 ) -> (
@@ -11085,11 +12609,14 @@ fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     }
 }
 
-fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
-    render_diff_report_for(&env::current_dir()?)
+fn render_diff_report(path: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    render_diff_report_for(&env::current_dir()?, path)
 }
 
-fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn render_diff_report_for(
+    cwd: &Path,
+    path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // Verify we are inside a git repository before calling `git diff`.
     // Running `git diff --cached` outside a git tree produces a misleading
     // "unknown option `cached`" error because git falls back to --no-index mode.
@@ -11104,13 +12631,30 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
             cwd.display()
         ));
     }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    // A leading dash would be parsed by git as a flag, not a pathspec.
+    if let Some(file) = path {
+        if file.starts_with('-') {
+            return Ok(format!(
+                "Diff\n  Result           invalid path\n  Detail           {file} empieza por '-' — usa una ruta de archivo"
+            ));
+        }
+    }
+    let mut staged_args = vec!["diff", "--cached"];
+    let mut unstaged_args = vec!["diff"];
+    if let Some(file) = path {
+        staged_args.extend(["--", file]);
+        unstaged_args.extend(["--", file]);
+    }
+    let staged = run_git_diff_command_in(cwd, &staged_args)?;
+    let unstaged = run_git_diff_command_in(cwd, &unstaged_args)?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
-        return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
-                .to_string(),
+        let detail = path.map_or_else(
+            || "no current changes".to_string(),
+            |file| format!("sin cambios en {file}"),
         );
+        return Ok(format!(
+            "Diff\n  Result           clean working tree\n  Detail           {detail}"
+        ));
     }
 
     let mut sections = Vec::new();
@@ -12440,7 +13984,23 @@ fn build_runtime_with_plugin_state(
     if emit_output {
         runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
     }
-    Ok(BuiltRuntime::new(runtime, plugin_registry, mcp_state))
+    let dashboard_tracer = dashboard_session_tracer(session_id);
+    if let Some(tracer) = &dashboard_tracer {
+        runtime = runtime.with_session_tracer(tracer.clone());
+    }
+    let mut built = BuiltRuntime::new(runtime, plugin_registry, mcp_state);
+    if let Some(tracer) = dashboard_tracer {
+        // Label the agent card in claw-dashboard; parallel claw instances
+        // can each set CLAW_AGENT_LABEL to a human-readable task name.
+        let label = env::var("CLAW_AGENT_LABEL")
+            .ok()
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| session_id.to_string());
+        tracer.record_analytics(AnalyticsEvent::agent_started(session_id, label));
+        built = built.with_agent_tracer(tracer);
+    }
+    Ok(built)
 }
 
 struct CliHookProgressReporter;
@@ -12577,9 +14137,12 @@ impl AnthropicRuntimeClient {
         let client = match detect_provider_kind(&resolved_model) {
             ProviderKind::Anthropic => {
                 let auth = resolve_cli_auth_source()?;
-                let inner = AnthropicClient::from_auth(auth)
+                let mut inner = AnthropicClient::from_auth(auth)
                     .with_base_url(api::read_base_url())
                     .with_prompt_cache(PromptCache::new(session_id));
+                if let Some(tracer) = dashboard_session_tracer(session_id) {
+                    inner = inner.with_session_tracer(tracer);
+                }
                 ApiProviderClient::Anthropic(inner)
             }
             ProviderKind::Xai | ProviderKind::OpenAi => {
@@ -12593,7 +14156,12 @@ impl AnthropicRuntimeClient {
                 // OpenRouter, xAI, DashScope, Ollama, and any other
                 // OpenAI-compat endpoint users configure via
                 // `OPENAI_BASE_URL` / `XAI_BASE_URL` / `DASHSCOPE_BASE_URL`.
-                ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
+                let mut client =
+                    ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?;
+                if let Some(tracer) = dashboard_session_tracer(session_id) {
+                    client = client.with_session_tracer(tracer);
+                }
+                client
             }
         };
         Ok(Self {
@@ -12622,6 +14190,81 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
 #[allow(clippy::result_large_err)]
 fn resolve_cli_auth_source_for_cwd() -> Result<AuthSource, api::ApiError> {
     resolve_startup_auth_source(|| Ok(None))
+}
+
+/// `/provider test [model]`: one real 1-token request against the resolved
+/// provider, so a bad key, wrong base URL, or DNS/proxy failure surfaces
+/// here — with the exact error — instead of on the first real turn.
+fn run_provider_probe(model: &str) -> String {
+    let resolved_model = api::resolve_model_alias(model);
+    let (provider_summary, provider_url) = provider_presets::active_provider_summary();
+    let header = format!(
+        "Provider test\n  Model            {resolved_model}\n  Provider         {provider_summary}\n  Provider URL     {provider_url}"
+    );
+    let client = match detect_provider_kind(&resolved_model) {
+        ProviderKind::Anthropic => match resolve_cli_auth_source() {
+            Ok(auth) => ApiProviderClient::Anthropic(
+                AnthropicClient::from_auth(auth).with_base_url(api::read_base_url()),
+            ),
+            Err(error) => {
+                return format!(
+                    "{header}\n  Result           FAILED (auth)\n  Error            {error}"
+                );
+            }
+        },
+        ProviderKind::Xai | ProviderKind::OpenAi => {
+            match ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None) {
+                Ok(client) => client,
+                Err(error) => {
+                    return format!(
+                        "{header}\n  Result           FAILED (setup)\n  Error            {error}"
+                    );
+                }
+            }
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return format!("{header}\n  Result           FAILED\n  Error            {error}")
+        }
+    };
+    let request = MessageRequest {
+        model: resolved_model.clone(),
+        max_tokens: 1,
+        messages: vec![InputMessage::user_text("ping")],
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    // Bounded: a black-holed endpoint (wrong port, firewalled proxy) must
+    // report "timed out", not hang the REPL until Ctrl+C.
+    let response = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.send_message(&request),
+        )
+        .await
+    });
+    let elapsed_ms = started.elapsed().as_millis();
+    match response {
+        Ok(Ok(_)) => {
+            let slow_note = if elapsed_ms > 5_000 {
+                "\n  Note             respuesta lenta (>5s): revisa red/proxy o elige un endpoint más cercano"
+            } else {
+                ""
+            };
+            format!(
+                "{header}\n  Result           ok ({elapsed_ms} ms){slow_note}\n  Hint             credentials and endpoint verified with a live request"
+            )
+        }
+        Ok(Err(error)) => format!(
+            "{header}\n  Result           FAILED ({elapsed_ms} ms)\n  Error            {}\n  Hint             check /provider show and your key; base URL must include the protocol path the provider expects",
+            truncate_retry_error(&error.to_string())
+        ),
+        Err(_) => format!(
+            "{header}\n  Result           FAILED (timeout tras 30s)\n  Hint             el endpoint no responde — revisa la Base URL, el puerto y tu red/proxy"
+        ),
+    }
 }
 
 impl ApiClient for AnthropicRuntimeClient {
@@ -14008,39 +15651,37 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
             let content = message
                 .blocks
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(InputContentBlock::Text { text: text.clone() })
-                    }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
                     ContentBlock::Thinking {
                         thinking,
                         signature,
                     } => {
                         // 保留 Thinking 块：OpenAI 兼容协议会把它转成 reasoning_content 字段
                         // 回传给 DeepSeek V4（避免 400 "reasoning_content must be passed back" 错误）
-                        Some(InputContentBlock::Thinking {
+                        InputContentBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: signature.clone(),
-                        })
+                        }
                     }
-                    ContentBlock::ToolUse { id, name, input } => Some(InputContentBlock::ToolUse {
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
                         input: serde_json::from_str(input)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                    }),
+                    },
                     ContentBlock::ToolResult {
                         tool_use_id,
                         output,
                         is_error,
                         ..
-                    } => Some(InputContentBlock::ToolResult {
+                    } => InputContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
                         content: vec![ToolResultContentBlock::Text {
                             text: output.clone(),
                         }],
                         is_error: *is_error,
-                    }),
+                    },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -14269,29 +15910,31 @@ mod tests {
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
         create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_connected_line, format_cost_report, format_history_timestamp,
-        format_internal_prompt_progress_line, format_issue_report, format_model_report,
-        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_help_topic,
-        render_help_topic_json, render_memory_report, render_prompt_history_report,
-        render_repl_help, render_resume_usage, render_session_list, render_session_markdown,
-        resolve_model_alias, resolve_model_alias_with_config, resolve_repl_model,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_resume_command, short_tool_id, slash_command_completion_candidates_with_sessions,
-        split_error_hint, status_context, status_json_value, summarize_tool_payload_for_markdown,
-        try_resolve_bare_skill_prompt, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitOperation, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
+        format_bughunter_report, format_color_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_connected_line,
+        format_context_report, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_keybindings_report,
+        format_model_report, format_model_switch_report, format_permissions_report,
+        format_permissions_switch_report, format_pr_report, format_resume_report,
+        format_status_report, format_tool_call_start, format_tool_result, format_ultraplan_report,
+        format_unknown_slash_command, format_unknown_slash_command_message, format_upgrade_report,
+        format_user_visible_api_error, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_export_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, parse_history_count, permission_policy, print_help_to,
+        push_output_block, render_config_report, render_diff_report, render_diff_report_for,
+        render_help_topic, render_help_topic_json, render_memory_report,
+        render_prompt_history_report, render_repl_help, render_resume_usage, render_session_list,
+        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
+        resolve_repl_model, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        slash_command_completion_candidates_with_sessions, split_error_hint, status_context,
+        status_json_value, summarize_tool_payload_for_markdown, truncate_last_exchanges,
+        truncate_retry_error, try_resolve_bare_skill_prompt, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitOperation,
+        GitWorkspaceSummary, InternalPromptProgressEvent, InternalPromptProgressState, LiveCli,
+        LocalHelpTopic, PermissionModeProvenance, PromptHistoryEntry, SessionLifecycleKind,
         SessionLifecycleSummary, SlashCommand, StatusUsage, TmuxPaneSnapshot, DEFAULT_MODEL,
-        LATEST_SESSION_REFERENCE, STUB_COMMANDS,
+        LATEST_SESSION_REFERENCE, STUB_COMMANDS, VERSION,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -15482,6 +17125,7 @@ mod tests {
         assert_eq!(
             parse_args(&["diff".to_string()]).expect("diff should parse"),
             CliAction::Diff {
+                path: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -15493,6 +17137,7 @@ mod tests {
             ])
             .expect("diff --output-format json should parse"),
             CliAction::Diff {
+                path: None,
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -16972,7 +18617,7 @@ mod tests {
         for action in ["remove", "uninstall", "delete"] {
             assert_eq!(
                 parse_args(&["skills".to_string(), action.to_string()])
-                    .expect(&format!("skills {action} should parse")),
+                    .unwrap_or_else(|_| panic!("skills {action} should parse")),
                 CliAction::Skills {
                     args: Some(action.to_string()),
                     output_format: CliOutputFormat::Text,
@@ -17296,7 +18941,9 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(
+            help.contains("/mcp [list|show <server>|add <name> <command|url>|remove <name>|help]")
+        );
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -17588,6 +19235,183 @@ mod tests {
         assert!(report.contains("Previous         claude-sonnet"));
         assert!(report.contains("Current          claude-opus"));
         assert!(report.contains("Preserved msgs   9"));
+    }
+
+    fn message(role: MessageRole, text: &str) -> ConversationMessage {
+        ConversationMessage {
+            role,
+            blocks: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn truncate_last_exchanges_drops_whole_exchanges() {
+        let mut messages = vec![
+            message(MessageRole::User, "one"),
+            message(MessageRole::Assistant, "answer one"),
+            message(MessageRole::User, "two"),
+            message(MessageRole::Assistant, "answer two"),
+        ];
+        // One step: the last user message and its answer disappear.
+        assert_eq!(truncate_last_exchanges(&mut messages, 1), 2);
+        assert_eq!(messages.len(), 2);
+        // More steps than exchanges: cut at the earliest user message.
+        assert_eq!(truncate_last_exchanges(&mut messages, 5), 2);
+        assert!(messages.is_empty());
+        // Nothing left to rewind.
+        assert_eq!(truncate_last_exchanges(&mut messages, 1), 0);
+    }
+
+    #[test]
+    fn truncate_retry_error_flattens_and_caps() {
+        let long = format!("line one\nline two {}", "x".repeat(300));
+        let flattened = truncate_retry_error(&long);
+        assert!(!flattened.contains('\n'));
+        assert!(flattened.chars().count() <= 141); // 140 + ellipsis
+        assert!(flattened.ends_with('…'));
+        assert_eq!(truncate_retry_error("short error"), "short error");
+    }
+
+    #[test]
+    fn context_report_shows_window_and_threshold() {
+        let report = format_context_report("claude-sonnet-4-5", 5_000, 20_000);
+        assert!(report.contains("Session tokens   5000"));
+        assert!(report.contains("Context window"));
+        assert!(report.contains("Auto-compact at"));
+        assert!(report.contains("/compact"));
+    }
+
+    #[test]
+    fn upgrade_report_names_version_and_rebuild_commands() {
+        let report = format_upgrade_report();
+        assert!(report.contains(VERSION));
+        assert!(report.contains("./install.sh"));
+        assert!(report.contains("install.ps1"));
+        assert!(report.contains("charcsllc/claw-code"));
+    }
+
+    #[test]
+    fn keybindings_report_covers_core_bindings() {
+        let report = format_keybindings_report();
+        assert!(report.contains("Shift+Enter"));
+        assert!(report.contains("Ctrl+R"));
+        assert!(report.contains("Tab"));
+    }
+
+    #[test]
+    fn color_report_names_usage_and_mode() {
+        crate::render::set_color_override(None);
+        let report = format_color_report();
+        assert!(report.contains("Mode"));
+        assert!(report.contains("/color on|off|auto"));
+    }
+
+    #[test]
+    fn turn_error_hints_map_to_the_fixing_command() {
+        use crate::hint_for_turn_error;
+        assert!(hint_for_turn_error("HTTP 401 Unauthorized")
+            .unwrap()
+            .contains("/provider test"));
+        assert!(hint_for_turn_error("retries exhausted after 9 attempts")
+            .unwrap()
+            .contains("limitando"));
+        assert!(hint_for_turn_error("context_window_blocked")
+            .unwrap()
+            .contains("/compact"));
+        assert!(hint_for_turn_error("connection refused")
+            .unwrap()
+            .contains("Base URL"));
+        assert!(hint_for_turn_error("insufficient_quota for this key")
+            .unwrap()
+            .contains("saldo"));
+        assert!(
+            hint_for_turn_error("402: insufficient credits on this account")
+                .unwrap()
+                .contains("saldo")
+        );
+        assert!(
+            hint_for_turn_error("The model `nope-9` does not exist or you do not have access")
+                .unwrap()
+                .contains("/model")
+        );
+        assert!(hint_for_turn_error("529 overloaded_error")
+            .unwrap()
+            .contains("sobrecargado"));
+        assert!(hint_for_turn_error("invalid peer certificate")
+            .unwrap()
+            .contains("TLS"));
+        assert!(hint_for_turn_error("something else entirely").is_none());
+    }
+
+    #[test]
+    fn failover_hint_only_fires_on_outages() {
+        use crate::failover_hint;
+        // Whatever credentials this machine has, a non-outage error must
+        // never produce a failover suggestion.
+        assert!(failover_hint("HTTP 401 Unauthorized").is_none());
+        assert!(failover_hint("context_window_blocked").is_none());
+        // And with <2 credential vars set the hint stays silent even on
+        // outages, so this can only be exercised as "does not panic".
+        let _ = failover_hint("529 overloaded_error");
+    }
+
+    #[test]
+    fn large_paste_detection_uses_a_50_line_threshold() {
+        use crate::large_paste_line_count;
+        assert_eq!(large_paste_line_count("una línea"), None);
+        let fifty = "x\n".repeat(50);
+        assert_eq!(large_paste_line_count(&fifty), None);
+        let sixty = "x\n".repeat(60);
+        assert_eq!(large_paste_line_count(&sixty), Some(60));
+    }
+
+    #[test]
+    fn design_review_fix_prompt_lists_findings_and_caps_them() {
+        use crate::design_review_fix_prompt;
+        let findings: Vec<String> = (0..30).map(|i| format!("[A11Y] problema {i}")).collect();
+        let prompt = design_review_fix_prompt(&findings);
+        assert!(prompt.contains("[A11Y] problema 0"));
+        assert!(prompt.contains("[A11Y] problema 24"));
+        assert!(!prompt.contains("[A11Y] problema 25"));
+        assert!(prompt.contains("Corrígelos"));
+    }
+
+    #[test]
+    fn utilization_bar_fills_proportionally() {
+        use crate::render_utilization_bar;
+        assert_eq!(render_utilization_bar(0), "[----------] 0%");
+        assert_eq!(render_utilization_bar(40), "[####------] 40%");
+        assert_eq!(render_utilization_bar(100), "[##########] 100%");
+        // Over 100 clamps the bar but reports the real number.
+        assert_eq!(render_utilization_bar(250), "[##########] 250%");
+    }
+
+    #[test]
+    fn cache_hit_rate_handles_zero_and_ratios() {
+        use crate::format_cache_hit_rate;
+        assert!(format_cache_hit_rate(0, 0).contains("n/a"));
+        assert_eq!(
+            format_cache_hit_rate(25, 75),
+            "75% of prompt tokens from cache"
+        );
+    }
+
+    #[test]
+    fn release_notes_report_names_version() {
+        let report = crate::format_release_notes_report();
+        assert!(report.contains(VERSION));
+        assert!(report.contains("charcsllc/claw-code"));
+    }
+
+    #[test]
+    fn privacy_report_points_at_local_paths() {
+        let report = crate::format_privacy_report();
+        assert!(report.contains("settings.json"));
+        assert!(report.contains("0600"));
+        assert!(report.contains("/provider show"));
     }
 
     #[test]
@@ -18157,7 +19981,7 @@ UU conflicted.rs",
         git(&["add", "tracked.txt"], &root);
         git(&["commit", "-m", "init", "--quiet"], &root);
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -18180,7 +20004,7 @@ UU conflicted.rs",
         fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n")
             .expect("update file twice");
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("Staged changes:"));
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
@@ -18205,10 +20029,41 @@ UU conflicted.rs",
         fs::write(root.join("ignored.txt"), "secret\n").expect("write ignored file");
         fs::write(root.join("tracked.txt"), "hello\nworld\n").expect("write tracked change");
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("tracked.txt"));
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn diff_report_narrows_to_a_single_file_when_asked() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        git(&["init", "--quiet"], &root);
+        git(&["config", "user.email", "tests@example.com"], &root);
+        git(&["config", "user.name", "Rusty Claude Tests"], &root);
+        fs::write(root.join("a.txt"), "a\n").expect("write a");
+        fs::write(root.join("b.txt"), "b\n").expect("write b");
+        git(&["add", "a.txt", "b.txt"], &root);
+        git(&["commit", "-m", "init", "--quiet"], &root);
+        fs::write(root.join("a.txt"), "a\nmás\n").expect("modify a");
+        fs::write(root.join("b.txt"), "b\nmás\n").expect("modify b");
+
+        let report =
+            render_diff_report_for(&root, Some("a.txt")).expect("diff report should render");
+        assert!(report.contains("a.txt"));
+        assert!(!report.contains("b.txt"));
+
+        // Untouched file: explicit clean answer, naming the file.
+        let clean = render_diff_report_for(&root, Some("c.txt")).expect("clean report");
+        assert!(clean.contains("sin cambios en c.txt"));
+
+        // A leading dash must not reach git as a flag.
+        let refused = render_diff_report_for(&root, Some("--cached")).expect("refused report");
+        assert!(refused.contains("invalid path"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -18232,7 +20087,7 @@ UU conflicted.rs",
 
         let session = Session::load_from_path(&session_path).expect("session should load");
         let outcome = with_current_dir(&root, || {
-            run_resume_command(&session_path, &session, &SlashCommand::Diff)
+            run_resume_command(&session_path, &session, &SlashCommand::Diff { path: None })
                 .expect("resume diff should work")
         });
         let message = outcome.message.expect("diff message should exist");
@@ -18990,7 +20845,8 @@ UU conflicted.rs",
 
         let rendered = String::from_utf8(out).expect("utf8");
         assert!(rendered.contains("Heading"));
-        assert!(rendered.contains('\u{1b}'));
+        // The sink is not a TTY, so rendering is correctly plain (no ANSI).
+        assert!(!rendered.contains('\u{1b}'));
     }
 
     #[test]

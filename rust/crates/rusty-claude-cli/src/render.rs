@@ -44,9 +44,26 @@ impl Default for ColorTheme {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spinner {
     frame_index: usize,
+    /// The spinner writes cursor-control and color escapes, which only make
+    /// sense on a real terminal. When stdout is redirected to a file or a
+    /// pipe, every method becomes a no-op so those escapes never pollute the
+    /// captured output.
+    enabled: bool,
+}
+
+impl Default for Spinner {
+    fn default() -> Self {
+        Self {
+            frame_index: 0,
+            // `/color off` also silences the spinner's cursor-control
+            // escapes; forcing color ON cannot enable it off-TTY, where
+            // the escapes would corrupt piped output.
+            enabled: color_override() != Some(false) && io::IsTerminal::is_terminal(&io::stdout()),
+        }
+    }
 }
 
 impl Spinner {
@@ -57,12 +74,23 @@ impl Spinner {
         Self::default()
     }
 
+    /// Forces the spinner on/off regardless of TTY detection (tests, or
+    /// callers rendering into a known-styled context).
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
     pub fn tick(
         &mut self,
         label: &str,
         theme: &ColorTheme,
         out: &mut impl Write,
     ) -> io::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         let frame = Self::FRAMES[self.frame_index % Self::FRAMES.len()];
         self.frame_index += 1;
         queue!(
@@ -78,6 +106,9 @@ impl Spinner {
         out.flush()
     }
 
+    /// Clears the spinner line and prints the final marker on it. Use only
+    /// when nothing else was drawn over the spinner line (e.g. a tool-only
+    /// turn); otherwise use [`finish_below`], which does not clear.
     pub fn finish(
         &mut self,
         label: &str,
@@ -85,10 +116,35 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !self.enabled {
+            return Ok(());
+        }
         execute!(
             out,
             MoveToColumn(0),
             Clear(ClearType::CurrentLine),
+            SetForegroundColor(theme.spinner_done),
+            Print(format!("✔ {label}\n")),
+            ResetColor
+        )?;
+        out.flush()
+    }
+
+    /// Prints the final marker on a fresh line WITHOUT clearing the current
+    /// one — used after streamed response text, whose last line must not be
+    /// erased.
+    pub fn finish_below(
+        &mut self,
+        label: &str,
+        theme: &ColorTheme,
+        out: &mut impl Write,
+    ) -> io::Result<()> {
+        self.frame_index = 0;
+        if !self.enabled {
+            return Ok(());
+        }
+        execute!(
+            out,
             SetForegroundColor(theme.spinner_done),
             Print(format!("✔ {label}\n")),
             ResetColor
@@ -103,6 +159,9 @@ impl Spinner {
         out: &mut impl Write,
     ) -> io::Result<()> {
         self.frame_index = 0;
+        if !self.enabled {
+            return Ok(());
+        }
         execute!(
             out,
             MoveToColumn(0),
@@ -154,6 +213,7 @@ impl TableState {
 struct RenderState {
     emphasis: usize,
     strong: usize,
+    strikethrough: usize,
     heading_level: Option<u8>,
     quote: usize,
     list_stack: Vec<ListKind>,
@@ -176,6 +236,9 @@ impl RenderState {
         }
         if self.emphasis > 0 {
             style = style.italic();
+        }
+        if self.strikethrough > 0 {
+            style = style.crossed_out();
         }
 
         if let Some(level) = self.heading_level {
@@ -219,6 +282,9 @@ pub struct TerminalRenderer {
     syntax_set: SyntaxSet,
     syntax_theme: Theme,
     color_theme: ColorTheme,
+    /// Emit ANSI colors. Off when stdout is not a terminal or `NO_COLOR` is
+    /// set, so piped/redirected output stays plain text.
+    color_enabled: bool,
 }
 
 impl Default for TerminalRenderer {
@@ -232,6 +298,7 @@ impl Default for TerminalRenderer {
             syntax_set,
             syntax_theme,
             color_theme: ColorTheme::default(),
+            color_enabled: color_output_enabled(),
         }
     }
 }
@@ -240,6 +307,14 @@ impl TerminalRenderer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forces colors on regardless of TTY/`NO_COLOR` — for tests and callers
+    /// that render into an explicitly styled context.
+    #[must_use]
+    pub fn with_color(mut self, enabled: bool) -> Self {
+        self.color_enabled = enabled;
+        self
     }
 
     #[must_use]
@@ -267,7 +342,15 @@ impl TerminalRenderer {
             );
         }
 
-        output.trim_end().to_string()
+        let rendered = output.trim_end().to_string();
+        // When color is disabled (piped stdout / NO_COLOR), strip every ANSI
+        // escape the render produced so files and downstream tools receive
+        // clean text instead of `\x1b[...m` sequences.
+        if self.color_enabled {
+            rendered
+        } else {
+            strip_ansi(&rendered)
+        }
     }
 
     #[must_use]
@@ -333,12 +416,29 @@ impl TerminalRenderer {
             Event::End(TagEnd::Emphasis) => state.emphasis = state.emphasis.saturating_sub(1),
             Event::Start(Tag::Strong) => state.strong += 1,
             Event::End(TagEnd::Strong) => state.strong = state.strong.saturating_sub(1),
+            Event::Start(Tag::Strikethrough) => {
+                // Without color the crossed-out attribute is stripped away,
+                // so mark struck text with tildes to keep the meaning visible.
+                if !self.color_enabled {
+                    state.append_raw(output, "~");
+                }
+                state.strikethrough += 1;
+            }
+            Event::End(TagEnd::Strikethrough) => {
+                state.strikethrough = state.strikethrough.saturating_sub(1);
+                if !self.color_enabled {
+                    state.append_raw(output, "~");
+                }
+            }
             Event::Code(code) => {
                 let rendered =
                     format!("{}", format!("`{code}`").with(self.color_theme.inline_code));
                 state.append_raw(output, &rendered);
             }
-            Event::Rule => output.push_str("---\n"),
+            Event::Rule => {
+                let _ = writeln!(output, "{}", "─".repeat(40).dim());
+                output.push('\n');
+            }
             Event::Text(text) => {
                 self.push_text(text.as_ref(), state, output, code_buffer, *in_code_block);
             }
@@ -349,7 +449,12 @@ impl TerminalRenderer {
                 state.append_raw(output, &format!("[{reference}]"));
             }
             Event::TaskListMarker(done) => {
-                state.append_raw(output, if done { "[x] " } else { "[ ] " });
+                // The item marker ("• ") was already emitted by `start_item`;
+                // replace it with a checkbox so task lists read as task lists.
+                if output.ends_with("• ") {
+                    output.truncate(output.len() - "• ".len());
+                }
+                state.append_raw(output, if done { "☑ " } else { "☐ " });
             }
             Event::InlineMath(math) | Event::DisplayMath(math) => {
                 state.append_raw(output, &math);
@@ -609,7 +714,14 @@ impl MarkdownStreamState {
         let split = find_stream_safe_boundary(&self.pending)?;
         let ready = self.pending[..split].to_string();
         self.pending.drain(..split);
-        Some(renderer.markdown_to_ansi(&ready))
+        let rendered = renderer.markdown_to_ansi(&ready);
+        if rendered.is_empty() {
+            return None;
+        }
+        // `render_markdown` trims the trailing blank line, but this chunk ends
+        // at a paragraph/fence boundary; re-add the separator so consecutive
+        // flushed chunks are not glued into one run-together line.
+        Some(format!("{rendered}\n\n"))
     }
 
     #[must_use]
@@ -619,7 +731,8 @@ impl MarkdownStreamState {
             None
         } else {
             let pending = std::mem::take(&mut self.pending);
-            Some(renderer.markdown_to_ansi(&pending))
+            let rendered = renderer.markdown_to_ansi(&pending);
+            (!rendered.is_empty()).then_some(rendered)
         }
     }
 }
@@ -871,7 +984,49 @@ fn parse_fence_opener(line: &str) -> Option<FenceMarker> {
     Some(FenceMarker { character, length })
 }
 
+/// Session-scoped color override set by `/color on|off|auto`.
+/// 0 = auto (TTY + NO_COLOR detection), 1 = forced on, 2 = forced off.
+static COLOR_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Applies `/color`: `Some(true)` forces color, `Some(false)` disables it,
+/// `None` returns to automatic detection.
+pub fn set_color_override(mode: Option<bool>) {
+    let value = match mode {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    COLOR_OVERRIDE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The current override, if any (for reporting in `/color` and `/theme`).
+#[must_use]
+pub fn color_override() -> Option<bool> {
+    match COLOR_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+/// Colors are on only when stdout is a real terminal and `NO_COLOR` is
+/// unset (the de-facto standard honored by most CLI tools), unless the
+/// user forced a mode with `/color`.
+fn color_output_enabled() -> bool {
+    if let Some(forced) = color_override() {
+        return forced;
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    io::IsTerminal::is_terminal(&io::stdout())
+}
+
 fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
+    // A CRLF provider sends the closer as "```\r"; the residual `\r` must not
+    // count as fence content or the fence is seen as still open and streaming
+    // stalls until end-of-message.
+    let line = line.trim_end_matches('\r');
     let indent = line.chars().take_while(|c| *c == ' ').count();
     if indent > 3 {
         return false;
@@ -885,7 +1040,11 @@ fn line_closes_fence(line: &str, opener: FenceMarker) -> bool {
 }
 
 fn visible_width(input: &str) -> usize {
-    strip_ansi(input).chars().count()
+    // Display columns, not char count: CJK and emoji occupy two columns, so
+    // table padding computed from `chars().count()` drifts after any wide
+    // cell and breaks the grid alignment.
+    use unicode_width::UnicodeWidthStr as _;
+    strip_ansi(input).width()
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -916,7 +1075,7 @@ mod tests {
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {
-        let terminal_renderer = TerminalRenderer::new();
+        let terminal_renderer = TerminalRenderer::new().with_color(true);
         let markdown_output = terminal_renderer
             .render_markdown("# Heading\n\nThis is **bold** and *italic*.\n\n- item\n\n`code`");
 
@@ -928,7 +1087,7 @@ mod tests {
 
     #[test]
     fn renders_links_as_colored_markdown_labels() {
-        let terminal_renderer = TerminalRenderer::new();
+        let terminal_renderer = TerminalRenderer::new().with_color(true);
         let markdown_output =
             terminal_renderer.render_markdown("See [Claw](https://example.com/docs) now.");
         let plain_text = strip_ansi(&markdown_output);
@@ -939,7 +1098,7 @@ mod tests {
 
     #[test]
     fn highlights_fenced_code_blocks() {
-        let terminal_renderer = TerminalRenderer::new();
+        let terminal_renderer = TerminalRenderer::new().with_color(true);
         let markdown_output =
             terminal_renderer.markdown_to_ansi("```rust\nfn hi() { println!(\"hi\"); }\n```");
         let plain_text = strip_ansi(&markdown_output);
@@ -964,8 +1123,46 @@ mod tests {
     }
 
     #[test]
+    fn renders_task_list_items_with_checkboxes() {
+        let terminal_renderer = TerminalRenderer::new().with_color(false);
+        let markdown_output =
+            terminal_renderer.render_markdown("- [ ] pending task\n- [x] finished task");
+
+        assert!(markdown_output.contains("☐ pending task"));
+        assert!(markdown_output.contains("☑ finished task"));
+        assert!(
+            !markdown_output.contains('•'),
+            "task items must replace the plain bullet: {markdown_output:?}"
+        );
+    }
+
+    #[test]
+    fn renders_rule_as_dashed_line() {
+        let terminal_renderer = TerminalRenderer::new().with_color(false);
+        let markdown_output = terminal_renderer.render_markdown("above\n\n---\n\nbelow");
+
+        assert!(markdown_output.contains(&"─".repeat(40)));
+        assert!(markdown_output.contains("above"));
+        assert!(markdown_output.contains("below"));
+    }
+
+    #[test]
+    fn renders_strikethrough_with_plain_fallback() {
+        let plain_renderer = TerminalRenderer::new().with_color(false);
+        let plain_output = plain_renderer.render_markdown("this is ~~gone~~ now");
+        assert_eq!(plain_output, "this is ~gone~ now");
+
+        let colored_renderer = TerminalRenderer::new().with_color(true);
+        let colored_output = colored_renderer.render_markdown("~~gone~~");
+        assert!(
+            colored_output.contains("\u{1b}[9m"),
+            "colored strikethrough must use the crossed-out attribute: {colored_output:?}"
+        );
+    }
+
+    #[test]
     fn renders_tables_with_alignment() {
-        let terminal_renderer = TerminalRenderer::new();
+        let terminal_renderer = TerminalRenderer::new().with_color(true);
         let markdown_output = terminal_renderer
             .render_markdown("| Name | Value |\n| ---- | ----- |\n| alpha | 1 |\n| beta | 22 |");
         let plain_text = strip_ansi(&markdown_output);
@@ -1055,7 +1252,7 @@ mod tests {
     #[test]
     fn spinner_advances_frames() {
         let terminal_renderer = TerminalRenderer::new();
-        let mut spinner = Spinner::new();
+        let mut spinner = Spinner::new().with_enabled(true);
         let mut out = Vec::new();
         spinner
             .tick("Working", terminal_renderer.color_theme(), &mut out)
@@ -1066,5 +1263,30 @@ mod tests {
 
         let output = String::from_utf8_lossy(&out);
         assert!(output.contains("Working"));
+    }
+
+    #[test]
+    fn plain_output_has_no_ansi_when_color_disabled() {
+        let renderer = TerminalRenderer::new().with_color(false);
+        let out = renderer.render_markdown("# Heading\n\n**bold** text");
+        assert!(out.contains("Heading"));
+        assert!(
+            !out.contains('\u{1b}'),
+            "piped output must be plain: {out:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_separates_consecutive_paragraphs() {
+        let renderer = TerminalRenderer::new().with_color(false);
+        let mut state = MarkdownStreamState::default();
+        // Two paragraphs arriving in one delta must not be glued together.
+        let out = state
+            .push(&renderer, "First paragraph.\n\nSecond paragraph.\n\n")
+            .expect("boundary flushes");
+        assert!(
+            out.contains("First paragraph.\n"),
+            "paragraph break must survive streaming: {out:?}"
+        );
     }
 }

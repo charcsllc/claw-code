@@ -1,3 +1,8 @@
+// ApiError is intentionally large (it carries response bodies and retry
+// metadata); boxing every Err would ripple through all providers. The CLI
+// already allows this lint at call sites — keep the same policy crate-wide.
+#![allow(clippy::result_large_err)]
+
 mod client;
 mod error;
 mod http_client;
@@ -13,7 +18,7 @@ pub use client::{
 pub use error::ApiError;
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
-    build_http_client_with_opts, ProxyConfig, TimeoutConfig,
+    build_http_client_with_opts, net_timeout_ms, parse_net_timeout_ms, ProxyConfig, TimeoutConfig,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
@@ -27,9 +32,10 @@ pub use providers::openai_compat::{
     OpenAiCompatConfig,
 };
 pub use providers::{
-    detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
-    model_family_identity_for, model_family_identity_for_kind, provider_diagnostics_for_model,
-    resolve_model_alias, ProviderDiagnostics, ProviderKind,
+    detect_provider_kind, jwt_expiry_unix, max_tokens_for_model,
+    max_tokens_for_model_with_override, model_family_identity_for, model_family_identity_for_kind,
+    model_token_limit, provider_diagnostics_for_model, resolve_model_alias, resolve_model_fuzzy,
+    set_retry_notifier, ModelTokenLimit, ProviderDiagnostics, ProviderKind, RetryNotice,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

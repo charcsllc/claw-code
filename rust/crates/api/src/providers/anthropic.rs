@@ -3,21 +3,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runtime::format_usd;
 use runtime::{
     load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
     OAuthTokenExchangeRequest,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use telemetry::{AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer};
+use telemetry::{AnthropicRequestProfile, ClientIdentity, SessionTracer};
 
 use crate::error::ApiError;
 use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+    anthropic_missing_credentials, message_usage_event, model_token_limit, resolve_model_alias,
+    Provider, ProviderFuture,
 };
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
@@ -325,26 +325,11 @@ impl AnthropicClient {
             self.store_last_prompt_cache_record(record);
         }
         if let Some(session_tracer) = &self.session_tracer {
-            session_tracer.record_analytics(
-                AnalyticsEvent::new("api", "message_usage")
-                    .with_property(
-                        "request_id",
-                        response
-                            .request_id
-                            .clone()
-                            .map_or(Value::Null, Value::String),
-                    )
-                    .with_property("total_tokens", Value::from(response.total_tokens()))
-                    .with_property(
-                        "estimated_cost_usd",
-                        Value::String(format_usd(
-                            response
-                                .usage
-                                .estimated_cost_usd(&response.model)
-                                .total_cost_usd(),
-                        )),
-                    ),
-            );
+            session_tracer.record_analytics(message_usage_event(
+                &response.model,
+                response.request_id.as_deref(),
+                &response.usage,
+            ));
         }
         Ok(response)
     }
@@ -367,6 +352,7 @@ impl AnthropicClient {
             prompt_cache: self.prompt_cache.clone(),
             latest_usage: None,
             usage_recorded: false,
+            session_tracer: self.session_tracer.clone(),
             last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
         })
     }
@@ -473,6 +459,15 @@ impl AnthropicClient {
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
             };
+            super::notify_retry(&super::RetryNotice {
+                attempt: attempts,
+                max_retries: self.max_retries,
+                delay,
+                error: last_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            });
             tokio::time::sleep(delay).await;
         }
 
@@ -821,6 +816,7 @@ pub struct MessageStream {
     prompt_cache: Option<PromptCache>,
     latest_usage: Option<Usage>,
     usage_recorded: bool,
+    session_tracer: Option<SessionTracer>,
     last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
@@ -841,6 +837,9 @@ impl MessageStream {
                 let remaining = self.parser.finish()?;
                 self.pending.extend(remaining);
                 if let Some(event) = self.pending.pop_front() {
+                    // Observe here too: a MessageStop surfacing in the final
+                    // flush must still record usage and prompt-cache state.
+                    self.observe_event(&event);
                     return Ok(Some(event));
                 }
                 return Ok(None);
@@ -859,8 +858,32 @@ impl MessageStream {
 
     fn observe_event(&mut self, event: &StreamEvent) {
         match event {
+            StreamEvent::MessageStart(start) => {
+                // message_start carries the request's input/cache token counts;
+                // message_delta later carries the cumulative output count.
+                self.latest_usage = Some(start.message.usage.clone());
+            }
             StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
-                self.latest_usage = Some(usage.clone());
+                let merged = match self.latest_usage.take() {
+                    Some(mut existing) => {
+                        if usage.input_tokens != 0 {
+                            existing.input_tokens = usage.input_tokens;
+                        }
+                        if usage.output_tokens != 0 {
+                            existing.output_tokens = usage.output_tokens;
+                        }
+                        if usage.cache_creation_input_tokens != 0 {
+                            existing.cache_creation_input_tokens =
+                                usage.cache_creation_input_tokens;
+                        }
+                        if usage.cache_read_input_tokens != 0 {
+                            existing.cache_read_input_tokens = usage.cache_read_input_tokens;
+                        }
+                        existing
+                    }
+                    None => usage.clone(),
+                };
+                self.latest_usage = Some(merged);
             }
             StreamEvent::MessageStop(_) if !self.usage_recorded => {
                 if let (Some(prompt_cache), Some(usage)) =
@@ -872,10 +895,48 @@ impl MessageStream {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
                 }
+                if let (Some(session_tracer), Some(usage)) =
+                    (&self.session_tracer, self.latest_usage.as_ref())
+                {
+                    session_tracer.record_analytics(message_usage_event(
+                        &self.request.model,
+                        self.request_id.as_deref(),
+                        usage,
+                    ));
+                }
                 self.usage_recorded = true;
             }
             _ => {}
         }
+    }
+}
+
+impl Drop for MessageStream {
+    fn drop(&mut self) {
+        // A stream dropped mid-response (user abort, network cut) has real
+        // billed usage that MessageStop will never record: the accumulated
+        // MessageStart/MessageDelta counts are the best available figure,
+        // so record them (marked aborted) instead of losing them entirely.
+        if self.usage_recorded {
+            return;
+        }
+        let Some(usage) = self.latest_usage.as_ref() else {
+            return;
+        };
+        if let Some(prompt_cache) = &self.prompt_cache {
+            let record = prompt_cache.record_usage(&self.request, usage);
+            *self
+                .last_prompt_cache_record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+        }
+        if let Some(session_tracer) = &self.session_tracer {
+            session_tracer.record_analytics(
+                message_usage_event(&self.request.model, self.request_id.as_deref(), usage)
+                    .with_property("aborted", serde_json::Value::Bool(true)),
+            );
+        }
+        self.usage_recorded = true;
     }
 }
 

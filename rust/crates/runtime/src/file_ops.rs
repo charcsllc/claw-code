@@ -244,6 +244,10 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     }
 
     let absolute_path = normalize_path_allow_missing(path)?;
+    // Existence decides create-vs-update: an existing non-UTF-8 file makes
+    // read_to_string fail, which must not be misreported as a "create" of an
+    // empty file in the patch metadata.
+    let existed_before = absolute_path.exists();
     let original_file = fs::read_to_string(&absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
@@ -251,7 +255,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
     fs::write(&absolute_path, content)?;
 
     Ok(WriteFileOutput {
-        kind: if original_file.is_some() {
+        kind: if existed_before {
             String::from("update")
         } else {
             String::from("create")
@@ -273,16 +277,49 @@ pub fn edit_file(
 ) -> io::Result<EditFileOutput> {
     let absolute_path = normalize_path(path)?;
     let original_file = fs::read_to_string(&absolute_path)?;
+    // An empty old_string passes `contains("")` (always true) and would then
+    // splice new_string between every character via `replace`, destroying
+    // the file.
+    if old_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty",
+        ));
+    }
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "old_string and new_string must differ",
         ));
     }
-    if !original_file.contains(old_string) {
+    let occurrences = original_file.matches(old_string).count();
+    if occurrences == 0 {
+        // Most misses are a stale read: the block moved or was reformatted.
+        // Showing a mini-diff against the most similar region lets the caller
+        // (usually an agent) re-anchor without a blind retry.
+        let hint = closest_match_diff(&original_file, old_string)
+            .map(|diff| {
+                format!(
+                    "; the closest region differs — re-read the file and retry \
+                     with the current text:\n{diff}"
+                )
+            })
+            .unwrap_or_default();
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "old_string not found in file",
+            format!("old_string not found in file{hint}"),
+        ));
+    }
+    // Editing "the first match" of a non-unique string silently mutates a
+    // location the caller may not have meant; require a unique anchor or an
+    // explicit replace_all.
+    if !replace_all && occurrences > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "old_string appears {occurrences} times in the file; include more \
+                 surrounding context to make it unique, or pass replace_all: true"
+            ),
         ));
     }
 
@@ -623,6 +660,106 @@ fn apply_limit<T>(
     )
 }
 
+/// Caps for the `edit_file` mismatch hint so a huge `old_string` or file
+/// region can never balloon the error message.
+const DIFF_HINT_MAX_LINES_PER_SIDE: usize = 6;
+const DIFF_HINT_CONTEXT_LINES: usize = 2;
+const DIFF_HINT_MAX_LINE_CHARS: usize = 120;
+
+/// Locates the region of `file_contents` most similar to `old_string` and
+/// renders a small diff-style hint: surrounding context lines are indented,
+/// the expected (missing) lines are prefixed with `-`, and the lines actually
+/// found in the file with `+`. Both sides are capped at
+/// [`DIFF_HINT_MAX_LINES_PER_SIDE`] lines of [`DIFF_HINT_MAX_LINE_CHARS`]
+/// characters. Returns `None` when no line of the file resembles the
+/// expected block (no candidate region to point at).
+#[must_use]
+pub fn closest_match_diff(file_contents: &str, old_string: &str) -> Option<String> {
+    let expected: Vec<&str> = old_string.lines().collect();
+    let file_lines: Vec<&str> = file_contents.lines().collect();
+    if expected.is_empty() || file_lines.is_empty() {
+        return None;
+    }
+
+    // Slide a window of the expected block's height over the file (clamped
+    // for files shorter than the block) and keep the best-scoring region.
+    let window = expected.len().min(file_lines.len());
+    let mut best_start = 0usize;
+    let mut best_score = 0usize;
+    for start in 0..=(file_lines.len() - window) {
+        let score = expected
+            .iter()
+            .zip(&file_lines[start..start + window])
+            .map(|(expected_line, found_line)| line_similarity(expected_line, found_line))
+            .sum();
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+        }
+    }
+    if best_score == 0 {
+        return None;
+    }
+
+    let mut rendered = vec![format!("closest match at line {}:", best_start + 1)];
+    let context_start = best_start.saturating_sub(DIFF_HINT_CONTEXT_LINES);
+    for line in &file_lines[context_start..best_start] {
+        rendered.push(format!("  {}", cap_line(line)));
+    }
+    push_capped_side(&mut rendered, '-', &expected);
+    push_capped_side(
+        &mut rendered,
+        '+',
+        &file_lines[best_start..best_start + window],
+    );
+    let context_end = (best_start + window + DIFF_HINT_CONTEXT_LINES).min(file_lines.len());
+    for line in &file_lines[best_start + window..context_end] {
+        rendered.push(format!("  {}", cap_line(line)));
+    }
+    Some(rendered.join("\n"))
+}
+
+/// Similarity of a single line pair for [`closest_match_diff`]: 2 for an
+/// exact trimmed match, 1 when one trimmed line contains the other (and the
+/// shorter side is long enough to be meaningful), 0 otherwise. Blank pairs
+/// score 0 so the window never anchors on empty lines.
+fn line_similarity(expected: &str, found: &str) -> usize {
+    let expected = expected.trim();
+    let found = found.trim();
+    if expected.is_empty() || found.is_empty() {
+        return 0;
+    }
+    if expected == found {
+        return 2;
+    }
+    let shorter = expected.len().min(found.len());
+    if shorter >= 3 && (expected.contains(found) || found.contains(expected)) {
+        return 1;
+    }
+    0
+}
+
+fn cap_line(line: &str) -> String {
+    if line.chars().count() <= DIFF_HINT_MAX_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut capped: String = line.chars().take(DIFF_HINT_MAX_LINE_CHARS).collect();
+    capped.push('…');
+    capped
+}
+
+fn push_capped_side(rendered: &mut Vec<String>, prefix: char, lines: &[&str]) {
+    for line in lines.iter().take(DIFF_HINT_MAX_LINES_PER_SIDE) {
+        rendered.push(format!("{prefix} {}", cap_line(line)));
+    }
+    if lines.len() > DIFF_HINT_MAX_LINES_PER_SIDE {
+        rendered.push(format!(
+            "{prefix} … ({} more lines)",
+            lines.len() - DIFF_HINT_MAX_LINES_PER_SIDE
+        ));
+    }
+}
+
 fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     let mut lines = Vec::new();
     for line in original.lines() {
@@ -776,9 +913,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        closest_match_diff, component_contains_glob, derive_glob_walk_root, edit_file,
+        expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
+        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
+        MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -809,6 +947,133 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string() {
+        let path = temp_path("edit-empty.txt");
+        write_file(path.to_string_lossy().as_ref(), "abc").expect("write");
+        // `"abc".contains("")` is true; without the guard, replace_all would
+        // splice new_string between every character.
+        let error = edit_file(path.to_string_lossy().as_ref(), "", "X", true)
+            .expect_err("empty old_string must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "abc",
+            "file must be untouched"
+        );
+    }
+
+    #[test]
+    fn edit_not_found_hints_at_moved_block() {
+        let path = temp_path("edit-hint.txt");
+        write_file(
+            path.to_string_lossy().as_ref(),
+            "fn main() {\n    println!(\"hola\");\n}\n",
+        )
+        .expect("write");
+        // The block anchors but its body differs: the error should carry a
+        // mini-diff of the closest region (expected `-`, found `+`).
+        let error = edit_file(
+            path.to_string_lossy().as_ref(),
+            "fn main() {\n    println!(\"adios\");\n}",
+            "X",
+            false,
+        )
+        .expect_err("stale block must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(message.contains("closest match at line 1"), "{message}");
+        assert!(message.contains("-     println!(\"adios\");"), "{message}");
+        assert!(message.contains("+     println!(\"hola\");"), "{message}");
+        // No anchor at all: plain not-found, no hint.
+        let error = edit_file(path.to_string_lossy().as_ref(), "no existe", "X", false)
+            .expect_err("missing text must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "old_string not found in file",
+            "no candidate region must yield the plain error"
+        );
+    }
+
+    #[test]
+    fn closest_match_diff_renders_partial_match_with_context() {
+        let file = "use std::io;\n\nfn helper() {}\n\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        let old = "fn main() {\n    let x = 2;\n    println!(\"{x}\");\n}";
+        let diff = closest_match_diff(file, old).expect("partial match should yield a hint");
+        assert!(diff.contains("closest match at line 5"), "{diff}");
+        // Expected lines carry `-`, found lines carry `+`.
+        assert!(diff.contains("-     let x = 2;"), "{diff}");
+        assert!(diff.contains("+     let x = 1;"), "{diff}");
+        // Two context lines surround the region.
+        assert!(diff.contains("  fn helper() {}"), "{diff}");
+    }
+
+    #[test]
+    fn closest_match_diff_returns_none_without_candidate() {
+        let file = "alpha\nbeta\ngamma\n";
+        assert_eq!(closest_match_diff(file, "totally unrelated content"), None);
+        assert_eq!(closest_match_diff("", "anything"), None);
+        assert_eq!(closest_match_diff(file, ""), None);
+    }
+
+    #[test]
+    fn closest_match_diff_handles_file_shorter_than_block() {
+        let file = "only line\n";
+        let old = "only line\nsecond line\nthird line";
+        let diff = closest_match_diff(file, old).expect("clamped window should still match");
+        assert!(diff.contains("closest match at line 1"), "{diff}");
+        assert!(diff.contains("- only line"), "{diff}");
+        assert!(diff.contains("- second line"), "{diff}");
+        assert!(diff.contains("+ only line"), "{diff}");
+    }
+
+    #[test]
+    fn closest_match_diff_caps_oversized_blocks_and_lines() {
+        let long_line = "x".repeat(500);
+        let file_block: String = (0..30).map(|i| format!("shared line {i}\n")).collect();
+        let file = format!("{file_block}{long_line}\n");
+        let expected: String = (0..30)
+            .map(|i| format!("shared line {i} CHANGED\n"))
+            .collect();
+        let diff = closest_match_diff(&file, &expected).expect("large block should still hint");
+        assert!(diff.contains("more lines)"), "{diff}");
+        let diff_lines = diff.lines().count();
+        assert!(
+            diff_lines <= 20,
+            "hint too large ({diff_lines} lines): {diff}"
+        );
+        for line in diff.lines() {
+            assert!(line.chars().count() <= 130, "uncapped line: {line}");
+        }
+    }
+
+    #[test]
+    fn edit_requires_unique_match_without_replace_all() {
+        let path = temp_path("edit-unique.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha beta alpha").expect("write");
+        let error = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", false)
+            .expect_err("ambiguous old_string must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("2 times"));
+        // A unique anchor still works without replace_all.
+        let output = edit_file(path.to_string_lossy().as_ref(), "beta", "gamma", false)
+            .expect("unique edit succeeds");
+        assert!(!output.replace_all);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha gamma alpha"
+        );
+    }
+
+    #[test]
+    fn write_over_non_utf8_file_reports_update() {
+        let path = temp_path("overwrite-binary.txt");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00]).expect("seed binary");
+        let output =
+            write_file(path.to_string_lossy().as_ref(), "clean text").expect("overwrite succeeds");
+        assert_eq!(output.kind, "update", "existing file is an update");
     }
 
     #[test]

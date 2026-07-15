@@ -1121,7 +1121,7 @@ pub fn save_user_provider_settings(
     fs::create_dir_all(&config_home).map_err(ConfigError::Io)?;
     let settings_path = config_home.join("settings.json");
 
-    let mut root = read_settings_root(&settings_path);
+    let mut root = read_settings_root(&settings_path)?;
 
     let mut provider = serde_json::Map::new();
     provider.insert(
@@ -1150,16 +1150,31 @@ pub fn save_user_provider_settings(
         root.remove("model");
     }
 
+    // write_settings_root already sets 0600 atomically.
     write_settings_root(&settings_path, &root)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&settings_path, perms).map_err(ConfigError::Io)?;
-    }
-
     Ok(())
+}
+
+/// Save a single top-level string field to the user-level settings file,
+/// preserving everything else. Uses the same atomic 0600 writer as the
+/// provider save so a file holding an API key never regresses to 0644.
+pub fn save_user_settings_field(field: &str, value: &str) -> Result<(), ConfigError> {
+    let settings_path = default_config_home().join("settings.json");
+    let mut root = read_settings_root(&settings_path)?;
+    root.insert(
+        field.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
+    write_settings_root(&settings_path, &root)
+}
+
+/// Read a single top-level string field from the user-level settings file.
+#[must_use]
+pub fn load_user_settings_field(field: &str) -> Option<String> {
+    let settings_path = default_config_home().join("settings.json");
+    let root = read_settings_root(&settings_path).ok()?;
+    root.get(field)?.as_str().map(str::to_string)
 }
 
 /// Remove the `provider` section from the user-level `~/.claw/settings.json`.
@@ -1171,7 +1186,7 @@ pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    let mut root = read_settings_root(&settings_path);
+    let mut root = read_settings_root(&settings_path)?;
     if root.remove("provider").is_none() {
         return Ok(());
     }
@@ -1182,15 +1197,30 @@ pub fn clear_user_provider_settings() -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn read_settings_root(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+/// Reads the settings object. A missing or empty file is an empty object;
+/// a NON-EMPTY file that fails to parse is an error, NOT an empty object —
+/// returning empty here would let a caller overwrite (and destroy) every
+/// existing setting because of a single stray comma.
+fn read_settings_root(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>, ConfigError> {
     match fs::read_to_string(path) {
         Ok(contents) if !contents.trim().is_empty() => {
-            serde_json::from_str::<serde_json::Value>(&contents)
-                .ok()
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default()
+            let value = serde_json::from_str::<serde_json::Value>(&contents).map_err(|error| {
+                ConfigError::Parse(format!(
+                    "{} is not valid JSON ({error}); fix or remove it before saving so \
+                     existing settings are not lost",
+                    path.display()
+                ))
+            })?;
+            value.as_object().cloned().ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "{} must contain a JSON object at the top level",
+                    path.display()
+                ))
+            })
         }
-        _ => serde_json::Map::new(),
+        _ => Ok(serde_json::Map::new()),
     }
 }
 
@@ -1203,7 +1233,36 @@ fn write_settings_root(
     }
     let rendered = serde_json::to_string_pretty(&serde_json::Value::Object(root.clone()))
         .map_err(|e| ConfigError::Parse(e.to_string()))?;
-    fs::write(path, format!("{rendered}\n")).map_err(ConfigError::Io)
+
+    // Write to a sibling temp file with owner-only perms set BEFORE any
+    // secret is written, then atomically rename over the target: the key is
+    // never briefly world-readable, and a crash mid-write cannot corrupt the
+    // real settings file (which would then wipe on the next save).
+    let temp = path.with_extension("json.tmp");
+    {
+        use std::io::Write as _;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp).map_err(ConfigError::Io)?;
+        file.write_all(rendered.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .map_err(ConfigError::Io)?;
+        file.flush().map_err(ConfigError::Io)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600)).map_err(ConfigError::Io)?;
+    }
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        ConfigError::Io(error)
+    })
 }
 
 impl RuntimeHookCommand {

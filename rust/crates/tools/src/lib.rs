@@ -7,10 +7,10 @@ use aspect_macros::aspect;
 use aspect_std::LoggingAspect;
 
 use api::{
-    max_tokens_for_model, model_family_identity_for, resolve_model_alias, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    max_tokens_for_model, model_family_identity_for, resolve_model_alias, AnalyticsEvent, ApiError,
+    ContentBlockDelta, InputContentBlock, InputMessage, JsonlTelemetrySink, MessageRequest,
+    MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
 use reqwest::blocking::Client;
@@ -2835,6 +2835,8 @@ struct AgentInput {
     subagent_type: Option<String>,
     name: Option<String>,
     model: Option<String>,
+    /// Module isolation: restrict file-writing tools to these path prefixes.
+    allowed_write_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3223,6 +3225,7 @@ struct AgentJob {
     prompt: String,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
+    allowed_write_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4156,12 +4159,25 @@ where
     };
     write_agent_manifest(&manifest)?;
 
+    if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
+        tracer.record_analytics(AnalyticsEvent::agent_started(
+            &manifest.agent_id,
+            &manifest.name,
+        ));
+    }
+
     let manifest_for_spawn = manifest.clone();
     let job = AgentJob {
         manifest: manifest_for_spawn,
         prompt: input.prompt,
         system_prompt,
         allowed_tools,
+        allowed_write_paths: input
+            .allowed_write_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
     };
     if let Err(error) = spawn_fn(job) {
         let error = format!("failed to spawn sub-agent: {error}");
@@ -4217,17 +4233,26 @@ fn build_agent_runtime(
         .clone()
         .unwrap_or_else(|| DEFAULT_AGENT_MODEL.to_string());
     let allowed_tools = job.allowed_tools.clone();
-    let api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let mut api_client = ProviderRuntimeClient::new(model, allowed_tools.clone())?;
+    let dashboard_tracer = dashboard_agent_tracer(&job.manifest.agent_id);
+    if let Some(tracer) = &dashboard_tracer {
+        api_client = api_client.with_session_tracer(tracer);
+    }
     let permission_policy = agent_permission_policy();
     let tool_executor = SubagentToolExecutor::new(allowed_tools)
-        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()));
-    Ok(ConversationRuntime::new(
+        .with_enforcer(PermissionEnforcer::new(permission_policy.clone()))
+        .with_write_scope(job.allowed_write_paths.clone());
+    let mut runtime = ConversationRuntime::new(
         Session::new(),
         api_client,
         tool_executor,
         permission_policy,
         job.system_prompt.clone(),
-    ))
+    );
+    if let Some(tracer) = dashboard_tracer {
+        runtime = runtime.with_session_tracer(tracer);
+    }
+    Ok(runtime)
 }
 
 fn build_agent_system_prompt(subagent_type: &str, model: &str) -> Result<Vec<String>, String> {
@@ -4358,6 +4383,17 @@ fn persist_agent_terminal_state(
     result: Option<&str>,
     error: Option<String>,
 ) -> Result<(), String> {
+    if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
+        let event = if status == "completed" {
+            AnalyticsEvent::agent_finished(&manifest.agent_id)
+        } else {
+            AnalyticsEvent::agent_failed(
+                &manifest.agent_id,
+                error.as_deref().unwrap_or("sub-agent failed"),
+            )
+        };
+        tracer.record_analytics(event);
+    }
     let blocker = error.as_deref().map(classify_lane_blocker);
     append_agent_output(
         &manifest.output_file,
@@ -5159,6 +5195,19 @@ impl ProviderRuntimeClient {
             allowed_tools,
         })
     }
+
+    /// Attaches a session tracer to every provider in the fallback chain so
+    /// sub-agent requests emit `message_usage` telemetry.
+    fn with_session_tracer(mut self, tracer: &SessionTracer) -> Self {
+        self.chain = std::mem::take(&mut self.chain)
+            .into_iter()
+            .map(|mut entry| {
+                entry.client = entry.client.with_session_tracer(tracer.clone());
+                entry
+            })
+            .collect();
+        self
+    }
 }
 
 fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
@@ -5342,13 +5391,28 @@ async fn stream_with_provider(
 struct SubagentToolExecutor {
     allowed_tools: BTreeSet<String>,
     enforcer: Option<PermissionEnforcer>,
+    /// Module isolation: when set, file-writing tools may only target paths
+    /// under these prefixes (multi-agent builds pass each task's module
+    /// files so parallel agents can never clobber each other).
+    write_scope: Option<Vec<PathBuf>>,
 }
+
+/// Tools whose `path`-like argument mutates the filesystem, by canonical
+/// name (`canonical_allowed_tool_name` output — "NotebookEdit" would never
+/// match, since the membership test compares canonical names).
+const WRITE_SCOPED_TOOLS: &[&str] = &["write_file", "edit_file", "notebook_edit"];
+
+/// Shell tools can write anywhere (`echo x > file`), so lexical path
+/// checks cannot scope them: under a module write-scope they are refused
+/// outright rather than silently bypassing the isolation.
+const SHELL_TOOLS: &[&str] = &["bash", "power_shell", "repl"];
 
 impl SubagentToolExecutor {
     fn new(allowed_tools: BTreeSet<String>) -> Self {
         Self {
             allowed_tools,
             enforcer: None,
+            write_scope: None,
         }
     }
 
@@ -5356,6 +5420,102 @@ impl SubagentToolExecutor {
         self.enforcer = Some(enforcer);
         self
     }
+
+    fn with_write_scope(mut self, scope: Vec<PathBuf>) -> Self {
+        if !scope.is_empty() {
+            self.write_scope = Some(scope);
+        }
+        self
+    }
+
+    /// Rejects writes outside the module scope. Reads stay workspace-wide
+    /// (agents legitimately inspect other modules' interfaces). Symlinks
+    /// inside the scope are not resolved (normalization is lexical), but
+    /// the separate workspace-boundary check still contains any write to
+    /// the workspace itself.
+    fn enforce_write_scope(&self, tool_name: &str, input: &Value) -> Result<(), ToolError> {
+        let Some(scope) = &self.write_scope else {
+            return Ok(());
+        };
+        let canonical = canonical_allowed_tool_name(tool_name);
+        if SHELL_TOOLS.contains(&canonical.as_str()) {
+            return Err(ToolError::new(format!(
+                "`{tool_name}` is disabled for module-scoped agents (a shell \
+                 can write outside the module); use read/write/edit tools \
+                 within the TaskSpec's files instead"
+            )));
+        }
+        if !WRITE_SCOPED_TOOLS.contains(&canonical.as_str()) {
+            return Ok(());
+        }
+        let raw_path = ["path", "file_path", "notebook_path"]
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str));
+        let Some(raw_path) = raw_path else {
+            return Ok(());
+        };
+        let cwd = std::env::current_dir().unwrap_or_default();
+        // Lexical normalization first (works for not-yet-created files),
+        // then resolve the deepest EXISTING ancestor through the real
+        // filesystem: a symlink inside the module (src/auth/vendor →
+        // ../cart) must not smuggle writes into another module.
+        let target = resolve_existing_ancestors(&normalize_scope_path(&cwd, Path::new(raw_path)));
+        let in_scope = scope.iter().any(|prefix| {
+            let prefix = resolve_existing_ancestors(&normalize_scope_path(&cwd, prefix));
+            target == prefix || target.starts_with(&prefix)
+        });
+        if in_scope {
+            Ok(())
+        } else {
+            Err(ToolError::new(format!(
+                "write to `{raw_path}` escapes this agent's module scope; \
+                 only files under its TaskSpec may be modified"
+            )))
+        }
+    }
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` (resolving
+/// symlinks), then re-appends the not-yet-existing tail. This keeps scope
+/// checks honest for files about to be created while still following any
+/// symlink that already exists on the way.
+fn resolve_existing_ancestors(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            break;
+        };
+        tail.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    let base = existing.canonicalize().unwrap_or(existing);
+    tail.into_iter()
+        .rev()
+        .fold(base, |acc, component| acc.join(component))
+}
+
+/// Lexically normalizes a path against `cwd` (no filesystem access, so it
+/// also works for files the agent is about to create).
+fn normalize_scope_path(cwd: &Path, path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 impl ToolExecutor for SubagentToolExecutor {
@@ -5370,6 +5530,7 @@ impl ToolExecutor for SubagentToolExecutor {
         }
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        self.enforce_write_scope(tool_name, &value)?;
         execute_tool_with_enforcer(self.enforcer.as_ref(), tool_name, &value)
             .map_err(ToolError::new)
     }
@@ -5683,6 +5844,95 @@ fn make_agent_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("agent-{nanos}")
+}
+
+/// Public summary of a background agent job, for consumers such as the CLI
+/// `/tasks` command.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentJobSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    /// `"running"`, `"done"`, or `"failed"`. Unknown manifest states pass
+    /// through verbatim so future statuses are never silently dropped.
+    pub status: String,
+    /// ISO-8601 creation timestamp, as recorded in the manifest.
+    pub created_at: String,
+}
+
+/// Lists background agent jobs from the agent store (the `.clawd-agents`
+/// manifests written by the `Agent` tool), ordered by creation time.
+///
+/// Status comes from each persisted manifest: `running` while the job thread
+/// is alive, `done`/`failed` once the job reaches a terminal state.
+///
+/// Limitations: the store is per-workspace (or `CLAWD_AGENT_STORE`) and
+/// manifests outlive the process, so jobs launched by previous runs also
+/// appear; and if a process dies before persisting a terminal state, its
+/// jobs remain listed as `running`.
+#[must_use]
+pub fn list_agent_jobs() -> Vec<AgentJobSummary> {
+    agent_store_dir()
+        .map(|dir| agent_job_summaries_in(&dir))
+        .unwrap_or_default()
+}
+
+/// Pure directory-driven core of [`list_agent_jobs`]: reads every `*.json`
+/// manifest under `dir`, skipping unreadable or malformed entries.
+fn agent_job_summaries_in(dir: &Path) -> Vec<AgentJobSummary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<AgentJobSummary> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            let manifest: AgentOutput = serde_json::from_str(&contents).ok()?;
+            Some(AgentJobSummary {
+                id: manifest.agent_id,
+                name: manifest.name,
+                description: manifest.description,
+                subagent_type: manifest.subagent_type,
+                status: normalize_agent_job_status(&manifest.status),
+                created_at: manifest.created_at,
+            })
+        })
+        .collect();
+    summaries.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    summaries
+}
+
+/// Maps manifest statuses onto the public `running`/`done`/`failed` set
+/// (manifests persist the terminal success state as `completed`).
+fn normalize_agent_job_status(status: &str) -> String {
+    match status {
+        "completed" => String::from("done"),
+        other => other.to_string(),
+    }
+}
+
+/// Builds a telemetry tracer for a sub-agent when `CLAW_DASHBOARD_EVENTS`
+/// is set, so each parallel agent shows up as its own card (with live token
+/// usage) in `claw-dashboard`. Local JSONL file only.
+fn dashboard_agent_tracer(agent_id: &str) -> Option<SessionTracer> {
+    let path = std::env::var("CLAW_DASHBOARD_EVENTS").ok()?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let sink = JsonlTelemetrySink::new(path).ok()?;
+    Some(SessionTracer::new(agent_id, std::sync::Arc::new(sink)))
 }
 
 fn slugify_agent_name(description: &str) -> String {
@@ -6591,11 +6841,36 @@ fn detect_powershell_shell() -> std::io::Result<&'static str> {
 }
 
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .is_ok_and(|status| status.success())
+    // Resolve against PATH without spawning a shell: forking `sh` for every
+    // probe fails spuriously under load (EAGAIN), which made runtime
+    // detection report "not found" for interpreters that exist.
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return is_executable_file(std::path::Path::new(command));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            if is_executable_file(&dir.join(command)) {
+                return true;
+            }
+            if cfg!(windows) {
+                return is_executable_file(&dir.join(format!("{command}.exe")));
+            }
+            false
+        })
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6839,13 +7114,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        agent_job_summaries_in, agent_permission_policy, allowed_tools_for_subagent,
+        build_agent_system_prompt, canonical_allowed_tool_name, classify_lane_failure,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
+        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -6884,6 +7159,128 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    /// Contract: no sub-agent type may spawn nested agents. Recursion is
+    /// prevented by construction because `allowed_tools_for_subagent` never
+    /// grants the `Agent` tool; this test pins that invariant so a future
+    /// tool-list edit cannot silently enable unbounded agent recursion.
+    #[test]
+    fn subagents_cannot_spawn_nested_agents_by_construction() {
+        let agent_canonical = canonical_allowed_tool_name("Agent");
+        for subagent_type in [
+            "general-purpose",
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "statusline-setup",
+            "some-custom-type",
+        ] {
+            let allowed = allowed_tools_for_subagent(subagent_type);
+            assert!(
+                !allowed.contains(&agent_canonical),
+                "subagent type `{subagent_type}` must not expose the Agent \
+                 tool: nested agents would allow unbounded recursion"
+            );
+        }
+    }
+
+    /// Contract: even a direct `Agent` invocation against a sub-agent's tool
+    /// executor is refused at execution time.
+    #[test]
+    fn subagent_executor_refuses_agent_tool_invocation() {
+        let mut executor = SubagentToolExecutor::new(allowed_tools_for_subagent("general-purpose"));
+        let error = executor
+            .execute(
+                "Agent",
+                &json!({"description": "nested", "prompt": "spawn"}).to_string(),
+            )
+            .expect_err("sub-agents must not be able to launch nested agents");
+        assert!(
+            error.to_string().contains("not enabled"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    fn write_agent_manifest_fixture(
+        dir: &Path,
+        id: &str,
+        status: &str,
+        created_at: &str,
+        subagent_type: Option<&str>,
+    ) {
+        let manifest = json!({
+            "agentId": id,
+            "name": format!("name-{id}"),
+            "description": format!("desc-{id}"),
+            "subagentType": subagent_type,
+            "status": status,
+            "outputFile": dir.join(format!("{id}.md")).display().to_string(),
+            "manifestFile": dir.join(format!("{id}.json")).display().to_string(),
+            "createdAt": created_at,
+            "derivedState": "working",
+        });
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&manifest).expect("manifest json"),
+        )
+        .expect("write manifest fixture");
+    }
+
+    #[test]
+    fn agent_job_summaries_read_manifests_sorted_by_creation() {
+        let dir = temp_path("agent-jobs");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-2",
+            "completed",
+            "2026-07-15T10:01:00Z",
+            Some("Explore"),
+        );
+        write_agent_manifest_fixture(&dir, "agent-1", "running", "2026-07-15T10:00:00Z", None);
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-3",
+            "failed",
+            "2026-07-15T10:02:00Z",
+            Some("general-purpose"),
+        );
+        // Non-manifest and malformed files are skipped, not errors.
+        fs::write(dir.join("agent-1.md"), "# output").expect("md");
+        fs::write(dir.join("broken.json"), "{not json").expect("broken");
+
+        let summaries = agent_job_summaries_in(&dir);
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-1", "agent-2", "agent-3"],
+            "summaries must be ordered by creation time"
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["running", "done", "failed"],
+            "manifest `completed` must surface as `done`"
+        );
+        assert_eq!(summaries[0].name, "name-agent-1");
+        assert_eq!(summaries[0].description, "desc-agent-1");
+        assert_eq!(summaries[0].subagent_type, None);
+        assert_eq!(summaries[1].subagent_type.as_deref(), Some("Explore"));
+        assert_eq!(summaries[0].created_at, "2026-07-15T10:00:00Z");
+    }
+
+    #[test]
+    fn agent_job_summaries_of_missing_dir_are_empty() {
+        let dir = temp_path("agent-jobs-missing");
+        assert!(agent_job_summaries_in(&dir).is_empty());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -8683,6 +9080,202 @@ mod tests {
     }
 
     #[test]
+    fn write_scope_blocks_writes_outside_module() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        std::fs::create_dir_all(workspace.join("src/cart")).expect("dirs");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([
+            "write_file".to_string(),
+            "read_file".to_string(),
+        ]))
+        .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        let inside = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/login.ts", "content": "ok"}).to_string(),
+        );
+        assert!(inside.is_ok(), "in-scope write should pass: {inside:?}");
+
+        let outside = executor.execute(
+            "write_file",
+            &json!({"path": "src/cart/cart.ts", "content": "nope"}).to_string(),
+        );
+        let error = outside.expect_err("out-of-scope write must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "error should mention scope: {error}"
+        );
+
+        let traversal = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/../cart/hack.ts", "content": "nope"}).to_string(),
+        );
+        assert!(
+            traversal.is_err(),
+            "path traversal must not escape the scope"
+        );
+
+        // Reads anywhere in the workspace remain allowed.
+        std::fs::write(workspace.join("src/cart/cart.ts"), "existing").expect("seed");
+        let read = executor.execute(
+            "read_file",
+            &json!({"path": "src/cart/cart.ts"}).to_string(),
+        );
+        assert!(read.is_ok(), "reads stay workspace-wide: {read:?}");
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_scope_follows_symlinks_out_of_the_module() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope-symlink");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        std::fs::create_dir_all(workspace.join("src/cart")).expect("dirs");
+        // src/auth/vendor → ../cart: lexically inside the scope, physically outside.
+        std::os::unix::fs::symlink("../cart", workspace.join("src/auth/vendor")).expect("symlink");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from(["write_file".to_string()]))
+            .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        let through_symlink = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/vendor/hijack.ts", "content": "nope"}).to_string(),
+        );
+        let error = through_symlink.expect_err("symlinked write must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "error should mention scope: {error}"
+        );
+
+        // Direct in-scope writes still pass.
+        let inside = executor.execute(
+            "write_file",
+            &json!({"path": "src/auth/login.ts", "content": "ok"}).to_string(),
+        );
+        assert!(inside.is_ok(), "in-scope write should pass: {inside:?}");
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn write_scope_closes_shell_and_notebook_bypasses() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_path("write-scope-bypass");
+        std::fs::create_dir_all(workspace.join("src/auth")).expect("dirs");
+        let original_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("chdir");
+
+        let mut executor = SubagentToolExecutor::new(BTreeSet::from([
+            "bash".to_string(),
+            "power_shell".to_string(),
+            "repl".to_string(),
+            "notebook_edit".to_string(),
+        ]))
+        .with_write_scope(vec![PathBuf::from("src/auth")]);
+
+        // Shell tools would write anywhere (`echo x > src/cart/x.ts`), so a
+        // scoped agent must not get them at all.
+        for shell in ["bash", "PowerShell", "REPL"] {
+            let result = executor.execute(shell, &json!({"command": "echo hi"}).to_string());
+            let error = result.expect_err("shells must be refused under scope");
+            assert!(
+                error.to_string().contains("module-scoped"),
+                "{shell}: {error}"
+            );
+        }
+
+        // NotebookEdit is matched by canonical name ("notebook_edit"): an
+        // out-of-scope notebook write must be rejected, not silently allowed.
+        let notebook = executor.execute(
+            "NotebookEdit",
+            &json!({
+                "notebook_path": "src/cart/evil.ipynb",
+                "new_source": "x"
+            })
+            .to_string(),
+        );
+        let error = notebook.expect_err("out-of-scope notebook edit must fail");
+        assert!(
+            error.to_string().contains("module scope"),
+            "notebook error should mention scope: {error}"
+        );
+
+        std::env::set_current_dir(original_cwd).expect("restore cwd");
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn agent_emits_dashboard_lifecycle_events() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = temp_path("agent-dashboard");
+        let events = dir.join("events.jsonl");
+        std::fs::create_dir_all(&dir).expect("store dir");
+        std::env::set_var("CLAWD_AGENT_STORE", &dir);
+        std::env::set_var("CLAW_DASHBOARD_EVENTS", &events);
+
+        let manifest = execute_agent_with_spawn(
+            AgentInput {
+                description: "Trace usage".to_string(),
+                prompt: "Do the traced work.".to_string(),
+                subagent_type: Some("Explore".to_string()),
+                name: Some("traced-agent".to_string()),
+                model: None,
+                allowed_write_paths: None,
+            },
+            |_job| Ok(()),
+        )
+        .expect("Agent should succeed");
+        persist_agent_terminal_state(&manifest, "completed", Some("done"), None)
+            .expect("terminal state persists");
+        let failed = manifest.clone();
+        persist_agent_terminal_state(&failed, "failed", None, Some("boom".to_string()))
+            .expect("failed state persists");
+
+        std::env::remove_var("CLAW_DASHBOARD_EVENTS");
+        std::env::remove_var("CLAWD_AGENT_STORE");
+
+        let contents = std::fs::read_to_string(&events).expect("events file exists");
+        assert!(
+            contents.contains("\"namespace\":\"agent\"") && contents.contains("\"started\""),
+            "agent_started should be emitted: {contents}"
+        );
+        assert!(
+            contents.contains("\"label\":\"traced-agent\""),
+            "label should be the agent name: {contents}"
+        );
+        assert!(
+            contents.contains("\"finished\""),
+            "agent_finished should be emitted: {contents}"
+        );
+        assert!(
+            contents.contains("\"failed\"") && contents.contains("boom"),
+            "agent_failed should carry the error: {contents}"
+        );
+        assert!(
+            contents.contains(&format!("\"agent_id\":\"{}\"", manifest.agent_id)),
+            "events should reference the agent id: {contents}"
+        );
+    }
+
+    #[test]
     fn agent_persists_handoff_metadata() {
         let _guard = env_lock()
             .lock()
@@ -8699,6 +9292,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("ship-audit".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -8780,6 +9374,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8837,6 +9432,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("fail-task".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8884,6 +9480,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("summary-floor".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8929,6 +9526,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("recovery-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -8977,6 +9575,7 @@ mod tests {
                 subagent_type: Some("Verification".to_string()),
                 name: Some("review-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9017,6 +9616,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("backlog-scan".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9063,6 +9663,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("artifact-lane".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9133,6 +9734,7 @@ mod tests {
                 subagent_type: Some("Explore".to_string()),
                 name: Some("cron-closeout".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9174,6 +9776,7 @@ mod tests {
                 subagent_type: None,
                 name: Some("spawn-error".to_string()),
                 model: None,
+                allowed_write_paths: None,
             },
             |_| Err(String::from("thread creation failed")),
         )

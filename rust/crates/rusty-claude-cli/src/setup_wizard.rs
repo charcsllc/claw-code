@@ -1,22 +1,29 @@
 use std::io::{self, IsTerminal, Write};
 
-use runtime::{save_user_provider_settings, ConfigLoader, RuntimeProviderConfig};
-
-use serde_json;
+use runtime::{
+    load_user_settings_field, save_user_provider_settings, save_user_settings_field, ConfigLoader,
+    RuntimeProviderConfig,
+};
 
 const PROVIDERS: &[(&str, &str, &str)] = &[
     ("1", "Anthropic", "anthropic"),
     ("2", "xAI / Grok", "xai"),
     ("3", "OpenAI", "openai"),
-    ("4", "DashScope (Qwen/Kimi)", "dashscope"),
-    ("5", "Custom (OpenAI-compat)", "openai"),
+    ("4", "DashScope (Qwen)", "dashscope"),
+    ("5", "Zhipu / Z.ai (GLM, coding plan)", "zhipu"),
+    ("6", "Moonshot / Kimi", "kimi"),
+    ("7", "DeepSeek", "deepseek"),
+    ("8", "Custom (OpenAI-compat)", "openai"),
 ];
 
 const PROVIDER_MODELS: &[(&str, &[&str])] = &[
     ("anthropic", &["opus", "sonnet", "haiku"]),
     ("xai", &["grok", "grok-mini", "grok-2"]),
     ("openai", &["gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano"]),
-    ("dashscope", &["qwen-plus", "qwen-max", "kimi"]),
+    ("dashscope", &["qwen-plus", "qwen-max", "qwen3-coder"]),
+    ("zhipu", &["glm-4.6", "glm-4.5-air"]),
+    ("kimi", &["kimi-k2-0905-preview", "kimi-k2-turbo-preview"]),
+    ("deepseek", &["deepseek-chat", "deepseek-reasoner"]),
 ];
 
 const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
@@ -27,6 +34,11 @@ const DEFAULT_BASE_URLS: &[(&str, &str)] = &[
         "dashscope",
         "https://dashscope.aliyuncs.com/compatible-mode/v1",
     ),
+    // Anthropic-protocol endpoints of the Chinese coding providers: their
+    // tokens ride ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL.
+    ("zhipu", "https://api.z.ai/api/anthropic"),
+    ("kimi", "https://api.moonshot.ai/anthropic"),
+    ("deepseek", "https://api.deepseek.com"),
 ];
 
 const API_KEY_ENV_VARS: &[(&str, &str)] = &[
@@ -34,6 +46,9 @@ const API_KEY_ENV_VARS: &[(&str, &str)] = &[
     ("xai", "XAI_API_KEY"),
     ("openai", "OPENAI_API_KEY"),
     ("dashscope", "DASHSCOPE_API_KEY"),
+    ("zhipu", "ANTHROPIC_AUTH_TOKEN"),
+    ("kimi", "ANTHROPIC_AUTH_TOKEN"),
+    ("deepseek", "OPENAI_API_KEY"),
 ];
 
 pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,6 +61,10 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("  \x1b[1mClaw Code Setup Wizard\x1b[0m");
     println!("  Configure your provider, API key, and model.");
+    println!(
+        "  Active now: {}",
+        crate::provider_presets::active_provider_summary().0
+    );
     println!("  Press Enter to keep current value.\n");
 
     let kind = prompt_provider(&current)?;
@@ -57,15 +76,49 @@ pub fn run_setup_wizard() -> Result<(), Box<dyn std::error::Error>> {
     save_user_provider_settings(&kind, &api_key, base_url.as_deref(), model.as_deref())?;
 
     if let Some(fast) = &fast_model {
-        save_settings_field("subagentModel", fast)?;
+        save_user_settings_field("subagentModel", fast)?;
     }
+
+    // Apply to the running process too: before this, the wizard's changes
+    // only took effect after a restart (the API clients read env vars).
+    let applied_now = crate::provider_presets::preset_for(&kind)
+        .map(|preset| {
+            crate::provider_presets::apply_provider_env(
+                preset,
+                (!api_key.is_empty()).then_some(api_key.as_str()),
+                base_url.as_deref(),
+                false,
+            )
+        })
+        .is_some();
 
     println!();
     println!("  \x1b[32mProvider saved to ~/.claw/settings.json\x1b[0m");
+    if applied_now {
+        println!("  Applied to this session too — no restart needed.");
+    }
     println!(
-        "  Run \x1b[1m/model {}\x1b[0m or restart claw to activate.",
+        "  Run \x1b[1m/model {}\x1b[0m to activate the model.",
         model.as_deref().unwrap_or(&kind)
     );
+
+    // One live request catches a typo'd key or wrong base URL here, not on
+    // the first real prompt.
+    let test = read_line("  Test the connection now with a 1-token request? [y/N]: ")?;
+    if matches!(
+        test.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "s" | "si" | "sí"
+    ) {
+        let probe_model = model
+            .clone()
+            .or_else(|| {
+                crate::provider_presets::preset_for(&kind)
+                    .map(|preset| preset.default_model.to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| kind.clone());
+        println!("{}", crate::run_provider_probe(&probe_model));
+    }
     println!();
 
     Ok(())
@@ -123,8 +176,15 @@ fn prompt_api_key(
     let current_key = current.api_key();
     let hint = match current_key {
         Some(key) if !key.is_empty() => {
-            let masked = if key.len() > 4 {
-                format!("****{}", &key[key.len() - 4..])
+            // Char-based, not byte-based: a multibyte key (e.g. one with a
+            // `€`) would panic on a mid-codepoint byte slice.
+            let last4: String = {
+                let chars: Vec<char> = key.chars().collect();
+                let start = chars.len().saturating_sub(4);
+                chars[start..].iter().collect()
+            };
+            let masked = if key.chars().count() > 4 {
+                format!("****{last4}")
             } else {
                 "****".to_string()
             };
@@ -173,9 +233,9 @@ fn prompt_base_url(
 
     // Check if the relevant env var is already set
     let env_var = match kind {
-        "anthropic" => "ANTHROPIC_BASE_URL",
+        "anthropic" | "zhipu" | "kimi" => "ANTHROPIC_BASE_URL",
         "xai" => "XAI_BASE_URL",
-        "openai" => "OPENAI_BASE_URL",
+        "openai" | "deepseek" => "OPENAI_BASE_URL",
         "dashscope" => "DASHSCOPE_BASE_URL",
         _ => "BASE_URL",
     };
@@ -239,7 +299,7 @@ fn prompt_fast_model(
     println!("    by using a fast model for information-gathering tasks.");
     println!("    Press Enter to skip (agents will use your main model).");
 
-    let current_fast = load_current_settings_field("subagentModel");
+    let current_fast = load_user_settings_field("subagentModel");
     let default_hint = current_fast.as_deref().or(main_model).unwrap_or("");
 
     let input = read_line(&format!(
@@ -255,38 +315,6 @@ fn prompt_fast_model(
     } else {
         Ok(Some(input.trim().to_string()))
     }
-}
-
-fn load_current_settings_field(field: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let settings_path = std::path::Path::new(&home).join(".claw/settings.json");
-    let content = std::fs::read_to_string(&settings_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    json.get(field)?.as_str().map(|s| s.to_string())
-}
-
-fn save_settings_field(field: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let home = std::env::var("HOME")?;
-    let settings_dir = std::path::Path::new(&home).join(".claw");
-    let settings_path = settings_dir.join("settings.json");
-
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        serde_json::json!({})
-    };
-
-    if let Some(obj) = settings.as_object_mut() {
-        obj.insert(
-            field.to_string(),
-            serde_json::Value::String(value.to_string()),
-        );
-    }
-
-    std::fs::create_dir_all(&settings_dir)?;
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&settings)?)?;
-    Ok(())
 }
 
 fn read_line(prompt: &str) -> Result<String, Box<dyn std::error::Error>> {

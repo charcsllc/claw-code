@@ -16,7 +16,10 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, resolve_model_alias, Provider, ProviderFuture};
+use super::{
+    message_usage_event, preflight_message_request, resolve_model_alias, Provider, ProviderFuture,
+};
+use telemetry::SessionTracer;
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -115,6 +118,7 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    session_tracer: Option<SessionTracer>,
 }
 
 impl OpenAiCompatClient {
@@ -136,7 +140,16 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            session_tracer: None,
         }
+    }
+
+    /// Attaches a session tracer so this provider emits `message_usage`
+    /// analytics (token breakdown) to the telemetry sink.
+    #[must_use]
+    pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
+        self.session_tracer = Some(session_tracer);
+        self
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
@@ -171,6 +184,7 @@ impl OpenAiCompatClient {
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            session_tracer: None,
         })
     }
 
@@ -266,6 +280,13 @@ impl OpenAiCompatClient {
             normalized.request_id = request_id;
         }
         normalized.model = original_model;
+        if let Some(session_tracer) = &self.session_tracer {
+            session_tracer.record_analytics(message_usage_event(
+                &normalized.model,
+                normalized.request_id.as_deref(),
+                &normalized.usage,
+            ));
+        }
         Ok(normalized)
     }
 
@@ -292,6 +313,8 @@ impl OpenAiCompatClient {
             pending: VecDeque::new(),
             done: false,
             state: StreamState::new(original_model),
+            session_tracer: self.session_tracer.clone(),
+            usage_recorded: false,
         })
     }
 
@@ -322,6 +345,12 @@ impl OpenAiCompatClient {
             } else {
                 self.jittered_backoff_for_attempt(attempts)?
             };
+            super::notify_retry(&super::RetryNotice {
+                attempt: attempts,
+                max_retries: self.max_retries,
+                delay,
+                error: retryable_error.to_string(),
+            });
             tokio::time::sleep(delay).await;
         };
 
@@ -440,6 +469,8 @@ pub struct MessageStream {
     pending: VecDeque<StreamEvent>,
     done: bool,
     state: StreamState,
+    session_tracer: Option<SessionTracer>,
+    usage_recorded: bool,
 }
 
 impl MessageStream {
@@ -448,15 +479,35 @@ impl MessageStream {
         self.request_id.as_deref()
     }
 
+    /// Emits the `message_usage` analytics event once, when the stream's
+    /// synthetic MessageStop surfaces and usage has been captured.
+    fn observe_outgoing(&mut self, event: &StreamEvent) {
+        if !matches!(event, StreamEvent::MessageStop(_)) || self.usage_recorded {
+            return;
+        }
+        self.usage_recorded = true;
+        if let (Some(session_tracer), Some(usage)) =
+            (&self.session_tracer, self.state.usage.as_ref())
+        {
+            session_tracer.record_analytics(message_usage_event(
+                &self.state.model,
+                self.request_id.as_deref(),
+                usage,
+            ));
+        }
+    }
+
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {
+                self.observe_outgoing(&event);
                 return Ok(Some(event));
             }
 
             if self.done {
                 self.pending.extend(self.state.finish()?);
                 if let Some(event) = self.pending.pop_front() {
+                    self.observe_outgoing(&event);
                     return Ok(Some(event));
                 }
                 return Ok(None);

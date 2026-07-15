@@ -176,14 +176,28 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
         "text prompt stdout should include the assistant text ({stdout:?})"
     );
     assert!(
-        plain_stdout.contains("✔ ✨ Done"),
-        "text prompt stdout should still include spinner completion ({stdout:?})"
-    );
-    assert!(
         plain_stdout
             .lines()
             .any(|line| line == "Mock streaming says hello from the parity harness."),
         "text prompt stdout should print the assistant text as its own line ({stdout:?})"
+    );
+    // stdout here is a pipe, not a terminal: the spinner decoration and ANSI
+    // escapes must NOT pollute captured output, and the assistant text must
+    // appear exactly once (no raw re-print after the rendered stream).
+    assert!(
+        !plain_stdout.contains("✨ Done"),
+        "piped stdout must stay clean of spinner decoration ({stdout:?})"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "piped stdout must contain no ANSI escapes ({stdout:?})"
+    );
+    assert_eq!(
+        plain_stdout
+            .matches("Mock streaming says hello from the parity harness.")
+            .count(),
+        1,
+        "assistant text must appear exactly once, not double-printed ({stdout:?})"
     );
 
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
