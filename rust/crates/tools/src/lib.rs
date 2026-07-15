@@ -5846,6 +5846,82 @@ fn make_agent_id() -> String {
     format!("agent-{nanos}")
 }
 
+/// Public summary of a background agent job, for consumers such as the CLI
+/// `/tasks` command.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentJobSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub subagent_type: Option<String>,
+    /// `"running"`, `"done"`, or `"failed"`. Unknown manifest states pass
+    /// through verbatim so future statuses are never silently dropped.
+    pub status: String,
+    /// ISO-8601 creation timestamp, as recorded in the manifest.
+    pub created_at: String,
+}
+
+/// Lists background agent jobs from the agent store (the `.clawd-agents`
+/// manifests written by the `Agent` tool), ordered by creation time.
+///
+/// Status comes from each persisted manifest: `running` while the job thread
+/// is alive, `done`/`failed` once the job reaches a terminal state.
+///
+/// Limitations: the store is per-workspace (or `CLAWD_AGENT_STORE`) and
+/// manifests outlive the process, so jobs launched by previous runs also
+/// appear; and if a process dies before persisting a terminal state, its
+/// jobs remain listed as `running`.
+#[must_use]
+pub fn list_agent_jobs() -> Vec<AgentJobSummary> {
+    agent_store_dir()
+        .map(|dir| agent_job_summaries_in(&dir))
+        .unwrap_or_default()
+}
+
+/// Pure directory-driven core of [`list_agent_jobs`]: reads every `*.json`
+/// manifest under `dir`, skipping unreadable or malformed entries.
+fn agent_job_summaries_in(dir: &Path) -> Vec<AgentJobSummary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<AgentJobSummary> = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            let manifest: AgentOutput = serde_json::from_str(&contents).ok()?;
+            Some(AgentJobSummary {
+                id: manifest.agent_id,
+                name: manifest.name,
+                description: manifest.description,
+                subagent_type: manifest.subagent_type,
+                status: normalize_agent_job_status(&manifest.status),
+                created_at: manifest.created_at,
+            })
+        })
+        .collect();
+    summaries.sort_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    summaries
+}
+
+/// Maps manifest statuses onto the public `running`/`done`/`failed` set
+/// (manifests persist the terminal success state as `completed`).
+fn normalize_agent_job_status(status: &str) -> String {
+    match status {
+        "completed" => String::from("done"),
+        other => other.to_string(),
+    }
+}
+
 /// Builds a telemetry tracer for a sub-agent when `CLAW_DASHBOARD_EVENTS`
 /// is set, so each parallel agent shows up as its own card (with live token
 /// usage) in `claw-dashboard`. Local JSONL file only.
@@ -7038,13 +7114,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
-        classify_lane_failure, derive_agent_state, execute_agent_with_spawn, execute_tool,
-        extract_recovery_outcome, final_assistant_text, global_cron_registry,
-        maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
-        persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
-        SubagentToolExecutor,
+        agent_job_summaries_in, agent_permission_policy, allowed_tools_for_subagent,
+        build_agent_system_prompt, canonical_allowed_tool_name, classify_lane_failure,
+        derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
+        final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
+        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
+        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
+        ProviderRuntimeClient, SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -7083,6 +7159,128 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    /// Contract: no sub-agent type may spawn nested agents. Recursion is
+    /// prevented by construction because `allowed_tools_for_subagent` never
+    /// grants the `Agent` tool; this test pins that invariant so a future
+    /// tool-list edit cannot silently enable unbounded agent recursion.
+    #[test]
+    fn subagents_cannot_spawn_nested_agents_by_construction() {
+        let agent_canonical = canonical_allowed_tool_name("Agent");
+        for subagent_type in [
+            "general-purpose",
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "statusline-setup",
+            "some-custom-type",
+        ] {
+            let allowed = allowed_tools_for_subagent(subagent_type);
+            assert!(
+                !allowed.contains(&agent_canonical),
+                "subagent type `{subagent_type}` must not expose the Agent \
+                 tool: nested agents would allow unbounded recursion"
+            );
+        }
+    }
+
+    /// Contract: even a direct `Agent` invocation against a sub-agent's tool
+    /// executor is refused at execution time.
+    #[test]
+    fn subagent_executor_refuses_agent_tool_invocation() {
+        let mut executor = SubagentToolExecutor::new(allowed_tools_for_subagent("general-purpose"));
+        let error = executor
+            .execute(
+                "Agent",
+                &json!({"description": "nested", "prompt": "spawn"}).to_string(),
+            )
+            .expect_err("sub-agents must not be able to launch nested agents");
+        assert!(
+            error.to_string().contains("not enabled"),
+            "unexpected error message: {error}"
+        );
+    }
+
+    fn write_agent_manifest_fixture(
+        dir: &Path,
+        id: &str,
+        status: &str,
+        created_at: &str,
+        subagent_type: Option<&str>,
+    ) {
+        let manifest = json!({
+            "agentId": id,
+            "name": format!("name-{id}"),
+            "description": format!("desc-{id}"),
+            "subagentType": subagent_type,
+            "status": status,
+            "outputFile": dir.join(format!("{id}.md")).display().to_string(),
+            "manifestFile": dir.join(format!("{id}.json")).display().to_string(),
+            "createdAt": created_at,
+            "derivedState": "working",
+        });
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_string_pretty(&manifest).expect("manifest json"),
+        )
+        .expect("write manifest fixture");
+    }
+
+    #[test]
+    fn agent_job_summaries_read_manifests_sorted_by_creation() {
+        let dir = temp_path("agent-jobs");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-2",
+            "completed",
+            "2026-07-15T10:01:00Z",
+            Some("Explore"),
+        );
+        write_agent_manifest_fixture(&dir, "agent-1", "running", "2026-07-15T10:00:00Z", None);
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-3",
+            "failed",
+            "2026-07-15T10:02:00Z",
+            Some("general-purpose"),
+        );
+        // Non-manifest and malformed files are skipped, not errors.
+        fs::write(dir.join("agent-1.md"), "# output").expect("md");
+        fs::write(dir.join("broken.json"), "{not json").expect("broken");
+
+        let summaries = agent_job_summaries_in(&dir);
+        fs::remove_dir_all(&dir).expect("cleanup");
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-1", "agent-2", "agent-3"],
+            "summaries must be ordered by creation time"
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["running", "done", "failed"],
+            "manifest `completed` must surface as `done`"
+        );
+        assert_eq!(summaries[0].name, "name-agent-1");
+        assert_eq!(summaries[0].description, "desc-agent-1");
+        assert_eq!(summaries[0].subagent_type, None);
+        assert_eq!(summaries[1].subagent_type.as_deref(), Some("Explore"));
+        assert_eq!(summaries[0].created_at, "2026-07-15T10:00:00Z");
+    }
+
+    #[test]
+    fn agent_job_summaries_of_missing_dir_are_empty() {
+        let dir = temp_path("agent-jobs-missing");
+        assert!(agent_job_summaries_in(&dir).is_empty());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {

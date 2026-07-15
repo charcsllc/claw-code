@@ -88,6 +88,9 @@ pub struct RunOptions {
     /// Pause after planning and ask for confirmation on stdin before
     /// spending developer runs.
     pub approve: bool,
+    /// Forced design archetype (`--archetype`); `None` keeps the keyword
+    /// detection over the Director's plan.
+    pub archetype: Option<crate::design::DesignArchetype>,
 }
 
 pub struct RunSummary {
@@ -106,6 +109,9 @@ pub struct RunSummary {
     pub blocked_task_ids: Vec<String>,
     /// This run's spend in USD, when telemetry is active.
     pub cost_usd: Option<f64>,
+    /// Approximate spend per role family (biggest spender first), sampled at
+    /// phase boundaries when telemetry is active; empty otherwise.
+    pub role_spend: Vec<(String, f64)>,
     /// Improve mode: the dedicated work branch and the branch it forked from,
     /// so the caller can print an accurate review/merge hint.
     pub improve_branch: Option<String>,
@@ -277,6 +283,17 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             options.max_cost_usd.unwrap_or_default()
         ));
     }
+    // Per-role spend attribution: deltas of the aggregate spend, sampled at
+    // the sequential phase boundaries below. Inactive without telemetry.
+    let mut role_ledger = RoleSpendLedger::default();
+    let mut spend_cursor = budget.spent().unwrap_or(0.0);
+
+    if let Some(archetype) = options.archetype {
+        workflow.phase(&format!(
+            "Arquetipo de diseño forzado por --archetype: {}",
+            archetype.label()
+        ));
+    }
 
     // For Improve, a bounded snapshot of the existing repo (tree + manifests)
     // grounds every planning agent in what already exists. Developers still
@@ -366,6 +383,13 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             save_doc(&docs, "decisions.md", &resolution.report)?;
             format!("\n\nResolved decisions (binding):\n{}", resolution.report)
         };
+        attribute_role_spend(
+            &budget,
+            &mut spend_cursor,
+            &mut role_ledger,
+            "Director",
+            &workflow,
+        );
         let plan_json = serde_json::to_string(&plan).unwrap_or_default();
 
         // Phase 2: Architects design BEFORE the backlog exists, so TaskSpecs
@@ -378,7 +402,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             // direction + the 8 sections its document must cover); the
             // generic "deliver your design document" left it rudderless.
             let designer_brief = if *role == Role::UxUiDesigner {
-                crate::design::designer_planning_brief(&plan)
+                crate::design::designer_planning_brief(effective_archetype(options, &plan))
             } else {
                 String::new()
             };
@@ -415,6 +439,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 truncate_chars(&result.report, 6_000)
             );
         }
+
+        attribute_role_spend(
+            &budget,
+            &mut spend_cursor,
+            &mut role_ledger,
+            "Arquitectos",
+            &workflow,
+        );
 
         // Phase 3: Subdirector turns plan + designs into the backlog.
         workflow.phase("Subdirector Técnico: creando el backlog desde los diseños");
@@ -475,6 +507,13 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             "backlog.json",
             &serde_json::to_string_pretty(&tasks).unwrap_or_default(),
         )?;
+        attribute_role_spend(
+            &budget,
+            &mut spend_cursor,
+            &mut role_ledger,
+            "Subdirector",
+            &workflow,
+        );
 
         (plan, tasks)
     };
@@ -507,6 +546,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             failed_task_ids: Vec::new(),
             blocked_task_ids: Vec::new(),
             cost_usd: budget.spent(),
+            role_spend: role_ledger.breakdown(),
             improve_branch,
             base_branch,
         });
@@ -529,6 +569,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             failed_task_ids: Vec::new(),
             blocked_task_ids: Vec::new(),
             cost_usd: budget.spent(),
+            role_spend: role_ledger.breakdown(),
             improve_branch,
             base_branch,
         });
@@ -587,7 +628,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         && options.project_dir.join("package.json").exists()
         && !docs.join("design-system.md").exists()
     {
-        let archetype = crate::design::detect_archetype(&plan);
+        let archetype = effective_archetype(options, &plan);
         workflow.phase(&format!(
             "Design system: fundación de tokens + componentes (arquetipo: {})",
             archetype.label()
@@ -625,6 +666,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
         }
     }
+
+    attribute_role_spend(
+        &budget,
+        &mut spend_cursor,
+        &mut role_ledger,
+        "Fundación (contratos y design system)",
+        &workflow,
+    );
 
     // ---- Developer waves + Supervisor per delivery ----
     let mut state = BuildState::load(&options.project_dir);
@@ -665,6 +714,8 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     ));
     let mut failed_tasks: BTreeSet<usize> = BTreeSet::new();
     let mut retried: BTreeSet<usize> = BTreeSet::new();
+    // One end-of-scheduling pass that requeues terminal failures once.
+    let mut final_retry_done = false;
     // Tasks whose files are locked (developer running or supervision pending).
     let mut busy: BTreeSet<usize> = BTreeSet::new();
     let mut devs: Vec<DevSlot> = Vec::new();
@@ -708,6 +759,29 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
 
         if devs.is_empty() && sups.is_empty() {
+            // Selective final retry: with the graph drained, requeue every
+            // terminally failed task exactly once. Transient failures
+            // (flaky provider, timeout) get a second life, and a retry that
+            // succeeds unblocks its dependents — the loop keeps scheduling.
+            // A repeated failure is final again (`retried` is untouched, so
+            // no re-escalation), which bounds this to one extra pass.
+            if !final_retry_done && !failed_tasks.is_empty() {
+                final_retry_done = true;
+                let requeued = requeue_failed_tasks(&tasks, &mut failed_tasks, &mut failed);
+                workflow.phase(&format!(
+                    "Reintento final: {} tarea(s) fallida(s) vuelven a la cola una única vez: {}",
+                    requeued.len(),
+                    requeued.join(", ")
+                ));
+                append_file(
+                    &supervision_md,
+                    &format!(
+                        "\n## Final retry pass\n\n- Requeued once: {}\n",
+                        requeued.join(", ")
+                    ),
+                )?;
+                continue 'scheduler;
+            }
             // Graph drained: anything neither completed nor failed was held
             // back by a failed dependency — say so in the live log, not
             // only in the final summary.
@@ -885,6 +959,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         }
         sups = still_supervising;
     }
+
+    attribute_role_spend(
+        &budget,
+        &mut spend_cursor,
+        &mut role_ledger,
+        "Desarrollo y supervisión",
+        &workflow,
+    );
 
     // Full build gate at the end: per-delivery quick checks ran throughout,
     // this is the cross-module confirmation (with Fixer retry on failure).
@@ -1089,6 +1171,22 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         let _ = git_commit(&options.project_dir, "docs: add documentation and README");
     }
 
+    attribute_role_spend(
+        &budget,
+        &mut spend_cursor,
+        &mut role_ledger,
+        "Gates, QA y documentación",
+        &workflow,
+    );
+    let role_spend = role_ledger.breakdown();
+    if !role_spend.is_empty() {
+        let rows: Vec<String> = role_spend
+            .iter()
+            .map(|(role, usd)| format!("{role} {usd:.2} USD"))
+            .collect();
+        workflow.phase(&format!("Gasto por rol: {}", rows.join(" · ")));
+    }
+
     workflow.event(
         "finished",
         &[
@@ -1126,26 +1224,18 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     };
     // Persist the outcome next to the other build docs: the terminal
     // scrolls away, docs/SUMMARY.md doesn't.
-    let summary_md = format!(
-        "# Resumen de la construcción\n\n- Visión: {}\n- Arquetipo de diseño: {}\n- Tareas: {} \
-         (completadas {completed}, fallidas {failed}, bloqueadas {})\n- Tareas fallidas: {}\n- \
-         Issues de supervisión: {supervision_issues}\n- Coste estimado: {}\n- Rama de trabajo: \
-         {}\n",
-        plan.vision,
-        crate::design::detect_archetype(&plan).label(),
-        tasks.len(),
-        blocked_task_ids.len(),
-        if failed_task_ids.is_empty() {
-            "ninguna".to_string()
-        } else {
-            failed_task_ids.join(", ")
-        },
-        budget.spent().map_or_else(
-            || "desconocido (sin telemetría)".to_string(),
-            |cost| { format!("{cost:.2} USD") }
-        ),
-        improve_branch.as_deref().unwrap_or("(rama actual)"),
-    );
+    let summary_md = render_summary_md(&SummaryInputs {
+        vision: &plan.vision,
+        archetype_label: effective_archetype(options, &plan).label(),
+        total_tasks: tasks.len(),
+        completed,
+        failed,
+        blocked: blocked_task_ids.len(),
+        failed_task_ids: &failed_task_ids,
+        supervision_issues,
+        cost_usd: budget.spent(),
+        improve_branch: improve_branch.as_deref(),
+    });
     let _ = save_doc(&docs, "SUMMARY.md", &summary_md);
 
     Ok(RunSummary {
@@ -1161,6 +1251,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         failed_task_ids,
         blocked_task_ids,
         cost_usd: budget.spent(),
+        role_spend,
         improve_branch,
         base_branch,
     })
@@ -2541,6 +2632,181 @@ impl Budget {
         let spent = self.spent()?;
         (spent > ceiling).then_some(spent)
     }
+
+    /// The configured ceiling, if any (used by the per-role quota audit).
+    #[must_use]
+    pub fn ceiling(&self) -> Option<f64> {
+        self.ceiling
+    }
+}
+
+// ---------- Per-role spend ledger ----------
+
+/// Spend attributed per role family, fed with deltas of [`Budget::spent`]
+/// sampled at sequential phase boundaries. Attribution is approximate by
+/// construction (parallel agents share one aggregate counter), which is
+/// enough for the audit it powers: naming the role that eats the budget.
+/// It never changes the global-cutoff behavior — that stays in [`Budget`].
+#[derive(Default)]
+pub struct RoleSpendLedger {
+    spent: std::collections::BTreeMap<String, f64>,
+    /// Roles already reported over quota, so each breach logs once per run.
+    flagged: BTreeSet<String>,
+}
+
+impl RoleSpendLedger {
+    /// Adds `usd` to `role`'s tally; zero and negative deltas are ignored.
+    pub fn record(&mut self, role: &str, usd: f64) {
+        if usd > 0.0 {
+            *self.spent.entry(role.to_string()).or_insert(0.0) += usd;
+        }
+    }
+
+    /// The queryable per-role breakdown, biggest spender first (ties by
+    /// name, so the order is deterministic).
+    #[must_use]
+    pub fn breakdown(&self) -> Vec<(String, f64)> {
+        let mut rows: Vec<(String, f64)> = self
+            .spent
+            .iter()
+            .map(|(role, usd)| (role.clone(), *usd))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        rows
+    }
+
+    /// Roles that newly exceeded their proportional quota — `ceiling`
+    /// divided evenly across the roles seen so far. Returns
+    /// `(role, spent, quota)` and marks each role so it is reported once.
+    pub fn new_quota_breaches(&mut self, ceiling: f64) -> Vec<(String, f64, f64)> {
+        if ceiling <= 0.0 || self.spent.is_empty() {
+            return Vec::new();
+        }
+        let roles = u32::try_from(self.spent.len()).unwrap_or(u32::MAX);
+        let quota = ceiling / f64::from(roles);
+        let breaches: Vec<(String, f64, f64)> = self
+            .spent
+            .iter()
+            .filter(|(role, &usd)| usd > quota && !self.flagged.contains(*role))
+            .map(|(role, &usd)| (role.clone(), usd, quota))
+            .collect();
+        for (role, _, _) in &breaches {
+            self.flagged.insert(role.clone());
+        }
+        breaches
+    }
+}
+
+/// Attributes the spend since the last checkpoint to `role` and leaves an
+/// audit trail (log + dashboard event) for any role newly over its
+/// proportional quota. A no-op without telemetry (`spent()` is `None`).
+fn attribute_role_spend(
+    budget: &Budget,
+    cursor: &mut f64,
+    ledger: &mut RoleSpendLedger,
+    role: &str,
+    workflow: &WorkflowLog,
+) {
+    let Some(total) = budget.spent() else {
+        return;
+    };
+    let delta = total - *cursor;
+    *cursor = total;
+    ledger.record(role, delta);
+    let Some(ceiling) = budget.ceiling() else {
+        return;
+    };
+    for (role, spent, quota) in ledger.new_quota_breaches(ceiling) {
+        workflow.phase(&format!(
+            "Presupuesto por rol: {role} lleva {spent:.2} USD y supera su cuota \
+             proporcional ({quota:.2} USD de {ceiling:.2} USD)"
+        ));
+        workflow.event(
+            "role_budget_exceeded",
+            &[
+                ("role", role.clone()),
+                ("spent_usd", format!("{spent:.2}")),
+                ("quota_usd", format!("{quota:.2}")),
+            ],
+        );
+    }
+}
+
+// ---------- Build summary (docs/SUMMARY.md) ----------
+
+/// Everything the persisted summary reports. Extracted (with
+/// [`render_summary_md`]) so the exact file format is golden-tested:
+/// docs/SUMMARY.md outlives the terminal and tooling may parse its lines.
+pub struct SummaryInputs<'a> {
+    pub vision: &'a str,
+    pub archetype_label: &'a str,
+    pub total_tasks: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub blocked: usize,
+    pub failed_task_ids: &'a [String],
+    pub supervision_issues: usize,
+    pub cost_usd: Option<f64>,
+    pub improve_branch: Option<&'a str>,
+}
+
+/// Renders docs/SUMMARY.md. Format is a stable contract — update the golden
+/// test deliberately when changing anything here.
+#[must_use]
+pub fn render_summary_md(inputs: &SummaryInputs<'_>) -> String {
+    format!(
+        "# Resumen de la construcción\n\n- Visión: {}\n- Arquetipo de diseño: {}\n- Tareas: {} \
+         (completadas {}, fallidas {}, bloqueadas {})\n- Tareas fallidas: {}\n- \
+         Issues de supervisión: {}\n- Coste estimado: {}\n- Rama de trabajo: \
+         {}\n",
+        inputs.vision,
+        inputs.archetype_label,
+        inputs.total_tasks,
+        inputs.completed,
+        inputs.failed,
+        inputs.blocked,
+        if inputs.failed_task_ids.is_empty() {
+            "ninguna".to_string()
+        } else {
+            inputs.failed_task_ids.join(", ")
+        },
+        inputs.supervision_issues,
+        inputs.cost_usd.map_or_else(
+            || "desconocido (sin telemetría)".to_string(),
+            |cost| format!("{cost:.2} USD")
+        ),
+        inputs.improve_branch.unwrap_or("(rama actual)"),
+    )
+}
+
+/// The archetype the build actually uses: the `--archetype` override when
+/// given, keyword detection over the plan otherwise.
+fn effective_archetype(options: &RunOptions, plan: &Plan) -> crate::design::DesignArchetype {
+    options
+        .archetype
+        .unwrap_or_else(|| crate::design::detect_archetype(plan))
+}
+
+/// Final-retry bookkeeping: drains the terminally failed tasks back into
+/// the ready pool (they run exactly once more — the scheduler's `retried`
+/// escalation set is untouched, so a second failure is final again) and
+/// reconciles the failure counter. Returns the requeued ids for logging.
+fn requeue_failed_tasks(
+    tasks: &[TaskSpec],
+    failed_tasks: &mut BTreeSet<usize>,
+    failed_count: &mut usize,
+) -> Vec<String> {
+    let ids: Vec<String> = failed_tasks
+        .iter()
+        .map(|&index| tasks[index].id.clone())
+        .collect();
+    *failed_count = failed_count.saturating_sub(failed_tasks.len());
+    failed_tasks.clear();
+    ids
 }
 
 /// Sums `estimated_cost_usd_value` across all message_usage events.
@@ -3706,6 +3972,165 @@ mod tests {
             "template main"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn summary_md_format_is_golden() {
+        // GOLDEN TEST: docs/SUMMARY.md is a stable, user-visible contract.
+        // If this fails you changed the format — do it deliberately and
+        // update the expected text here in the same change.
+        let failed_ids = vec!["T3".to_string(), "T7".to_string()];
+        let rendered = render_summary_md(&SummaryInputs {
+            vision: "una tienda online",
+            archetype_label: "ecommerce",
+            total_tasks: 9,
+            completed: 6,
+            failed: 2,
+            blocked: 1,
+            failed_task_ids: &failed_ids,
+            supervision_issues: 3,
+            cost_usd: Some(1.5),
+            improve_branch: Some("multiagent/improve-42"),
+        });
+        assert_eq!(
+            rendered,
+            "# Resumen de la construcción\n\n\
+             - Visión: una tienda online\n\
+             - Arquetipo de diseño: ecommerce\n\
+             - Tareas: 9 (completadas 6, fallidas 2, bloqueadas 1)\n\
+             - Tareas fallidas: T3, T7\n\
+             - Issues de supervisión: 3\n\
+             - Coste estimado: 1.50 USD\n\
+             - Rama de trabajo: multiagent/improve-42\n"
+        );
+
+        // The no-failure / no-telemetry / greenfield wording is also fixed.
+        let rendered = render_summary_md(&SummaryInputs {
+            vision: "v",
+            archetype_label: "general",
+            total_tasks: 1,
+            completed: 1,
+            failed: 0,
+            blocked: 0,
+            failed_task_ids: &[],
+            supervision_issues: 0,
+            cost_usd: None,
+            improve_branch: None,
+        });
+        assert_eq!(
+            rendered,
+            "# Resumen de la construcción\n\n\
+             - Visión: v\n\
+             - Arquetipo de diseño: general\n\
+             - Tareas: 1 (completadas 1, fallidas 0, bloqueadas 0)\n\
+             - Tareas fallidas: ninguna\n\
+             - Issues de supervisión: 0\n\
+             - Coste estimado: desconocido (sin telemetría)\n\
+             - Rama de trabajo: (rama actual)\n"
+        );
+    }
+
+    #[test]
+    fn role_ledger_tracks_breakdown_and_flags_quota_breaches_once() {
+        let mut ledger = RoleSpendLedger::default();
+        assert!(ledger.breakdown().is_empty());
+        ledger.record("Director", 0.30);
+        ledger.record("Arquitectos", 0.10);
+        ledger.record("Director", 0.20);
+        // Zero and negative deltas never pollute the ledger.
+        ledger.record("Subdirector", 0.0);
+        ledger.record("Subdirector", -1.0);
+
+        let breakdown = ledger.breakdown();
+        assert_eq!(breakdown.len(), 2, "{breakdown:?}");
+        assert_eq!(breakdown[0].0, "Director", "biggest spender first");
+        assert!((breakdown[0].1 - 0.50).abs() < 1e-9);
+        assert!((breakdown[1].1 - 0.10).abs() < 1e-9);
+
+        // Ceiling 0.8 over 2 roles → quota 0.4: only Director breaches…
+        let breaches = ledger.new_quota_breaches(0.8);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].0, "Director");
+        assert!((breaches[0].2 - 0.4).abs() < 1e-9, "quota is proportional");
+        // …and is reported exactly once even as spend keeps growing.
+        ledger.record("Director", 0.10);
+        assert!(ledger.new_quota_breaches(0.8).is_empty());
+        // No ceiling / empty ledger → nothing to flag.
+        assert!(RoleSpendLedger::default()
+            .new_quota_breaches(1.0)
+            .is_empty());
+        assert!(ledger.new_quota_breaches(0.0).is_empty());
+    }
+
+    #[test]
+    fn final_retry_requeues_failures_once_and_unblocks_dependents() {
+        let tasks = vec![
+            spec("T1", "src/a.ts", &[], 1),
+            spec("T2", "src/b.ts", &["T1"], 1),
+        ];
+        let mut completed = BTreeSet::new();
+        let mut failed_tasks = BTreeSet::new();
+        let mut failed_count = 1_usize;
+        failed_tasks.insert(0);
+
+        // Drained graph: T1 failed terminally, T2 is blocked by it.
+        assert_eq!(
+            next_ready_task(&tasks, &completed, &failed_tasks, &BTreeSet::new()),
+            None
+        );
+
+        // The final pass requeues the failure (and reconciles the counter)…
+        let requeued = requeue_failed_tasks(&tasks, &mut failed_tasks, &mut failed_count);
+        assert_eq!(requeued, vec!["T1".to_string()]);
+        assert!(failed_tasks.is_empty());
+        assert_eq!(failed_count, 0);
+        // …so the scheduler picks T1 again, and its success unblocks T2.
+        assert_eq!(
+            next_ready_task(&tasks, &completed, &failed_tasks, &BTreeSet::new()),
+            Some(0)
+        );
+        completed.insert("T1".to_string());
+        assert_eq!(
+            next_ready_task(&tasks, &completed, &failed_tasks, &BTreeSet::new()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn archetype_override_beats_plan_detection() {
+        let options = RunOptions {
+            kind: ProjectKind::Web,
+            mode: BuildMode::Greenfield,
+            prompt: "x".to_string(),
+            project_dir: PathBuf::from("."),
+            catalog: ModelCatalog::default(),
+            parallel: 1,
+            dry_run: true,
+            agent_timeout: Duration::from_secs(1),
+            resume: false,
+            max_cost_usd: None,
+            build_command: None,
+            scaffold: false,
+            approve: false,
+            archetype: Some(crate::design::DesignArchetype::Fintech),
+        };
+        let plan = Plan {
+            vision: "una tienda online con carrito".to_string(),
+            ..Plan::default()
+        };
+        // The plan clearly reads as ecommerce, but the override wins.
+        assert_eq!(
+            effective_archetype(&options, &plan),
+            crate::design::DesignArchetype::Fintech
+        );
+        let detected = RunOptions {
+            archetype: None,
+            ..options
+        };
+        assert_eq!(
+            effective_archetype(&detected, &plan),
+            crate::design::DesignArchetype::Ecommerce
+        );
     }
 
     #[test]

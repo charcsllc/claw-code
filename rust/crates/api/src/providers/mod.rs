@@ -328,6 +328,125 @@ pub fn resolve_model_alias(model: &str) -> String {
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
 }
 
+/// Canonical model IDs reachable through [`resolve_model_alias`]. Kept as a
+/// static table so [`resolve_model_fuzzy`] can hand out `&'static str`
+/// results; a unit test asserts it stays in sync with the alias resolver.
+const CANONICAL_MODEL_IDS: &[&str] = &[
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251213",
+    "glm-4.6",
+    "grok-3",
+    "grok-3-mini",
+    "grok-2",
+    "kimi-k2.5",
+    "deepseek-chat",
+    "qwen-max",
+];
+
+/// Resolves a user-supplied model name case-insensitively against the model
+/// registry:
+///
+/// 1. An exact match on a registry alias (e.g. `opus`, `grok-mini`) or on a
+///    canonical model ID wins immediately.
+/// 2. Otherwise the input is matched as a substring against the canonical
+///    model IDs: exactly one candidate resolves to `Ok`, several candidates
+///    return `Err` with the list so the caller can present them, and zero
+///    candidates return `Err(vec![])`.
+///
+/// This function is not wired into request routing; it is a helper for
+/// interactive callers (e.g. a CLI model picker) to suggest corrections.
+pub fn resolve_model_fuzzy(input: &str) -> Result<&'static str, Vec<&'static str>> {
+    let needle = input.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Err(Vec::new());
+    }
+
+    // Exact registry alias (resolve_model_alias lower-cases the input the
+    // same way, so this mirrors the existing alias behavior).
+    if MODEL_REGISTRY.iter().any(|(alias, _)| *alias == needle) {
+        let canonical = resolve_model_alias(&needle);
+        if let Some(id) = CANONICAL_MODEL_IDS
+            .iter()
+            .find(|id| **id == canonical.as_str())
+        {
+            return Ok(id);
+        }
+    }
+
+    // Exact canonical ID match (case-insensitive).
+    if let Some(id) = CANONICAL_MODEL_IDS
+        .iter()
+        .find(|id| id.eq_ignore_ascii_case(&needle))
+    {
+        return Ok(id);
+    }
+
+    // Substring match against canonical IDs.
+    let candidates: Vec<&'static str> = CANONICAL_MODEL_IDS
+        .iter()
+        .filter(|id| id.to_ascii_lowercase().contains(&needle))
+        .copied()
+        .collect();
+    match candidates.as_slice() {
+        [single] => Ok(single),
+        _ => Err(candidates),
+    }
+}
+
+/// Extracts the `exp` (expiry, Unix seconds) claim from a JWT without
+/// verifying its signature. Returns `None` for anything that is not a
+/// three-part JWT with a base64url-encoded JSON payload carrying a numeric
+/// `exp` claim.
+#[must_use]
+pub fn jwt_expiry_unix(token: &str) -> Option<i64> {
+    let mut parts = token.trim().split('.');
+    let (_header, payload) = (parts.next()?, parts.next()?);
+    let _signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let decoded = base64url_decode(payload)?;
+    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp = claims.get("exp")?;
+    exp.as_i64()
+        .or_else(|| exp.as_f64().map(|value| value as i64))
+}
+
+/// Minimal base64url (RFC 4648 §5) decoder, tolerant of missing padding.
+/// Hand-rolled so the API crate does not grow a `base64` dependency for a
+/// single claim lookup.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    let trimmed = input.trim_end_matches('=');
+    // A lone trailing sextet (len % 4 == 1) can never form a whole byte.
+    if trimmed.len() % 4 == 1 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(trimmed.len() * 3 / 4);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in trimmed.as_bytes() {
+        buffer = (buffer << 6) | sextet(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buffer >> bits) as u8);
+        }
+    }
+    Some(output)
+}
+
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
@@ -945,11 +1064,12 @@ mod tests {
 
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
-        load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_family_identity_for, model_family_identity_for_kind, model_token_limit, parse_dotenv,
-        preflight_message_request, provider_capabilities_for_model,
-        provider_diagnostics_for_request, resolve_model_alias, ProviderFeatureSupport,
-        ProviderKind, ProviderWireProtocol,
+        jwt_expiry_unix, load_dotenv_file, max_tokens_for_model,
+        max_tokens_for_model_with_override, model_family_identity_for,
+        model_family_identity_for_kind, model_token_limit, parse_dotenv, preflight_message_request,
+        provider_capabilities_for_model, provider_diagnostics_for_request, resolve_model_alias,
+        resolve_model_fuzzy, ProviderFeatureSupport, ProviderKind, ProviderWireProtocol,
+        CANONICAL_MODEL_IDS, MODEL_REGISTRY,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -1852,4 +1972,117 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    #[test]
+    fn canonical_model_ids_stay_in_sync_with_alias_resolver() {
+        for (alias, _) in MODEL_REGISTRY {
+            let canonical = resolve_model_alias(alias);
+            assert!(
+                CANONICAL_MODEL_IDS.contains(&canonical.as_str()),
+                "alias `{alias}` resolves to `{canonical}`, which is missing \
+                 from CANONICAL_MODEL_IDS — update the fuzzy resolver table"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_model_fuzzy_exact_alias_and_id_win() {
+        assert_eq!(resolve_model_fuzzy("opus"), Ok("claude-opus-4-7"));
+        assert_eq!(resolve_model_fuzzy("OPUS"), Ok("claude-opus-4-7"));
+        assert_eq!(resolve_model_fuzzy("  sonnet  "), Ok("claude-sonnet-4-6"));
+        // Exact alias wins even though "grok" is a substring of several IDs.
+        assert_eq!(resolve_model_fuzzy("grok"), Ok("grok-3"));
+        assert_eq!(
+            resolve_model_fuzzy("Claude-Opus-4-7"),
+            Ok("claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn resolve_model_fuzzy_unique_substring_resolves() {
+        assert_eq!(resolve_model_fuzzy("k2"), Ok("kimi-k2.5"));
+        assert_eq!(resolve_model_fuzzy("DEEP"), Ok("deepseek-chat"));
+        assert_eq!(resolve_model_fuzzy("opus-4"), Ok("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn resolve_model_fuzzy_ambiguous_returns_candidates() {
+        let candidates = resolve_model_fuzzy("gro").expect_err("`gro` matches several grok models");
+        assert_eq!(candidates, vec!["grok-3", "grok-3-mini", "grok-2"]);
+
+        let claude_candidates =
+            resolve_model_fuzzy("claude").expect_err("`claude` matches several models");
+        assert!(claude_candidates.len() > 1);
+        assert!(claude_candidates.contains(&"claude-opus-4-7"));
+    }
+
+    #[test]
+    fn resolve_model_fuzzy_no_match_returns_empty() {
+        assert_eq!(resolve_model_fuzzy("gpt-99-ultra"), Err(vec![]));
+        assert_eq!(resolve_model_fuzzy(""), Err(vec![]));
+        assert_eq!(resolve_model_fuzzy("   "), Err(vec![]));
+    }
+
+    /// Builds a synthetic (unsigned) JWT from a JSON payload.
+    fn synthetic_jwt(payload: &serde_json::Value) -> String {
+        fn b64url(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let mut buffer = 0u32;
+                for (index, byte) in chunk.iter().enumerate() {
+                    buffer |= u32::from(*byte) << (16 - 8 * index);
+                }
+                let sextets = [
+                    (buffer >> 18) & 0x3f,
+                    (buffer >> 12) & 0x3f,
+                    (buffer >> 6) & 0x3f,
+                    buffer & 0x3f,
+                ];
+                let emit = match chunk.len() {
+                    1 => 2,
+                    2 => 3,
+                    _ => 4,
+                };
+                for sextet in &sextets[..emit] {
+                    out.push(char::from(ALPHABET[*sextet as usize]));
+                }
+            }
+            out
+        }
+        let header = b64url(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = b64url(payload.to_string().as_bytes());
+        format!("{header}.{body}.sig")
+    }
+
+    #[test]
+    fn jwt_expiry_unix_reads_exp_claim() {
+        let token = synthetic_jwt(&json!({"sub": "user-1", "exp": 1_764_000_000_i64}));
+        assert_eq!(jwt_expiry_unix(&token), Some(1_764_000_000));
+    }
+
+    #[test]
+    fn jwt_expiry_unix_handles_missing_exp_and_non_jwt_input() {
+        let no_exp = synthetic_jwt(&json!({"sub": "user-1"}));
+        assert_eq!(jwt_expiry_unix(&no_exp), None);
+
+        assert_eq!(jwt_expiry_unix("sk-ant-not-a-jwt"), None);
+        assert_eq!(jwt_expiry_unix(""), None);
+        assert_eq!(jwt_expiry_unix("only.two"), None);
+        assert_eq!(jwt_expiry_unix("a.b.c.d"), None);
+        // Payload is not valid base64url JSON.
+        assert_eq!(jwt_expiry_unix("head.!!invalid!!.sig"), None);
+    }
+
+    #[test]
+    fn jwt_expiry_unix_accepts_padded_payload() {
+        let token = synthetic_jwt(&json!({"exp": 42}));
+        // Re-insert padding on the payload segment; decoders must tolerate it.
+        let mut parts = token.split('.');
+        let header = parts.next().unwrap();
+        let payload = parts.next().unwrap();
+        let padded = format!("{header}.{payload}==.sig");
+        assert_eq!(jwt_expiry_unix(&padded), Some(42));
+    }
 }

@@ -131,6 +131,21 @@ pub(crate) fn preset_for(kind: &str) -> Option<&'static ProviderPreset> {
         .find(|preset| preset.kind == normalized)
 }
 
+/// Distinct provider credential env vars that are set right now (saved
+/// settings are exported to env at startup, so this sees both sources).
+/// Several presets share a var (e.g. OPENAI_API_KEY), hence vars, not kinds.
+pub(crate) fn credentialed_env_vars() -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| preset.key_env)
+        .filter(|var| !var.is_empty())
+        .collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.retain(|var| env_is_set(var));
+    vars
+}
+
 fn env_is_set(name: &str) -> bool {
     !name.is_empty()
         && std::env::var(name)
@@ -373,8 +388,49 @@ fn render_provider_show() -> String {
             }
         }
     }
+    if let Some(warning) = jwt_expiry_warning() {
+        out.push_str(&format!("  {warning}\n"));
+    }
     out.push_str(&provider_usage());
     out
+}
+
+/// Some providers issue JWT credentials with an embedded expiry (Z.ai
+/// coding-plan tokens, for example). Warn before the first failed turn,
+/// not after: expired now, or expiring within a week.
+pub(crate) fn jwt_expiry_warning() -> Option<String> {
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
+    .ok()?;
+    let mut vars: Vec<&'static str> = PROVIDER_PRESETS
+        .iter()
+        .map(|preset| preset.key_env)
+        .filter(|var| !var.is_empty())
+        .collect();
+    vars.sort_unstable();
+    vars.dedup();
+    vars.into_iter().find_map(|var| {
+        let value = std::env::var(var).ok()?;
+        let exp = api::jwt_expiry_unix(value.trim())?;
+        jwt_expiry_message(var, exp, now)
+    })
+}
+
+/// Pure core of [`jwt_expiry_warning`], testable without env or clock.
+fn jwt_expiry_message(var: &str, exp_unix: i64, now_unix: i64) -> Option<String> {
+    if exp_unix <= now_unix {
+        return Some(format!(
+            "⚠ el token en {var} es un JWT ya expirado — renueva la credencial (/provider use)"
+        ));
+    }
+    let days = (exp_unix - now_unix) / 86_400;
+    (days < 7).then(|| {
+        format!("⚠ el token en {var} expira en {days} día(s) — renueva pronto (/provider use)")
+    })
 }
 
 /// One-line description of the credential source the API clients will pick
@@ -491,5 +547,22 @@ mod tests {
         for preset in PROVIDER_PRESETS {
             assert!(usage.contains(preset.kind), "usage lists {}", preset.kind);
         }
+    }
+
+    #[test]
+    fn jwt_expiry_message_warns_only_near_or_past_expiry() {
+        let now = 1_750_000_000;
+        let day = 86_400;
+        // Expired: hard warning.
+        let expired = jwt_expiry_message("ANTHROPIC_AUTH_TOKEN", now - day, now)
+            .expect("expired token warns");
+        assert!(expired.contains("expirado"));
+        assert!(expired.contains("ANTHROPIC_AUTH_TOKEN"));
+        // Expiring in 3 days: soft warning with the count.
+        let soon =
+            jwt_expiry_message("OPENAI_API_KEY", now + 3 * day, now).expect("soon token warns");
+        assert!(soon.contains("3 día(s)"));
+        // Comfortable margin: silence.
+        assert!(jwt_expiry_message("OPENAI_API_KEY", now + 30 * day, now).is_none());
     }
 }

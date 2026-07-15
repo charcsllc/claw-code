@@ -303,6 +303,9 @@ fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(),
         build_command: common.build_cmd,
         scaffold: !common.no_scaffold,
         approve: common.approve,
+        // Archetype forcing is a REPL (/web, /app) affordance; the
+        // standalone CLI keeps keyword detection over the plan.
+        archetype: None,
     })?;
 
     println!("\n[multiagent] === resumen ===");

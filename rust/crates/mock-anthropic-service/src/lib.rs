@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 pub const SCENARIO_PREFIX: &str = "PARITY_SCENARIO:";
 pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
+/// Scenario label recorded for requests answered by a content route.
+pub const ROUTED_SCENARIO_PREFIX: &str = "route:";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedRequest {
     pub method: String,
@@ -23,9 +26,18 @@ pub struct CapturedRequest {
     pub raw_body: String,
 }
 
+/// A canned answer keyed by a substring of the raw request body. First
+/// registered match wins, so register the most specific patterns first.
+#[derive(Debug, Clone)]
+struct ContentRoute {
+    pattern: String,
+    response_text: String,
+}
+
 pub struct MockAnthropicService {
     base_url: String,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    routes: Arc<Mutex<Vec<ContentRoute>>>,
     shutdown: Option<oneshot::Sender<()>>,
     join_handle: JoinHandle<()>,
 }
@@ -39,8 +51,10 @@ impl MockAnthropicService {
         let listener = TcpListener::bind(bind_addr).await?;
         let address = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let routes: Arc<Mutex<Vec<ContentRoute>>> = Arc::new(Mutex::new(Vec::new()));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let request_state = Arc::clone(&requests);
+        let route_state = Arc::clone(&routes);
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -51,8 +65,9 @@ impl MockAnthropicService {
                             break;
                         };
                         let request_state = Arc::clone(&request_state);
+                        let route_state = Arc::clone(&route_state);
                         tokio::spawn(async move {
-                            let _ = handle_connection(socket, request_state).await;
+                            let _ = handle_connection(socket, request_state, route_state).await;
                         });
                     }
                 }
@@ -62,6 +77,7 @@ impl MockAnthropicService {
         Ok(Self {
             base_url: format!("http://{address}"),
             requests,
+            routes,
             shutdown: Some(shutdown_tx),
             join_handle,
         })
@@ -74,6 +90,18 @@ impl MockAnthropicService {
 
     pub async fn captured_requests(&self) -> Vec<CapturedRequest> {
         self.requests.lock().await.clone()
+    }
+
+    /// Registers a content route: any request whose raw body contains
+    /// `pattern` is answered with `response_text` (as a plain assistant text
+    /// message, streamed or not to match the request). Routes are checked in
+    /// registration order and take precedence over the parity scenarios;
+    /// requests matching no route keep the existing scenario behavior.
+    pub async fn route(&self, pattern: impl Into<String>, response_text: impl Into<String>) {
+        self.routes.lock().await.push(ContentRoute {
+            pattern: pattern.into(),
+            response_text: response_text.into(),
+        });
     }
 }
 
@@ -142,10 +170,34 @@ impl Scenario {
 async fn handle_connection(
     mut socket: tokio::net::TcpStream,
     requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    routes: Arc<Mutex<Vec<ContentRoute>>>,
 ) -> io::Result<()> {
     let (method, path, headers, raw_body) = read_http_request(&mut socket).await?;
     let request: MessageRequest = serde_json::from_str(&raw_body)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+
+    // Content routes first: they answer by substring of the raw JSON body
+    // (patterns should avoid quotes/newlines, which arrive JSON-escaped).
+    let matched_route = routes
+        .lock()
+        .await
+        .iter()
+        .find(|route| raw_body.contains(&route.pattern))
+        .cloned();
+    if let Some(route) = matched_route {
+        requests.lock().await.push(CapturedRequest {
+            method,
+            path,
+            headers,
+            scenario: format!("{ROUTED_SCENARIO_PREFIX}{}", route.pattern),
+            stream: request.stream,
+            raw_body,
+        });
+        let response = build_routed_response(&request, &route.response_text);
+        socket.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
+
     let scenario = detect_scenario(&request)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parity scenario"))?;
 
@@ -161,6 +213,27 @@ async fn handle_connection(
     let response = build_http_response(&request, scenario);
     socket.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+/// A routed request is answered with a plain assistant text message, in the
+/// transport the caller asked for (SSE stream or single JSON body).
+fn build_routed_response(request: &MessageRequest, text: &str) -> String {
+    if request.stream {
+        http_response(
+            "200 OK",
+            "text/event-stream",
+            &final_text_sse(text),
+            &[("x-request-id", "req_content_route")],
+        )
+    } else {
+        let response = text_message_response(&unique_message_id(), text);
+        http_response(
+            "200 OK",
+            "application/json",
+            &serde_json::to_string(&response).expect("message response should serialize"),
+            &[("request-id", "req_content_route")],
+        )
+    }
 }
 
 async fn read_http_request(
@@ -1120,4 +1193,107 @@ fn extract_plugin_message(tool_output: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| tool_output.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_body(prompt: &str, stream: bool) -> String {
+        let mut body = json!({
+            "model": DEFAULT_MODEL,
+            "max_tokens": 512,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": prompt}],
+            }],
+        });
+        if stream {
+            body["stream"] = json!(true);
+        }
+        body.to_string()
+    }
+
+    async fn post_messages(base_url: &str, body: &str) -> String {
+        let address = base_url
+            .strip_prefix("http://")
+            .expect("mock base url is http");
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect to mock");
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nhost: {address}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(request.as_bytes())
+            .await
+            .expect("send request");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        String::from_utf8(response).expect("utf8 response")
+    }
+
+    #[tokio::test]
+    async fn content_route_answers_matching_request_and_captures_it() {
+        let server = MockAnthropicService::spawn().await.expect("spawn mock");
+        server
+            .route("Produce the complete product plan", "plan enlatado listo")
+            .await;
+
+        let body = request_body("User prompt: Produce the complete product plan now", false);
+        let response = post_messages(&server.base_url(), &body).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("plan enlatado listo"), "{response}");
+
+        let captured = server.captured_requests().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].scenario,
+            format!("{ROUTED_SCENARIO_PREFIX}Produce the complete product plan")
+        );
+        assert!(!captured[0].stream);
+    }
+
+    #[tokio::test]
+    async fn content_route_streams_sse_when_the_request_streams() {
+        let server = MockAnthropicService::spawn().await.expect("spawn mock");
+        server.route("design document", "documento de diseño").await;
+
+        let body = request_body("Deliver your design document", true);
+        let response = post_messages(&server.base_url(), &body).await;
+        assert!(response.contains("text/event-stream"), "{response}");
+        assert!(response.contains("documento de diseño"), "{response}");
+        assert!(response.contains("message_stop"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn first_registered_route_wins_and_scenarios_still_work() {
+        let server = MockAnthropicService::spawn().await.expect("spawn mock");
+        server.route("plan", "primera ruta").await;
+        server.route("plan detallado", "segunda ruta").await;
+
+        let routed = post_messages(
+            &server.base_url(),
+            &request_body("dame el plan detallado", false),
+        )
+        .await;
+        assert!(routed.contains("primera ruta"), "{routed}");
+        assert!(!routed.contains("segunda ruta"), "{routed}");
+
+        // A request matching no route falls back to the parity scenarios.
+        let scenario = post_messages(
+            &server.base_url(),
+            &request_body(&format!("{SCENARIO_PREFIX}streaming_text"), false),
+        )
+        .await;
+        assert!(scenario.contains("parity harness"), "{scenario}");
+        let captured = server.captured_requests().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[1].scenario, "streaming_text");
+    }
 }

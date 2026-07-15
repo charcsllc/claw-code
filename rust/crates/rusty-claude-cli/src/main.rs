@@ -1136,9 +1136,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             action,
             output_format,
         } => print_models(action.as_deref(), output_format)?,
-        CliAction::Diff { output_format } => match output_format {
+        CliAction::Diff {
+            path,
+            output_format,
+        } => match output_format {
             CliOutputFormat::Text => {
-                println!("{}", render_diff_report()?);
+                println!("{}", render_diff_report(path.as_deref())?);
             }
             CliOutputFormat::Json => {
                 let cwd = friendly_cwd(env::current_dir()?);
@@ -1148,6 +1151,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
+        CliAction::DesignReview { output_format } => {
+            let findings = collect_design_review_findings();
+            match output_format {
+                CliOutputFormat::Text => println!("{}", format_design_review_report()),
+                CliOutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "design-review",
+                        "action": "audit",
+                        "status": if findings.is_empty() { "ok" } else { "findings" },
+                        "finding_count": findings.len(),
+                        "findings": findings,
+                    }))?
+                ),
+            }
+            // CI contract: a non-zero exit code when the gate finds problems,
+            // so `claw design-review --output-format json` works as a check.
+            if !findings.is_empty() {
+                std::process::exit(1);
+            }
+        }
         CliAction::Export {
             session_reference,
             output_path,
@@ -1272,6 +1296,10 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Diff {
+        path: Option<String>,
+        output_format: CliOutputFormat,
+    },
+    DesignReview {
         output_format: CliOutputFormat,
     },
     Export {
@@ -2032,7 +2060,22 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 // before Usage is part of the JSON hint contract.
                 return Err(unexpected_diff_args_error(&rest[1..]));
             }
-            Ok(CliAction::Diff { output_format })
+            Ok(CliAction::Diff {
+                path: None,
+                output_format,
+            })
+        }
+        // The deterministic design gate is pure-local too (WCAG token
+        // contrast + HTML audit); exit code 1 on findings makes it usable
+        // as a CI check.
+        "design-review" => {
+            if rest.len() > 1 {
+                return Err(
+                    "Usage: claw design-review [--output-format json]\n  (sin argumentos; 'fix' solo existe dentro del REPL)"
+                        .to_string(),
+                );
+            }
+            Ok(CliAction::DesignReview { output_format })
         }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
@@ -2493,7 +2536,7 @@ fn parse_single_word_command_alias(
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
         // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
+        "config" | "diff" | "design-review" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -2610,9 +2653,18 @@ fn parse_direct_slash_cli_action(
             allowed_tools,
         }),
         Ok(Some(SlashCommand::Sandbox)) => Ok(CliAction::Sandbox { output_format }),
-        Ok(Some(SlashCommand::Diff)) => Ok(CliAction::Diff { output_format }),
+        Ok(Some(SlashCommand::Diff { path })) => Ok(CliAction::Diff {
+            path,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::DesignReview { fix: false })) => {
+            Ok(CliAction::DesignReview { output_format })
+        }
+        Ok(Some(SlashCommand::DesignReview { fix: true })) => Err(
+            "design-review fix necesita una sesión con modelo. Arranca `claw` y ejecuta /design-review fix en el REPL.".to_string(),
+        ),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
-        Ok(Some(SlashCommand::Doctor)) => Ok(CliAction::Doctor {
+        Ok(Some(SlashCommand::Doctor { online: _ })) => Ok(CliAction::Doctor {
             output_format,
             permission_mode,
         }),
@@ -6844,9 +6896,9 @@ fn run_resume_command(
                 json: Some(init_json_value(&report, &message)),
             })
         }
-        SlashCommand::Diff => {
+        SlashCommand::Diff { path } => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let message = render_diff_report_for(&cwd)?;
+            let message = render_diff_report_for(&cwd, path.as_deref())?;
             let json = render_diff_json_for(&cwd)?;
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -6958,14 +7010,19 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
-        SlashCommand::Doctor => {
+        SlashCommand::Doctor { online } => {
             let report = render_doctor_report(
                 ConfigWarningMode::EmitStderr,
                 permission_mode_provenance_for_current_dir(),
             )?;
+            let mut message = report.render();
+            if *online {
+                message.push('\n');
+                message.push_str(&doctor_online_section());
+            }
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
-                message: Some(report.render()),
+                message: Some(message),
                 json: Some(report.json_value()),
             })
         }
@@ -7088,7 +7145,8 @@ fn run_resume_command(
         | SlashCommand::Thinkback
         | SlashCommand::ReleaseNotes
         | SlashCommand::SecurityReview
-        | SlashCommand::DesignReview
+        | SlashCommand::DesignReview { .. }
+        | SlashCommand::Retry
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
@@ -7529,8 +7587,7 @@ fn format_security_review_report() -> String {
 /// current project — WCAG contrast of any token stylesheet, accessibility
 /// audit of `docs/rendered-dom.html`/`index.html` if present, and token
 /// discipline. Deterministic, zero tokens.
-fn format_design_review_report() -> String {
-    use std::fmt::Write as _;
+fn collect_design_review_findings() -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut findings = claw_multiagent::design::run_design_gate(&cwd, &cwd.join("docs"), false);
     // Outside a multiagent build there is rarely a rendered DOM capture;
@@ -7549,6 +7606,29 @@ fn format_design_review_report() -> String {
     for finding in claw_multiagent::design::audit_hardcoded_colors(&cwd) {
         findings.push(format!("[TOKENS] {finding}"));
     }
+    findings
+}
+
+/// Turns the design-gate findings into the one-turn prompt `/design-review fix`
+/// hands to the model — the audit is deterministic, the repair is not.
+fn design_review_fix_prompt(findings: &[String]) -> String {
+    let mut prompt = String::from(
+        "La auditoría determinista de diseño (/design-review) ha encontrado estos problemas en el proyecto actual. \
+         Corrígelos editando los archivos afectados, sin rediseñar nada más. \
+         [CONTRASTE] = par de tokens que no cumple WCAG, [A11Y] = HTML, [TOKENS] = color hardcodeado que debe usar var(--token), [PESO] = asset demasiado pesado.\n\n",
+    );
+    for finding in findings.iter().take(25) {
+        prompt.push_str("- ");
+        prompt.push_str(finding);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nAl terminar, resume qué cambiaste por archivo.");
+    prompt
+}
+
+fn format_design_review_report() -> String {
+    use std::fmt::Write as _;
+    let findings = collect_design_review_findings();
     if findings.is_empty() {
         return "Design review (checks deterministas, 0 tokens)\n  Result           ok — \
                 sin fallos de contraste WCAG, accesibilidad HTML ni disciplina de tokens\n  \
@@ -7676,7 +7756,7 @@ fn format_keybindings_report() -> String {
     "Keybindings
   Enter            send prompt
   Shift+Enter      insert newline (also Ctrl+J)
-  Tab              complete slash commands
+  Tab              complete slash commands and @file paths
   Up / Down        browse prompt history
   Ctrl+R           reverse-search history
   Ctrl+A / Ctrl+E  start / end of line
@@ -7750,6 +7830,56 @@ fn hint_for_turn_error(error: &str) -> Option<&'static str> {
     None
 }
 
+/// A pasted wall of text is the most common accidental send in a REPL;
+/// above this many lines the loop asks once before spending tokens on it.
+const LARGE_PASTE_LINES: usize = 50;
+
+fn large_paste_line_count(input: &str) -> Option<usize> {
+    let lines = input.lines().count();
+    (lines > LARGE_PASTE_LINES).then_some(lines)
+}
+
+/// Second-line hint after a provider outage error: the fix for "their
+/// servers are down" is switching providers, but only worth saying when
+/// the user actually has alternative credentials configured.
+fn failover_hint(error: &str) -> Option<String> {
+    let lower = error.to_lowercase();
+    let outage = lower.contains("overloaded")
+        || lower.contains("529")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("internal server error")
+        || lower.contains("insufficient");
+    if !outage {
+        return None;
+    }
+    let vars = provider_presets::credentialed_env_vars();
+    if vars.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "pista: tienes más credenciales configuradas ({}) — cambia de proveedor con /provider use <preset>",
+        vars.join(", ")
+    ))
+}
+
+/// `/doctor online`: the doctor report is static analysis; this appends one
+/// live 1-token probe of the active provider plus the credential env vars
+/// that are actually set.
+fn doctor_online_section() -> String {
+    let model =
+        resolve_repl_model(DEFAULT_MODEL.to_string()).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let mut out = run_provider_probe(&model);
+    let vars = provider_presets::credentialed_env_vars();
+    out.push_str("\n  Credentials      ");
+    if vars.is_empty() {
+        out.push_str("ninguna variable de entorno de proveedor detectada");
+    } else {
+        out.push_str(&vars.join(", "));
+    }
+    out
+}
+
 /// One terminal line: API error strings can embed whole JSON response
 /// bodies, and a retry notice must not scroll the conversation away.
 fn truncate_retry_error(error: &str) -> String {
@@ -7807,6 +7937,11 @@ fn run_repl(
             "⚠ sin credenciales configuradas — ejecuta /provider use <preset> <clave> (verifica con /provider test)"
         );
     }
+    // A JWT credential that is already expired fails every turn with an
+    // opaque 401; say it before the first prompt instead.
+    if let Some(warning) = provider_presets::jwt_expiry_warning() {
+        println!("{warning}");
+    }
 
     let mut exit_hint_shown = false;
     loop {
@@ -7863,12 +7998,30 @@ fn run_repl(
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let prompt = try_resolve_bare_skill_prompt(&cwd, &trimmed)
                     .unwrap_or_else(|| trimmed.clone());
+                // A 50+ line submit is almost always a paste; confirm before
+                // spending tokens on it. Enter (default) discards.
+                if let Some(lines) = large_paste_line_count(&prompt) {
+                    eprint!("El mensaje tiene {lines} líneas — ¿enviarlo al modelo? [s/N]: ");
+                    let mut answer = String::new();
+                    let confirmed = io::stdin().read_line(&mut answer).is_ok()
+                        && matches!(
+                            answer.trim().to_ascii_lowercase().as_str(),
+                            "s" | "si" | "sí" | "y" | "yes"
+                        );
+                    if !confirmed {
+                        eprintln!("(descartado — recupéralo con ↑ si era intencionado)");
+                        continue;
+                    }
+                }
                 cli.record_prompt_history(&trimmed);
                 // A failed turn (network blip, 429, expired key) also returns
                 // to the prompt instead of exiting the REPL.
                 if let Err(error) = cli.run_turn(&prompt) {
                     eprintln!("{error}");
                     if let Some(hint) = hint_for_turn_error(&error.to_string()) {
+                        eprintln!("{hint}");
+                    }
+                    if let Some(hint) = failover_hint(&error.to_string()) {
                         eprintln!("{hint}");
                     }
                 }
@@ -9075,8 +9228,8 @@ impl LiveCli {
                 run_init(CliOutputFormat::Text)?;
                 false
             }
-            SlashCommand::Diff => {
-                Self::print_diff()?;
+            SlashCommand::Diff { path } => {
+                Self::print_diff(path.as_deref())?;
                 false
             }
             SlashCommand::Version => {
@@ -9112,7 +9265,7 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Doctor => {
+            SlashCommand::Doctor { online } => {
                 println!(
                     "{}",
                     render_doctor_report(
@@ -9121,6 +9274,9 @@ impl LiveCli {
                     )?
                     .render()
                 );
+                if online {
+                    println!("{}", doctor_online_section());
+                }
                 false
             }
             SlashCommand::Setup => {
@@ -9367,6 +9523,69 @@ impl LiveCli {
                 }
                 false
             }
+            SlashCommand::Tasks { args } => {
+                let args = args.as_deref().map(str::trim).unwrap_or("");
+                let jobs = tools::list_agent_jobs();
+                match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+                    [] | ["list"] => {
+                        if jobs.is_empty() {
+                            println!(
+                                "Tasks\n  Result           sin agentes en background en este workspace\n  Nota             los lanza la herramienta Agent; los manifiestos viven en .clawd-agents/"
+                            );
+                        } else {
+                            println!("Tasks ({} job(s), workspace store)", jobs.len());
+                            for job in jobs.iter().rev().take(20) {
+                                let id: String = job.id.chars().take(12).collect();
+                                println!(
+                                    "  {id:<13} {:<8} {}  {}",
+                                    job.status,
+                                    job.created_at,
+                                    truncate_retry_error(&job.name)
+                                );
+                            }
+                            if jobs.len() > 20 {
+                                println!("  … y {} más (/tasks get <id>)", jobs.len() - 20);
+                            }
+                        }
+                    }
+                    ["get", id] => match jobs.iter().find(|job| job.id.starts_with(id)) {
+                        Some(job) => println!(
+                            "Task {}\n  Name             {}\n  Type             {}\n  Status           {}\n  Created          {}\n  Description      {}",
+                            job.id,
+                            job.name,
+                            job.subagent_type.as_deref().unwrap_or("general-purpose"),
+                            job.status,
+                            job.created_at,
+                            truncate_retry_error(&job.description),
+                        ),
+                        None => eprintln!("No hay ningún job cuyo id empiece por '{id}'."),
+                    },
+                    _ => eprintln!("Usage: /tasks [list|get <id>]"),
+                }
+                false
+            }
+            SlashCommand::Retry => {
+                // Only real prompts land in prompt_history (slash commands
+                // are filtered in the REPL loop), so the last entry is the
+                // last model-bound message.
+                let last = self
+                    .runtime
+                    .session()
+                    .prompt_history
+                    .last()
+                    .map(|entry| entry.text.clone());
+                match last {
+                    Some(prompt) => {
+                        println!(
+                            "Retry\n  Reenviando       {}",
+                            truncate_retry_error(&prompt)
+                        );
+                        self.run_turn(&prompt)?;
+                    }
+                    None => eprintln!("No hay ningún prompt previo que reintentar en esta sesión."),
+                }
+                false
+            }
             SlashCommand::Review { scope } => {
                 match collect_review_diff(scope.as_deref()) {
                     Ok(diff) => {
@@ -9413,8 +9632,16 @@ impl LiveCli {
                 println!("{}", format_security_review_report());
                 false
             }
-            SlashCommand::DesignReview => {
+            SlashCommand::DesignReview { fix } => {
                 println!("{}", format_design_review_report());
+                if fix {
+                    let findings = collect_design_review_findings();
+                    if findings.is_empty() {
+                        println!("  Fix              nada que corregir — la auditoría está limpia");
+                    } else {
+                        self.run_turn(&design_review_fix_prompt(&findings))?;
+                    }
+                }
                 false
             }
             SlashCommand::PrivacySettings => {
@@ -9432,7 +9659,6 @@ impl LiveCli {
             | SlashCommand::Stickers
             | SlashCommand::Insights
             | SlashCommand::Thinkback
-            | SlashCommand::Tasks { .. }
             | SlashCommand::Voice { .. }
             | SlashCommand::Rename { .. }
             | SlashCommand::Ide { .. }
@@ -9599,7 +9825,33 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let model = resolve_model_alias_with_config(&model);
+        let requested = model;
+        let resolved = resolve_model_alias_with_config(&requested);
+        // Config aliases and the exact registry go first; if neither
+        // recognized the name, a unique substring of a canonical ID still
+        // resolves (`/model sonnet-5` → the full ID). Unknown names pass
+        // through verbatim — custom/ollama models are legitimate.
+        let model = if resolved == requested.trim() {
+            match api::resolve_model_fuzzy(&requested) {
+                Ok(id) => {
+                    if id != resolved {
+                        println!("  Nota             '{}' → {id}", requested.trim());
+                    }
+                    id.to_string()
+                }
+                Err(candidates) if candidates.len() > 1 => {
+                    eprintln!(
+                        "'{}' es ambiguo — coincide con: {}",
+                        requested.trim(),
+                        candidates.join(", ")
+                    );
+                    return Ok(false);
+                }
+                Err(_) => resolved,
+            }
+        } else {
+            resolved
+        };
 
         if model == self.model {
             println!(
@@ -10045,8 +10297,8 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_diff() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_diff_report()?);
+    fn print_diff(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", render_diff_report(path)?);
         Ok(())
     }
 
@@ -12357,11 +12609,14 @@ fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
     }
 }
 
-fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
-    render_diff_report_for(&env::current_dir()?)
+fn render_diff_report(path: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
+    render_diff_report_for(&env::current_dir()?, path)
 }
 
-fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn render_diff_report_for(
+    cwd: &Path,
+    path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // Verify we are inside a git repository before calling `git diff`.
     // Running `git diff --cached` outside a git tree produces a misleading
     // "unknown option `cached`" error because git falls back to --no-index mode.
@@ -12376,13 +12631,30 @@ fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Erro
             cwd.display()
         ));
     }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
+    // A leading dash would be parsed by git as a flag, not a pathspec.
+    if let Some(file) = path {
+        if file.starts_with('-') {
+            return Ok(format!(
+                "Diff\n  Result           invalid path\n  Detail           {file} empieza por '-' — usa una ruta de archivo"
+            ));
+        }
+    }
+    let mut staged_args = vec!["diff", "--cached"];
+    let mut unstaged_args = vec!["diff"];
+    if let Some(file) = path {
+        staged_args.extend(["--", file]);
+        unstaged_args.extend(["--", file]);
+    }
+    let staged = run_git_diff_command_in(cwd, &staged_args)?;
+    let unstaged = run_git_diff_command_in(cwd, &unstaged_args)?;
     if staged.trim().is_empty() && unstaged.trim().is_empty() {
-        return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
-                .to_string(),
+        let detail = path.map_or_else(
+            || "no current changes".to_string(),
+            |file| format!("sin cambios en {file}"),
         );
+        return Ok(format!(
+            "Diff\n  Result           clean working tree\n  Detail           {detail}"
+        ));
     }
 
     let mut sections = Vec::new();
@@ -16853,6 +17125,7 @@ mod tests {
         assert_eq!(
             parse_args(&["diff".to_string()]).expect("diff should parse"),
             CliAction::Diff {
+                path: None,
                 output_format: CliOutputFormat::Text,
             }
         );
@@ -16864,6 +17137,7 @@ mod tests {
             ])
             .expect("diff --output-format json should parse"),
             CliAction::Diff {
+                path: None,
                 output_format: CliOutputFormat::Json,
             }
         );
@@ -19073,6 +19347,39 @@ mod tests {
     }
 
     #[test]
+    fn failover_hint_only_fires_on_outages() {
+        use crate::failover_hint;
+        // Whatever credentials this machine has, a non-outage error must
+        // never produce a failover suggestion.
+        assert!(failover_hint("HTTP 401 Unauthorized").is_none());
+        assert!(failover_hint("context_window_blocked").is_none());
+        // And with <2 credential vars set the hint stays silent even on
+        // outages, so this can only be exercised as "does not panic".
+        let _ = failover_hint("529 overloaded_error");
+    }
+
+    #[test]
+    fn large_paste_detection_uses_a_50_line_threshold() {
+        use crate::large_paste_line_count;
+        assert_eq!(large_paste_line_count("una línea"), None);
+        let fifty = "x\n".repeat(50);
+        assert_eq!(large_paste_line_count(&fifty), None);
+        let sixty = "x\n".repeat(60);
+        assert_eq!(large_paste_line_count(&sixty), Some(60));
+    }
+
+    #[test]
+    fn design_review_fix_prompt_lists_findings_and_caps_them() {
+        use crate::design_review_fix_prompt;
+        let findings: Vec<String> = (0..30).map(|i| format!("[A11Y] problema {i}")).collect();
+        let prompt = design_review_fix_prompt(&findings);
+        assert!(prompt.contains("[A11Y] problema 0"));
+        assert!(prompt.contains("[A11Y] problema 24"));
+        assert!(!prompt.contains("[A11Y] problema 25"));
+        assert!(prompt.contains("Corrígelos"));
+    }
+
+    #[test]
     fn utilization_bar_fills_proportionally() {
         use crate::render_utilization_bar;
         assert_eq!(render_utilization_bar(0), "[----------] 0%");
@@ -19674,7 +19981,7 @@ UU conflicted.rs",
         git(&["add", "tracked.txt"], &root);
         git(&["commit", "-m", "init", "--quiet"], &root);
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -19697,7 +20004,7 @@ UU conflicted.rs",
         fs::write(root.join("tracked.txt"), "hello\nstaged\nunstaged\n")
             .expect("update file twice");
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("Staged changes:"));
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
@@ -19722,10 +20029,41 @@ UU conflicted.rs",
         fs::write(root.join("ignored.txt"), "secret\n").expect("write ignored file");
         fs::write(root.join("tracked.txt"), "hello\nworld\n").expect("write tracked change");
 
-        let report = render_diff_report_for(&root).expect("diff report should render");
+        let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("tracked.txt"));
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn diff_report_narrows_to_a_single_file_when_asked() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        git(&["init", "--quiet"], &root);
+        git(&["config", "user.email", "tests@example.com"], &root);
+        git(&["config", "user.name", "Rusty Claude Tests"], &root);
+        fs::write(root.join("a.txt"), "a\n").expect("write a");
+        fs::write(root.join("b.txt"), "b\n").expect("write b");
+        git(&["add", "a.txt", "b.txt"], &root);
+        git(&["commit", "-m", "init", "--quiet"], &root);
+        fs::write(root.join("a.txt"), "a\nmás\n").expect("modify a");
+        fs::write(root.join("b.txt"), "b\nmás\n").expect("modify b");
+
+        let report =
+            render_diff_report_for(&root, Some("a.txt")).expect("diff report should render");
+        assert!(report.contains("a.txt"));
+        assert!(!report.contains("b.txt"));
+
+        // Untouched file: explicit clean answer, naming the file.
+        let clean = render_diff_report_for(&root, Some("c.txt")).expect("clean report");
+        assert!(clean.contains("sin cambios en c.txt"));
+
+        // A leading dash must not reach git as a flag.
+        let refused = render_diff_report_for(&root, Some("--cached")).expect("refused report");
+        assert!(refused.contains("invalid path"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -19749,7 +20087,7 @@ UU conflicted.rs",
 
         let session = Session::load_from_path(&session_path).expect("session should load");
         let outcome = with_current_dir(&root, || {
-            run_resume_command(&session_path, &session, &SlashCommand::Diff)
+            run_resume_command(&session_path, &session, &SlashCommand::Diff { path: None })
                 .expect("resume diff should work")
         });
         let message = outcome.message.expect("diff message should exist");

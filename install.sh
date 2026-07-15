@@ -9,6 +9,7 @@
 #   ./install.sh                # debug build (fast, default)
 #   ./install.sh --release      # optimized release build
 #   ./install.sh --no-verify    # skip post-install verification
+#   ./install.sh --uninstall    # remove compiled claw binaries
 #   ./install.sh --help         # print usage
 #
 # Environment overrides:
@@ -77,11 +78,19 @@ Options:
   --release       Build the optimized release profile (slower, smaller binary).
   --debug         Build the debug profile (default, faster compile).
   --no-verify     Skip the post-install verification step.
+  --uninstall     Remove the compiled claw binaries (rust/target/debug and
+                  rust/target/release). Asks before deleting; optionally offers
+                  to delete the user settings directory (~/.claw). Never touches
+                  the source repository.
+  -y, --yes       With --uninstall: skip the binary-removal confirmation.
+                  The settings directory is still only deleted after an
+                  explicit interactive "yes".
   -h, --help      Show this help text and exit.
 
 Environment overrides:
   CLAW_BUILD_PROFILE   debug | release
   CLAW_SKIP_VERIFY     set to 1 to skip verification
+  CLAW_CONFIG_HOME     settings directory considered by --uninstall (default ~/.claw)
 EOF
 }
 
@@ -91,6 +100,8 @@ EOF
 
 BUILD_PROFILE="${CLAW_BUILD_PROFILE:-debug}"
 SKIP_VERIFY="${CLAW_SKIP_VERIFY:-0}"
+UNINSTALL="0"
+ASSUME_YES="0"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -102,6 +113,12 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-verify)
             SKIP_VERIFY="1"
+            ;;
+        --uninstall)
+            UNINSTALL="1"
+            ;;
+        -y|--yes)
+            ASSUME_YES="1"
             ;;
         -h|--help)
             print_usage
@@ -123,6 +140,106 @@ case "${BUILD_PROFILE}" in
         exit 2
         ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Uninstall mode
+# ---------------------------------------------------------------------------
+
+# Ask a yes/no question; default is No. Returns 0 only on an explicit yes.
+confirm_no_default() {
+    prompt="$1"
+    if [ ! -t 0 ]; then
+        warn "stdin is not a terminal — assuming 'no' for: ${prompt}"
+        return 1
+    fi
+    printf '%s  ?%s  %s [y/N] ' "${COLOR_YELLOW}" "${COLOR_RESET}" "${prompt}"
+    read -r answer || answer=""
+    case "${answer}" in
+        y|Y|yes|YES|Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+run_uninstall() {
+    TOTAL_STEPS=3
+    print_banner
+    printf '%suninstall mode%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
+
+    # -- Step 1: locate compiled binaries -----------------------------------
+    step "Locating compiled claw binaries"
+
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    RUST_DIR="${SCRIPT_DIR}/rust"
+
+    FOUND_BINS=()
+    for profile in debug release; do
+        candidate="${RUST_DIR}/target/${profile}/claw"
+        if [ -f "${candidate}" ]; then
+            info "found: ${candidate}"
+            FOUND_BINS+=("${candidate}")
+        fi
+    done
+
+    if [ "${#FOUND_BINS[@]}" -eq 0 ]; then
+        ok "no compiled claw binaries found under ${RUST_DIR}/target — nothing to remove"
+    fi
+
+    # -- Step 2: remove binaries (with confirmation) ------------------------
+    step "Removing compiled binaries"
+
+    if [ "${#FOUND_BINS[@]}" -eq 0 ]; then
+        info "skipped (nothing found)"
+    else
+        DO_REMOVE="0"
+        if [ "${ASSUME_YES}" = "1" ]; then
+            info "--yes given, skipping confirmation"
+            DO_REMOVE="1"
+        elif confirm_no_default "Delete the ${#FOUND_BINS[@]} binary file(s) listed above?"; then
+            DO_REMOVE="1"
+        fi
+
+        if [ "${DO_REMOVE}" = "1" ]; then
+            for bin in "${FOUND_BINS[@]}"; do
+                rm -f -- "${bin}"
+                ok "removed ${bin}"
+            done
+        else
+            warn "binary removal declined — binaries kept"
+        fi
+    fi
+
+    # -- Step 3: user settings directory (optional, default NO) -------------
+    step "User settings directory (optional)"
+
+    CONFIG_HOME="${CLAW_CONFIG_HOME:-${HOME:-}/.claw}"
+
+    if [ -z "${CONFIG_HOME}" ] || [ "${CONFIG_HOME}" = "/" ] || [ "${CONFIG_HOME}" = "${HOME:-}" ]; then
+        warn "refusing to consider suspicious settings path: '${CONFIG_HOME}'"
+    elif [ ! -d "${CONFIG_HOME}" ]; then
+        info "no settings directory found at ${CONFIG_HOME} — nothing to do"
+    elif [ "${ASSUME_YES}" = "1" ] && [ ! -t 0 ]; then
+        info "settings directory ${CONFIG_HOME} kept (deletion requires an explicit interactive yes)"
+    else
+        info "settings directory: ${CONFIG_HOME}"
+        info "it holds settings.json (provider API keys), skills, commands and agents"
+        if confirm_no_default "Also delete ${CONFIG_HOME}? This removes saved API keys and settings"; then
+            rm -rf -- "${CONFIG_HOME}"
+            ok "removed ${CONFIG_HOME}"
+        else
+            ok "settings directory kept (default)"
+        fi
+    fi
+
+    printf '\n%sClaw Code uninstall finished.%s\n' "${COLOR_GREEN}" "${COLOR_RESET}"
+    printf '%sThe source repository itself was not touched — delete the checkout manually if you no longer want it.%s\n' \
+        "${COLOR_DIM}" "${COLOR_RESET}"
+    printf '%sTo reinstall later: ./install.sh%s\n' "${COLOR_DIM}" "${COLOR_RESET}"
+}
+
+if [ "${UNINSTALL}" = "1" ]; then
+    run_uninstall
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Troubleshooting hints

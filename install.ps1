@@ -9,6 +9,7 @@
 #   .\install.ps1                # debug build (fast, default)
 #   .\install.ps1 -Release      # optimized release build
 #   .\install.ps1 -NoVerify    # skip post-install verification
+#   .\install.ps1 -Uninstall   # remove compiled claw binaries
 #   .\install.ps1 -Help        # print usage
 #
 # If script execution is blocked, run once:
@@ -18,6 +19,8 @@
 param(
     [switch]$Release,
     [switch]$NoVerify,
+    [switch]$Uninstall,
+    [switch]$Yes,
     [switch]$Help
 )
 
@@ -40,11 +43,19 @@ Usage: .\install.ps1 [options]
 Options:
   -Release      Build the optimized release profile (slower, smaller binary).
   -NoVerify     Skip the post-install verification step.
+  -Uninstall    Remove the compiled claw binaries (rust\target\debug and
+                rust\target\release). Asks before deleting; optionally offers
+                to delete the user settings directory (~\.claw). Never touches
+                the source repository.
+  -Yes          With -Uninstall: skip the binary-removal confirmation.
+                The settings directory is still only deleted after an
+                explicit interactive "yes".
   -Help         Show this help text and exit.
 
 Environment overrides:
   CLAW_BUILD_PROFILE   debug | release
   CLAW_SKIP_VERIFY     set to 1 to skip verification
+  CLAW_CONFIG_HOME     settings directory considered by -Uninstall (default ~\.claw)
 "@ | Write-Host
 }
 
@@ -90,6 +101,86 @@ Write-Host @'
   \____||_| \__,_|  \_/\_/   \____\___/ \__,_|\___|
 '@ -ForegroundColor White
 Write-Host "Claw Code installer (Windows)" -ForegroundColor DarkGray
+
+# Ask a yes/no question; default is No. Returns $true only on an explicit yes.
+function Confirm-NoDefault([string]$prompt) {
+    try {
+        $answer = Read-Host "  ?   $prompt [y/N]"
+    } catch {
+        Write-Warn2 "no interactive input available — assuming 'no'"
+        return $false
+    }
+    return $answer -match '^(y|yes)$'
+}
+
+if ($Uninstall) {
+    Write-Host "uninstall mode" -ForegroundColor DarkGray
+    $total = 3
+
+    # -- Step 1: locate compiled binaries ----------------------------------
+    Write-Step 1 $total "Locating compiled claw binaries"
+    $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $rustDir = Join-Path $scriptDir 'rust'
+    $foundBins = @()
+    foreach ($p in @('debug', 'release')) {
+        $candidate = Join-Path $rustDir "target\$p\claw.exe"
+        if (Test-Path $candidate -PathType Leaf) {
+            Write-Info "found: $candidate"
+            $foundBins += $candidate
+        }
+    }
+    if ($foundBins.Count -eq 0) {
+        Write-Ok "no compiled claw binaries found under $rustDir\target — nothing to remove"
+    }
+
+    # -- Step 2: remove binaries (with confirmation) ------------------------
+    Write-Step 2 $total "Removing compiled binaries"
+    if ($foundBins.Count -eq 0) {
+        Write-Info "skipped (nothing found)"
+    } else {
+        $doRemove = $false
+        if ($Yes) {
+            Write-Info "-Yes given, skipping confirmation"
+            $doRemove = $true
+        } elseif (Confirm-NoDefault "Delete the $($foundBins.Count) binary file(s) listed above?") {
+            $doRemove = $true
+        }
+        if ($doRemove) {
+            foreach ($bin in $foundBins) {
+                Remove-Item -LiteralPath $bin -Force
+                Write-Ok "removed $bin"
+            }
+        } else {
+            Write-Warn2 "binary removal declined — binaries kept"
+        }
+    }
+
+    # -- Step 3: user settings directory (optional, default NO) -------------
+    Write-Step 3 $total "User settings directory (optional)"
+    $configHome = if ($env:CLAW_CONFIG_HOME) { $env:CLAW_CONFIG_HOME }
+             elseif ($env:HOME) { Join-Path $env:HOME '.claw' }
+             else { Join-Path $env:USERPROFILE '.claw' }
+    if (-not $configHome -or $configHome -eq '\' -or $configHome -eq $env:USERPROFILE) {
+        Write-Warn2 "refusing to consider suspicious settings path: '$configHome'"
+    } elseif (-not (Test-Path $configHome -PathType Container)) {
+        Write-Info "no settings directory found at $configHome — nothing to do"
+    } else {
+        Write-Info "settings directory: $configHome"
+        Write-Info "it holds settings.json (provider API keys), skills, commands and agents"
+        if (Confirm-NoDefault "Also delete $configHome? This removes saved API keys and settings") {
+            Remove-Item -LiteralPath $configHome -Recurse -Force
+            Write-Ok "removed $configHome"
+        } else {
+            Write-Ok "settings directory kept (default)"
+        }
+    }
+
+    Write-Host ""
+    Write-Host "Claw Code uninstall finished." -ForegroundColor Green
+    Write-Host "The source repository itself was not touched — delete the checkout manually if you no longer want it." -ForegroundColor DarkGray
+    Write-Host "To reinstall later: .\install.ps1" -ForegroundColor DarkGray
+    exit 0
+}
 
 $total = 6
 

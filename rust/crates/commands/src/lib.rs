@@ -153,7 +153,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "diff",
         aliases: &[],
         summary: "Show git diff for current workspace changes",
-        argument_hint: None,
+        argument_hint: Some("[file]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -283,7 +283,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "doctor",
         aliases: &[],
         summary: "Diagnose setup issues and environment health",
-        argument_hint: None,
+        argument_hint: Some("[online]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -521,7 +521,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "design-review",
         aliases: &[],
         summary: "Deterministic design audit: WCAG token contrast + rendered-HTML accessibility (0 tokens)",
-        argument_hint: None,
+        argument_hint: Some("[fix]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1124,7 +1124,9 @@ pub enum SlashCommand {
     },
     Memory,
     Init,
-    Diff,
+    Diff {
+        path: Option<String>,
+    },
     Version,
     Export {
         path: Option<String>,
@@ -1159,13 +1161,16 @@ pub enum SlashCommand {
     Skills {
         args: Option<String>,
     },
-    Doctor,
+    Doctor {
+        online: bool,
+    },
     Setup,
     Login,
     Logout,
     Vim,
     Upgrade,
     Stats,
+    Retry,
     Share,
     Feedback,
     Files,
@@ -1180,7 +1185,9 @@ pub enum SlashCommand {
     Thinkback,
     ReleaseNotes,
     SecurityReview,
-    DesignReview,
+    DesignReview {
+        fix: bool,
+    },
     Keybindings,
     PrivacySettings,
     Plan {
@@ -1282,12 +1289,12 @@ impl SlashCommand {
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
             Self::Cost => "/cost",
-            Self::Doctor => "/doctor",
+            Self::Doctor { .. } => "/doctor",
             Self::Setup => "/setup",
             Self::Config { .. } => "/config",
             Self::Memory { .. } => "/memory",
             Self::History { .. } => "/history",
-            Self::Diff => "/diff",
+            Self::Diff { .. } => "/diff",
             Self::Status => "/status",
             Self::Stats => "/stats",
             Self::Version => "/version",
@@ -1312,6 +1319,7 @@ impl SlashCommand {
             Self::Feedback => "/feedback",
             Self::Files => "/files",
             Self::Fast => "/fast",
+            Self::Retry => "/retry",
             Self::Exit => "/exit",
             Self::Summary => "/summary",
             Self::Desktop => "/desktop",
@@ -1322,7 +1330,7 @@ impl SlashCommand {
             Self::Thinkback => "/thinkback",
             Self::ReleaseNotes => "/release-notes",
             Self::SecurityReview => "/security-review",
-            Self::DesignReview => "/design-review",
+            Self::DesignReview { .. } => "/design-review",
             Self::Keybindings => "/keybindings",
             Self::PrivacySettings => "/privacy-settings",
             Self::Plan { .. } => "/plan",
@@ -1437,10 +1445,9 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Init
         }
-        "diff" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Diff
-        }
+        "diff" => SlashCommand::Diff {
+            path: optional_single_arg(command, &args, "[file]")?,
+        },
         "version" => {
             validate_no_args(command, &args)?;
             SlashCommand::Version
@@ -1458,10 +1465,13 @@ pub fn validate_slash_command_input(
         "skills" | "skill" => SlashCommand::Skills {
             args: parse_skills_args(remainder.as_deref())?,
         },
-        "doctor" | "providers" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Doctor
-        }
+        "doctor" | "providers" => match args.as_slice() {
+            [] => SlashCommand::Doctor { online: false },
+            ["online" | "--online"] => SlashCommand::Doctor { online: true },
+            _ => {
+                return Err(usage_error(command, "[online]"));
+            }
+        },
         "setup" => {
             validate_no_args(command, &args)?;
             SlashCommand::Setup
@@ -1501,6 +1511,10 @@ pub fn validate_slash_command_input(
         "fast" => {
             validate_no_args(command, &args)?;
             SlashCommand::Fast
+        }
+        "retry" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Retry
         }
         "exit" => {
             validate_no_args(command, &args)?;
@@ -1542,10 +1556,13 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::SecurityReview
         }
-        "design-review" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::DesignReview
-        }
+        "design-review" => match args.as_slice() {
+            [] => SlashCommand::DesignReview { fix: false },
+            ["fix" | "--fix"] => SlashCommand::DesignReview { fix: true },
+            _ => {
+                return Err(usage_error(command, "[fix]"));
+            }
+        },
         "keybindings" => {
             validate_no_args(command, &args)?;
             SlashCommand::Keybindings
@@ -5950,14 +5967,14 @@ pub fn handle_slash_command(
         | SlashCommand::Mcp { .. }
         | SlashCommand::Memory
         | SlashCommand::Init
-        | SlashCommand::Diff
+        | SlashCommand::Diff { .. }
         | SlashCommand::Version
         | SlashCommand::Export { .. }
         | SlashCommand::Session { .. }
         | SlashCommand::Plugins { .. }
         | SlashCommand::Agents { .. }
         | SlashCommand::Skills { .. }
-        | SlashCommand::Doctor
+        | SlashCommand::Doctor { .. }
         | SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Vim
@@ -5977,7 +5994,8 @@ pub fn handle_slash_command(
         | SlashCommand::Thinkback
         | SlashCommand::ReleaseNotes
         | SlashCommand::SecurityReview
-        | SlashCommand::DesignReview
+        | SlashCommand::DesignReview { .. }
+        | SlashCommand::Retry
         | SlashCommand::Keybindings
         | SlashCommand::PrivacySettings
         | SlashCommand::Plan { .. }
@@ -6463,7 +6481,16 @@ mod tests {
             Ok(Some(SlashCommand::Memory))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
-        assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));
+        assert_eq!(
+            SlashCommand::parse("/diff"),
+            Ok(Some(SlashCommand::Diff { path: None }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/diff src/main.rs"),
+            Ok(Some(SlashCommand::Diff {
+                path: Some("src/main.rs".to_string())
+            }))
+        );
         assert_eq!(
             SlashCommand::parse("/version"),
             Ok(Some(SlashCommand::Version))

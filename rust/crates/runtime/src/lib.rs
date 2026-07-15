@@ -86,8 +86,8 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace, grep_search,
-    grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
+    closest_match_diff, edit_file, edit_file_in_workspace, glob_search, glob_search_in_workspace,
+    grep_search, grep_search_in_workspace, read_file, read_file_in_workspace, write_file,
     write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
     ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
@@ -173,8 +173,8 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
-    SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
+    redact_secrets, ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction,
+    SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

@@ -157,6 +157,38 @@ impl DesignArchetype {
     }
 }
 
+/// Canonical CLI name for every archetype, in the order shown to users.
+pub const ARCHETYPE_NAMES: &[(&str, DesignArchetype)] = &[
+    ("landing", DesignArchetype::Landing),
+    ("ecommerce", DesignArchetype::Ecommerce),
+    ("dashboard", DesignArchetype::Dashboard),
+    ("saas", DesignArchetype::Saas),
+    ("content", DesignArchetype::Content),
+    ("fintech", DesignArchetype::Fintech),
+    ("social", DesignArchetype::Social),
+    ("booking", DesignArchetype::Booking),
+    ("general", DesignArchetype::General),
+];
+
+/// Parses a user-supplied archetype name (`--archetype`), case-insensitive.
+/// Unknown names fail with the full list of valid options — a typo must
+/// never silently fall back to keyword detection.
+pub fn parse_archetype(name: &str) -> Result<DesignArchetype, String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    ARCHETYPE_NAMES
+        .iter()
+        .find(|(canonical, _)| *canonical == normalized)
+        .map(|(_, archetype)| *archetype)
+        .ok_or_else(|| {
+            let valid = ARCHETYPE_NAMES
+                .iter()
+                .map(|(canonical, _)| *canonical)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("arquetipo desconocido `{name}`; válidos: {valid}")
+        })
+}
+
 /// Keyword-based archetype detection over the Director's plan. Deliberately
 /// simple: vision + scope + epic names, first match in priority order
 /// (ecommerce beats landing when both appear — the store IS the product).
@@ -429,9 +461,25 @@ const DARK_TOKENS: &str = "  --surface-page: #0d0d0d;\n\
   --shadow-3: 0 8px 24px rgba(0, 0, 0, 0.6);\n\
   --backdrop: rgba(0, 0, 0, 0.7);\n";
 
+/// `prefers-contrast: more` overrides for the light theme: harder borders
+/// and darker secondary/muted ink. Every value here must keep passing the
+/// gate's [`CONTRAST_PAIRS`] (a dedicated unit test recomputes the ratios).
+const HIGH_CONTRAST_LIGHT_TOKENS: &str = "  --text-secondary: #3f3e3b;\n\
+  --text-muted: #5c5a54;\n\
+  --border-hairline: #b3b2a7;\n\
+  --border-strong: #8a897e;\n";
+
+/// `prefers-contrast: more` overrides for the dark theme: lighter secondary
+/// and muted ink, more visible borders. Same contract as the light block.
+const HIGH_CONTRAST_DARK_TOKENS: &str = "  --text-secondary: #deddd4;\n\
+  --text-muted: #b3b1a7;\n\
+  --border-hairline: #4c4c48;\n\
+  --border-strong: #6a6a64;\n";
+
 /// The complete tokens stylesheet: light theme in `:root`, dark theme both
 /// by explicit opt-in (`[data-theme="dark"]`) and by OS preference, plus
-/// reduced-motion support baked in.
+/// reduced-motion support and hardened `prefers-contrast: more` overrides
+/// baked in.
 #[must_use]
 pub fn design_tokens_css() -> String {
     format!(
@@ -447,6 +495,16 @@ pub fn design_tokens_css() -> String {
          }}\n\n\
          @media (prefers-reduced-motion: reduce) {{\n\
          \x20 :root {{\n    --duration-fast: 0ms;\n    --duration-base: 0ms;\n  }}\n\
+         }}\n\n\
+         /* Users who ask the OS for more contrast get harder borders and\n\
+         \x20  darker (light) / lighter (dark) secondary ink — values validated\n\
+         \x20  against the same WCAG pairs as the base themes. */\n\
+         @media (prefers-contrast: more) {{\n\
+         \x20 :root {{\n{HIGH_CONTRAST_LIGHT_TOKENS}  }}\n\
+         \x20 [data-theme=\"dark\"] {{\n{HIGH_CONTRAST_DARK_TOKENS}  }}\n\
+         \x20 @media (prefers-color-scheme: dark) {{\n\
+         \x20   :root:not([data-theme=\"light\"]) {{\n{HIGH_CONTRAST_DARK_TOKENS}    }}\n\
+         \x20 }}\n\
          }}\n"
     )
 }
@@ -530,10 +588,10 @@ pub fn write_design_tokens(project_dir: &Path) -> Option<String> {
 
 /// Extra planning instructions for the UX/UI designer's architect run —
 /// the generic "deliver your design document" prompt gave a graphic
-/// designer nothing to push against.
+/// designer nothing to push against. The caller resolves the archetype
+/// (detected from the plan, or forced by `--archetype`).
 #[must_use]
-pub fn designer_planning_brief(plan: &Plan) -> String {
-    let archetype = detect_archetype(plan);
+pub fn designer_planning_brief(archetype: DesignArchetype) -> String {
     format!(
         "\n\nYou are the GRAPHIC DESIGN authority for this build. Product archetype \
          detected: {label}. {direction}\n\n\
@@ -696,6 +754,13 @@ fn parse_theme_vars(
 ) {
     let mut light = std::collections::BTreeMap::new();
     let mut dark = std::collections::BTreeMap::new();
+    // A `prefers-contrast: more` block holds CONDITIONAL overrides for both
+    // themes; folding them into the base maps would audit light values
+    // against dark surfaces (and vice versa). It has its own dedicated
+    // validation test, so the base audit stops where it starts.
+    let css = css
+        .find("@media (prefers-contrast")
+        .map_or(css, |index| &css[..index]);
     let dark_marker = css
         .find("data-theme=\"dark\"")
         .or_else(|| css.find("prefers-color-scheme: dark"))
@@ -936,10 +1001,107 @@ pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
     findings
 }
 
+// ---------- Heavy-image audit ([PESO]) ----------
+
+/// Asset directories the image-weight audit scans, relative to the project.
+const IMAGE_DIRS: &[&str] = &["public", "assets", "static", "src/assets"];
+
+/// Raster and vector formats the audit weighs.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg"];
+
+/// Per-image weight budget. 500 KB is already generous for web delivery —
+/// heavier assets should be compressed, resized or lazy-loaded.
+const DEFAULT_IMG_BUDGET_KB: u64 = 500;
+
+/// At most this many [PESO] findings reach the report: past that the signal
+/// is "the asset pipeline is broken", not eight more file names.
+const MAX_IMAGE_FINDINGS: usize = 8;
+
+/// Image-budget override in KB; junk or zero falls back to the default so a
+/// typo cannot silently disable the audit.
+#[must_use]
+pub fn parse_img_budget_kb(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&kb| kb > 0)
+        .unwrap_or(DEFAULT_IMG_BUDGET_KB)
+}
+
+/// Thin env wrapper over [`parse_img_budget_kb`] (`CLAW_IMG_BUDGET_KB`).
+#[must_use]
+fn img_budget_kb() -> u64 {
+    parse_img_budget_kb(std::env::var("CLAW_IMG_BUDGET_KB").ok().as_deref())
+}
+
+/// Scans the conventional asset directories for images over `budget_kb`.
+/// Heaviest first, capped at [`MAX_IMAGE_FINDINGS`]; the walk itself is
+/// bounded so a pathological tree cannot stall the gate.
+#[must_use]
+pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
+    // Same KB convention as the performance gate (1 KB = 1000 B).
+    let budget_bytes = budget_kb * 1_000;
+    let mut heavy: Vec<(String, u64)> = Vec::new();
+    let mut pending: Vec<PathBuf> = IMAGE_DIRS.iter().map(|dir| project_dir.join(dir)).collect();
+    let mut walk_budget = 2_000_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if walk_budget == 0 {
+                break;
+            }
+            walk_budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !crate::orchestrator::REPO_SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let is_image = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    IMAGE_EXTENSIONS
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(extension))
+                });
+            if !is_image {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > budget_bytes {
+                let rel = path
+                    .strip_prefix(project_dir)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                heavy.push((rel, metadata.len()));
+            }
+        }
+    }
+    heavy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    heavy.truncate(MAX_IMAGE_FINDINGS);
+    heavy
+        .into_iter()
+        .map(|(rel, size)| {
+            format!(
+                "{rel} weighs {} KB (budget {budget_kb} KB) — compress it, resize it \
+                 or serve a modern format",
+                size / 1_000
+            )
+        })
+        .collect()
+}
+
 /// The whole gate: token contrast + rendered-DOM accessibility + token
-/// discipline, each finding prefixed by its category. `require_tokens` is
-/// true only for greenfield builds — an /improve run must never demand
-/// that the user's existing project adopt our token foundation.
+/// discipline + image weight, each finding prefixed by its category.
+/// `require_tokens` is true only for greenfield builds — an /improve run
+/// must never demand that the user's existing project adopt our token
+/// foundation.
 #[must_use]
 pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) -> Vec<String> {
     let mut findings = Vec::new();
@@ -967,6 +1129,11 @@ pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) ->
         for finding in audit_hardcoded_colors(project_dir) {
             findings.push(format!("[TOKENS] {finding}"));
         }
+    }
+    // Image weight is objective in every mode: an oversized hero costs the
+    // same first paint on /improve as on a greenfield build.
+    for finding in audit_heavy_images(project_dir, img_budget_kb()) {
+        findings.push(format!("[PESO] {finding}"));
     }
     findings
 }
@@ -1197,13 +1364,117 @@ mod tests {
         for needle in ["h1", "320px", "lorem", "dark", "focus-visible", "Toast"] {
             assert!(qa.contains(needle), "missing {needle}");
         }
-        let plan = Plan {
-            vision: "tienda".to_string(),
-            ..Plan::default()
-        };
-        let brief = designer_planning_brief(&plan);
+        let brief = designer_planning_brief(DesignArchetype::Ecommerce);
         assert!(brief.contains("ecommerce"));
         assert!(brief.contains("WCAG AA"));
+    }
+
+    #[test]
+    fn archetype_names_parse_case_insensitively_and_cover_every_variant() {
+        assert_eq!(parse_archetype("landing"), Ok(DesignArchetype::Landing));
+        assert_eq!(parse_archetype("Ecommerce"), Ok(DesignArchetype::Ecommerce));
+        assert_eq!(parse_archetype("DASHBOARD"), Ok(DesignArchetype::Dashboard));
+        assert_eq!(parse_archetype(" saas "), Ok(DesignArchetype::Saas));
+        assert_eq!(parse_archetype("content"), Ok(DesignArchetype::Content));
+        assert_eq!(parse_archetype("fintech"), Ok(DesignArchetype::Fintech));
+        assert_eq!(parse_archetype("Social"), Ok(DesignArchetype::Social));
+        assert_eq!(parse_archetype("booking"), Ok(DesignArchetype::Booking));
+        assert_eq!(parse_archetype("general"), Ok(DesignArchetype::General));
+        // Every enum variant has a CLI name (a new variant must be added here).
+        assert_eq!(ARCHETYPE_NAMES.len(), 9);
+
+        let error = parse_archetype("tiendita").unwrap_err();
+        assert!(error.contains("tiendita"), "{error}");
+        for name in ["landing", "ecommerce", "booking", "general"] {
+            assert!(error.contains(name), "error must list `{name}`: {error}");
+        }
+    }
+
+    #[test]
+    fn img_budget_parses_override_and_rejects_junk() {
+        assert_eq!(parse_img_budget_kb(None), DEFAULT_IMG_BUDGET_KB);
+        assert_eq!(parse_img_budget_kb(Some("250")), 250);
+        assert_eq!(parse_img_budget_kb(Some(" 1024 ")), 1024, "trims");
+        // Zero would disable the audit; junk must not change it silently.
+        assert_eq!(parse_img_budget_kb(Some("0")), DEFAULT_IMG_BUDGET_KB);
+        assert_eq!(parse_img_budget_kb(Some("-5")), DEFAULT_IMG_BUDGET_KB);
+        assert_eq!(parse_img_budget_kb(Some("huge")), DEFAULT_IMG_BUDGET_KB);
+    }
+
+    #[test]
+    fn heavy_image_audit_flags_oversized_assets_and_caps_findings() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-peso-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("public/img")).expect("public");
+        std::fs::create_dir_all(dir.join("src/assets")).expect("assets");
+        // 3 KB budget for the test: hero (5 KB) is over, icon (1 KB) is not.
+        std::fs::write(dir.join("public/img/hero.png"), vec![0_u8; 5_000]).expect("hero");
+        std::fs::write(dir.join("public/icon.svg"), vec![0_u8; 1_000]).expect("icon");
+        // Non-image files and files outside the asset dirs are ignored.
+        std::fs::write(dir.join("public/data.json"), vec![0_u8; 9_000]).expect("json");
+        std::fs::write(dir.join("heavy-elsewhere.png"), vec![0_u8; 9_000]).expect("root");
+        std::fs::write(dir.join("src/assets/photo.JPG"), vec![0_u8; 4_000]).expect("photo");
+
+        let findings = audit_heavy_images(&dir, 3);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        // Heaviest first; extension matching is case-insensitive.
+        assert!(findings[0].contains("hero.png"), "{findings:?}");
+        assert!(findings[0].contains("5 KB"), "{findings:?}");
+        assert!(findings[0].contains("budget 3 KB"), "{findings:?}");
+        assert!(findings[1].contains("photo.JPG"), "{findings:?}");
+
+        // The cap: 12 oversized images report only MAX_IMAGE_FINDINGS.
+        for index in 0..12 {
+            std::fs::write(
+                dir.join(format!("public/img/gallery-{index}.png")),
+                vec![0_u8; 4_000],
+            )
+            .expect("gallery");
+        }
+        assert_eq!(audit_heavy_images(&dir, 3).len(), MAX_IMAGE_FINDINGS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_contrast_overrides_pass_the_contrast_gate() {
+        // The tokens stylesheet must carry the prefers-contrast block…
+        let css = design_tokens_css();
+        assert!(css.contains("@media (prefers-contrast: more)"), "{css}");
+        // …and the base audit must keep passing (the block must not leak
+        // conditional values into the base light/dark maps).
+        assert!(audit_token_contrast(&css).is_empty());
+
+        // Compose "high contrast applied": base themes + HC overrides, then
+        // run the SAME audit the gate uses.
+        let composed = format!(
+            ":root {{\n{LIGHT_TOKENS}{HIGH_CONTRAST_LIGHT_TOKENS}}}\n\
+             [data-theme=\"dark\"] {{\n{DARK_TOKENS}{HIGH_CONTRAST_DARK_TOKENS}}}\n"
+        );
+        let findings = audit_token_contrast(&composed);
+        assert!(findings.is_empty(), "HC overrides regressed: {findings:?}");
+
+        // And verify directly with contrast_ratio that hardening actually
+        // hardens: HC secondary/muted ink exceeds the base values' ratios.
+        let (light, dark) = parse_theme_vars(&composed);
+        let (base_light, base_dark) = parse_theme_vars(&design_tokens_css());
+        for (vars, base, theme) in [(&light, &base_light, "light"), (&dark, &base_dark, "dark")] {
+            let page = vars["--surface-page"];
+            for token in ["--text-secondary", "--text-muted"] {
+                let hardened = contrast_ratio(vars[token], page);
+                let original = contrast_ratio(base[token], page);
+                assert!(
+                    hardened > original,
+                    "{theme} {token}: {hardened:.2} must exceed base {original:.2}"
+                );
+                // Hardened ink is real text contrast, not just the 3:1 floor.
+                assert!(hardened >= 4.5, "{theme} {token}: {hardened:.2} < 4.5");
+            }
+        }
     }
 
     #[test]

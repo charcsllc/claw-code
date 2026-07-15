@@ -508,9 +508,11 @@ dependencies = [
  "api",
  "clap",
  "ctrlc",
+ "mock-anthropic-service",
  "serde",
  "serde_json",
  "telemetry",
+ "tokio",
  "tools",
 ]
 

@@ -16,5 +16,9 @@ serde_json.workspace = true
 tools = { path = "../tools" }
 ctrlc = "3"
 
+[dev-dependencies]
+mock-anthropic-service = { path = "../mock-anthropic-service" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

@@ -61,22 +61,74 @@ impl Completer for SlashCommandHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let Some(prefix) = slash_command_prefix(line, pos) else {
-            return Ok((0, Vec::new()));
-        };
+        if let Some(prefix) = slash_command_prefix(line, pos) {
+            let matches = self
+                .completions
+                .iter()
+                .filter(|candidate| candidate.starts_with(prefix))
+                .map(|candidate| Pair {
+                    display: candidate.clone(),
+                    replacement: candidate.clone(),
+                })
+                .collect();
+            return Ok((0, matches));
+        }
 
-        let matches = self
-            .completions
-            .iter()
-            .filter(|candidate| candidate.starts_with(prefix))
-            .map(|candidate| Pair {
-                display: candidate.clone(),
-                replacement: candidate.clone(),
-            })
-            .collect();
+        // `@ruta/al/arch<Tab>` completes filesystem paths anywhere in the
+        // line — the conventional way to reference a file in a prompt.
+        if let Some((start, prefix)) = at_path_prefix(line, pos) {
+            return Ok((start, complete_at_path(prefix)));
+        }
 
-        Ok((0, matches))
+        Ok((0, Vec::new()))
     }
+}
+
+/// If the word ending at the cursor starts with '@', returns the byte
+/// offset of the '@' and the path prefix typed after it.
+fn at_path_prefix(line: &str, pos: usize) -> Option<(usize, &str)> {
+    let upto = line.get(..pos)?;
+    let start = upto.rfind(char::is_whitespace).map_or(0, |index| index + 1);
+    let word = &upto[start..];
+    let path = word.strip_prefix('@')?;
+    Some((start, path))
+}
+
+/// Filesystem completion for `@` references, relative to the cwd. Hidden
+/// entries only appear once the user has typed their leading dot, and
+/// directories complete with a trailing '/' so Tab can keep descending.
+fn complete_at_path(prefix: &str) -> Vec<Pair> {
+    let (dir_part, file_part) = match prefix.rfind('/') {
+        Some(index) => prefix.split_at(index + 1),
+        None => ("", prefix),
+    };
+    let read_from = if dir_part.is_empty() { "." } else { dir_part };
+    let Ok(entries) = std::fs::read_dir(read_from) else {
+        return Vec::new();
+    };
+    let mut pairs: Vec<Pair> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(file_part)
+                || (!file_part.starts_with('.') && name.starts_with('.'))
+            {
+                return None;
+            }
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            let mut full = format!("{dir_part}{name}");
+            if is_dir {
+                full.push('/');
+            }
+            Some(Pair {
+                display: full.clone(),
+                replacement: format!("@{full}"),
+            })
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.display.cmp(&b.display));
+    pairs.truncate(50);
+    pairs
 }
 
 impl Hinter for SlashCommandHelper {
@@ -226,7 +278,9 @@ fn normalize_completions(completions: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{slash_command_prefix, LineEditor, SlashCommandHelper};
+    use super::{
+        at_path_prefix, complete_at_path, slash_command_prefix, LineEditor, SlashCommandHelper,
+    };
     use rustyline::completion::Completer;
     use rustyline::highlight::Highlighter;
     use rustyline::history::{DefaultHistory, History};
@@ -301,6 +355,42 @@ mod tests {
             .expect("completion should work");
 
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn at_path_prefix_finds_at_word_at_cursor() {
+        assert_eq!(at_path_prefix("mira @src/ma", 12), Some((5, "src/ma")));
+        assert_eq!(at_path_prefix("@Cargo", 6), Some((0, "Cargo")));
+        assert_eq!(at_path_prefix("sin arroba", 10), None);
+        // The '@' must start the word, not appear inside it.
+        assert_eq!(at_path_prefix("correo user@host", 16), None);
+    }
+
+    #[test]
+    fn complete_at_path_lists_directory_entries() {
+        let base = std::env::temp_dir().join(format!("claw-at-path-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("subdir")).expect("create dirs");
+        std::fs::write(base.join("subfile.txt"), "x").expect("write file");
+        std::fs::write(base.join(".hidden"), "x").expect("write hidden");
+
+        let prefix = format!("{}/sub", base.display());
+        let pairs = complete_at_path(&prefix);
+        let replacements: Vec<String> = pairs.iter().map(|pair| pair.replacement.clone()).collect();
+        assert_eq!(
+            replacements,
+            vec![
+                format!("@{}/subdir/", base.display()),
+                format!("@{}/subfile.txt", base.display()),
+            ]
+        );
+
+        // Hidden entries stay hidden until the dot is typed.
+        let all = complete_at_path(&format!("{}/", base.display()));
+        assert!(all.iter().all(|pair| !pair.display.contains(".hidden")));
+        let dotted = complete_at_path(&format!("{}/.h", base.display()));
+        assert_eq!(dotted.len(), 1);
+
+        std::fs::remove_dir_all(&base).expect("cleanup");
     }
 
     #[test]

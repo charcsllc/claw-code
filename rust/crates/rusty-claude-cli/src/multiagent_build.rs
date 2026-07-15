@@ -36,14 +36,38 @@ impl Drop for ReplEnvGuard {
 
 const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N] \
 [--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold] \
-[--timeout-secs N]\n\
+[--timeout-secs N] [--archetype <nombre>]\n\
                             /app <prompt> [same options]\n\
                             /improve <prompt> [same options; opera sobre el proyecto actual]\n\
                      Tips: --approve pauses after planning for a go/no-go;\n\
                      --dry-run stops after planning entirely.\n\
                      --max-cost-usd is OFF by default (subscription accounts).\n\
+                     --archetype fuerza la dirección de arte (landing, ecommerce, dashboard, \
+saas, content, fintech, social, booking, general) en vez de detectarla del plan.\n\
                      Env: CLAW_MA_{SIMPLE,MEDIUM,COMPLEX,DIRECTOR,SUPERVISOR}_MODEL \
-overrides per-role models; CLAW_PERF_BUDGET_KB and CLAW_SMOKE_TIMEOUT_SECS tune the gates.";
+overrides per-role models; CLAW_PERF_BUDGET_KB, CLAW_IMG_BUDGET_KB and \
+CLAW_SMOKE_TIMEOUT_SECS tune the gates.";
+
+/// Extracts the value of `--archetype`, accepting both `--archetype <n>`
+/// (advances `index` past the value) and `--archetype=<n>`.
+pub(crate) fn take_archetype_value<'a>(
+    tokens: &[&'a str],
+    index: &mut usize,
+) -> Result<&'a str, String> {
+    const MISSING: &str = "--archetype espera un nombre (landing, ecommerce, dashboard, \
+                           saas, content, fintech, social, booking, general)";
+    if let Some(value) = tokens[*index].strip_prefix("--archetype=") {
+        if value.is_empty() {
+            return Err(MISSING.to_string());
+        }
+        return Ok(value);
+    }
+    *index += 1;
+    tokens
+        .get(*index)
+        .copied()
+        .ok_or_else(|| MISSING.to_string())
+}
 
 /// Developer-slot bounds: 0 would deadlock the scheduler and beyond 16 the
 /// per-agent processes contend for CPU/IO without building any faster.
@@ -90,6 +114,7 @@ pub(crate) fn run_multiagent_build(
     let mut max_cost_usd: Option<f64> = None;
     let mut build_cmd: Option<String> = None;
     let mut agent_timeout_secs = 1800_u64;
+    let mut archetype: Option<claw_multiagent::DesignArchetype> = None;
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     let mut index = 0;
     while index < tokens.len() {
@@ -134,6 +159,10 @@ pub(crate) fn run_multiagent_build(
                     .and_then(|value| value.parse().ok())
                     .filter(|value| *value > 0)
                     .ok_or("--timeout-secs expects a positive number of seconds")?;
+            }
+            word if word == "--archetype" || word.starts_with("--archetype=") => {
+                let name = take_archetype_value(&tokens, &mut index)?;
+                archetype = Some(claw_multiagent::parse_archetype(name)?);
             }
             word => prompt_words.push(word),
         }
@@ -184,6 +213,7 @@ pub(crate) fn run_multiagent_build(
         build_command: build_cmd,
         scaffold,
         approve,
+        archetype,
     });
 
     match result {
@@ -217,6 +247,14 @@ pub(crate) fn run_multiagent_build(
                 if let Some(cost) = summary.cost_usd {
                     println!("[multiagent] coste estimado: {cost:.2} USD");
                 }
+                if !summary.role_spend.is_empty() {
+                    let rows: Vec<String> = summary
+                        .role_spend
+                        .iter()
+                        .map(|(role, usd)| format!("{role} {usd:.2} USD"))
+                        .collect();
+                    println!("[multiagent] gasto por rol: {}", rows.join(" · "));
+                }
             }
             if let Some(branch) = &summary.improve_branch {
                 let base = summary.base_branch.as_deref().unwrap_or("<tu-rama>");
@@ -236,7 +274,54 @@ pub(crate) fn run_multiagent_build(
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_parallel;
+    use super::{clamp_parallel, take_archetype_value};
+    use claw_multiagent::{parse_archetype, DesignArchetype};
+
+    #[test]
+    fn archetype_flag_accepts_both_token_forms() {
+        // Two-token form: `--archetype dashboard` (index advances past it).
+        let tokens = ["--archetype", "dashboard", "resto"];
+        let mut index = 0;
+        assert_eq!(take_archetype_value(&tokens, &mut index), Ok("dashboard"));
+        assert_eq!(index, 1, "value token consumed");
+
+        // Inline form: `--archetype=fintech` (index untouched).
+        let tokens = ["--archetype=fintech"];
+        let mut index = 0;
+        assert_eq!(take_archetype_value(&tokens, &mut index), Ok("fintech"));
+        assert_eq!(index, 0);
+
+        // Missing values fail with the name list, never silently.
+        for tokens in [vec!["--archetype"], vec!["--archetype="]] {
+            let mut index = 0;
+            let error = take_archetype_value(&tokens, &mut index).unwrap_err();
+            assert!(error.contains("landing"), "{error}");
+            assert!(error.contains("general"), "{error}");
+        }
+    }
+
+    #[test]
+    fn archetype_names_resolve_case_insensitively_with_clear_errors() {
+        // The CLI value goes straight to claw_multiagent::parse_archetype.
+        assert_eq!(parse_archetype("Dashboard"), Ok(DesignArchetype::Dashboard));
+        assert_eq!(parse_archetype("BOOKING"), Ok(DesignArchetype::Booking));
+        let error = parse_archetype("blog").unwrap_err();
+        assert!(error.contains("blog"), "{error}");
+        assert!(error.contains("válidos"), "{error}");
+        for name in [
+            "landing",
+            "ecommerce",
+            "dashboard",
+            "saas",
+            "content",
+            "fintech",
+            "social",
+            "booking",
+            "general",
+        ] {
+            assert!(error.contains(name), "error must list `{name}`: {error}");
+        }
+    }
 
     #[test]
     fn clamp_parallel_bounds_and_warns() {

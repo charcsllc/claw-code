@@ -1144,7 +1144,84 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
 }
 
 fn sanitize_jsonl_field(value: &str) -> String {
-    truncate_jsonl_field(&redact_jsonl_secrets(value))
+    truncate_jsonl_field(&redact_jsonl_secrets(&redact_secrets(value)))
+}
+
+/// Known credential prefixes and the minimum total token length required
+/// before a match is treated as a secret. Prefixes mirror the repo-wide
+/// `SECRET_MARKERS` conventions (Anthropic/OpenAI keys, GitHub/GitLab PATs,
+/// Slack tokens, AWS access key IDs, npm tokens); the length floor keeps the
+/// scan conservative so ordinary prose and identifiers (`sk-learn`,
+/// `ghp_test`) survive intact.
+const SECRET_TOKEN_PREFIXES: &[(&str, usize)] = &[
+    ("sk-ant-", 20),
+    ("sk-", 20),
+    ("ghp_", 20),
+    ("github_pat_", 30),
+    ("glpat-", 20),
+    ("xoxb-", 20),
+    ("xoxp-", 20),
+    ("npm_", 20),
+    ("AKIA", 20),
+];
+
+/// Minimum length for a token following `Bearer ` to be treated as a secret.
+const BEARER_TOKEN_MIN_LEN: usize = 30;
+
+/// Characters that can appear inside a credential token. Runs of these
+/// delimit the candidate tokens scanned for secret prefixes.
+fn is_secret_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')
+}
+
+/// Masks unambiguous credential material before persistence: tokens carrying
+/// a well-known secret prefix (see [`SECRET_TOKEN_PREFIXES`]) and long
+/// `Bearer` tokens are replaced by their first 4 characters plus
+/// `…[redacted]`. Deliberately conservative — only known prefixes with a
+/// minimum length are touched, so legitimate prose, short hex strings, and
+/// code identifiers pass through unchanged. Intended for the session JSONL
+/// persistence path only; in-memory conversation content is never altered.
+#[must_use]
+pub fn redact_secrets(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut previous_token = "";
+    while let Some(start) = rest.find(is_secret_token_char) {
+        let separator = &rest[..start];
+        output.push_str(separator);
+        let token_and_tail = &rest[start..];
+        let end = token_and_tail
+            .find(|ch: char| !is_secret_token_char(ch))
+            .unwrap_or(token_and_tail.len());
+        let token = &token_and_tail[..end];
+        if is_secret_token(token, previous_token, separator) {
+            let prefix: String = token.chars().take(4).collect();
+            output.push_str(&prefix);
+            output.push_str("…[redacted]");
+        } else {
+            output.push_str(token);
+        }
+        previous_token = token;
+        rest = &token_and_tail[end..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn is_secret_token(token: &str, previous_token: &str, separator: &str) -> bool {
+    if SECRET_TOKEN_PREFIXES
+        .iter()
+        .any(|(prefix, min_len)| token.starts_with(prefix) && token.len() >= *min_len)
+    {
+        return true;
+    }
+    // `Authorization: Bearer <long-token>` — only when the token directly
+    // follows the `Bearer` keyword separated by plain spaces, so an
+    // unrelated long word later in the text is never masked.
+    previous_token == "Bearer"
+        && token.len() >= BEARER_TOKEN_MIN_LEN
+        && !separator.is_empty()
+        && separator.chars().all(|ch| ch == ' ')
 }
 
 fn truncate_jsonl_field(value: &str) -> String {
@@ -1675,6 +1752,123 @@ mod tests {
         assert!(output.contains(super::JSONL_REDACTION_MARKER));
         assert!(output.ends_with(super::JSONL_TRUNCATION_MARKER));
         assert!(output.chars().count() <= super::MAX_JSONL_FIELD_CHARS);
+    }
+
+    #[test]
+    fn redact_secrets_masks_known_prefix_tokens() {
+        let cases = [
+            (
+                "key sk-ant-api03-abcdefghijklmnop123456 end",
+                "key sk-a…[redacted] end",
+            ),
+            (
+                "key sk-proj-abcdefghijklmnop1234 end",
+                "key sk-p…[redacted] end",
+            ),
+            (
+                "token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 end",
+                "token ghp_…[redacted] end",
+            ),
+            (
+                "pat github_pat_11ABCDEFG0123456789_abcdefghijklmnop end",
+                "pat gith…[redacted] end",
+            ),
+            (
+                "gitlab glpat-abcdefghij1234567890 end",
+                "gitlab glpa…[redacted] end",
+            ),
+            ("aws AKIAIOSFODNN7EXAMPLEKEY end", "aws AKIA…[redacted] end"),
+            (
+                "npm npm_abcdefghijklmnopqrstuvwxyz012345 end",
+                "npm npm_…[redacted] end",
+            ),
+            (
+                "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789",
+                "Authorization: Bearer abcd…[redacted]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(super::redact_secrets(input), expected, "input: {input}");
+        }
+        // Slack fixtures are assembled at runtime: as contiguous literals
+        // they trip GitHub's push-protection secret scanner, which cannot
+        // tell test data from a live token.
+        for prefix in ["xoxb", "xoxp"] {
+            let input = format!("slack {prefix}-1234567890-abcdefghijklmn end");
+            let expected = format!("slack {prefix}…[redacted] end");
+            assert_eq!(super::redact_secrets(&input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn redact_secrets_leaves_legitimate_content_untouched() {
+        let cases = [
+            "plain prose with no credentials at all",
+            "short hex deadbeef and cafe1234",
+            "sk-learn is a python library",
+            "the ghp_test fixture name",
+            "AKIA alone or AKIAshort",
+            "let skill = risk-analysis - task;",
+            "Bearer short",
+            "a Bearer of bad news arrived with a verylongwordthatmeansnothinghere",
+            "fn sk_ant_parser() { /* code */ }",
+            "xoxb- trailing dash only",
+        ];
+        for input in cases {
+            assert_eq!(
+                super::redact_secrets(input),
+                input,
+                "false positive on: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_secrets_masks_multiple_occurrences_and_keeps_surroundings() {
+        let input = "first sk-ant-api03-abcdefghijklmnop123 then ghp_ABCDEFGHIJKLMNOPQRSTUV0123";
+        let output = super::redact_secrets(input);
+        assert_eq!(
+            output, "first sk-a…[redacted] then ghp_…[redacted]",
+            "both secrets must be masked independently"
+        );
+    }
+
+    #[test]
+    fn redact_secrets_bearer_requires_adjacent_space_separator() {
+        // Newline between `Bearer` and a long word must not trigger masking.
+        let input = "Bearer\nabcdefghijklmnopqrstuvwxyz0123456789";
+        assert_eq!(super::redact_secrets(input), input);
+    }
+
+    #[test]
+    fn jsonl_persistence_applies_prefix_based_redaction() {
+        let path = temp_session_path("prefix-redaction");
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage::tool_result(
+                "tool-1",
+                "bash",
+                format!("stdout mentions {secret} inline"),
+                false,
+            ))
+            .expect("tool result should append");
+
+        session.save_to_path(&path).expect("session should save");
+        let persisted = fs::read_to_string(&path).expect("session jsonl should read");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert!(
+            !persisted.contains(secret),
+            "prefix secret leaked into JSONL: {persisted}"
+        );
+        assert!(persisted.contains("sk-a…[redacted]"));
+
+        // In-memory content stays untouched: only the persisted line is masked.
+        let ContentBlock::ToolResult { output, .. } = &session.messages[0].blocks[0] else {
+            panic!("first message should be a tool result");
+        };
+        assert!(output.contains(secret));
     }
 
     #[test]
