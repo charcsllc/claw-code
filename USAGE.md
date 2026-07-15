@@ -481,7 +481,7 @@ El nombre "codex" aparece en el ecosistema de Claw Code pero **no** se refiere a
 - Los **directorios `.codex/`** (p. ej. `.codex/skills`, `.codex/agents`, `.codex/commands`) son rutas de búsqueda legadas que `claw` sigue escaneando junto a los directorios primarios `.claw/`.
 - **`CODEX_HOME`** es una variable de entorno opcional que apunta a una raíz personalizada para las búsquedas de skills y comandos a nivel de usuario.
 
-`claw` **no** soporta sesiones de OpenAI Codex, el Codex CLI ni la importación/exportación de sesiones de Codex. Si necesitas usar modelos de OpenAI (como GPT-4.1), configura el proveedor compatible con OpenAI como se muestra arriba en las secciones [Endpoint compatible con OpenAI](#openai-compatible-endpoint) y [OpenRouter](#openrouter).
+`claw` **no** soporta sesiones de OpenAI Codex, el Codex CLI ni la importación/exportación de sesiones de Codex. Si necesitas usar modelos de OpenAI (como GPT-4.1), configura el proveedor compatible con OpenAI como se muestra arriba en las secciones [Endpoint compatible con OpenAI](#endpoint-compatible-con-openai) y [OpenRouter](#openrouter).
 
 ## Soporte de proxy HTTP
 
