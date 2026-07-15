@@ -666,6 +666,22 @@ pub fn design_system_prompt(archetype: DesignArchetype, tokens_path: &str) -> St
     )
 }
 
+/// Visual-QA rubric plus the deterministic gate's unresolved findings: the
+/// agent starts from known failures instead of rediscovering them.
+#[must_use]
+pub fn visual_qa_prompt_with(gate_findings: &[String]) -> String {
+    let mut prompt = visual_qa_prompt();
+    if !gate_findings.is_empty() {
+        prompt.push_str(
+            "\n\nADEMÁS — the deterministic design gate already verified these \
+             failures (they are facts, not opinions); fix every one of them \
+             first:\n- ",
+        );
+        prompt.push_str(&gate_findings.join("\n- "));
+    }
+    prompt
+}
+
 /// Visual-QA rubric: a concrete checklist beats "review the UI".
 #[must_use]
 pub fn visual_qa_prompt() -> String {
@@ -1965,6 +1981,20 @@ mod tests {
         let brief = designer_planning_brief(DesignArchetype::Ecommerce);
         assert!(brief.contains("ecommerce"));
         assert!(brief.contains("WCAG AA"));
+    }
+
+    #[test]
+    fn visual_qa_prompt_leads_with_unresolved_gate_findings() {
+        let findings = vec![
+            "[CONTRASTE] par roto".to_string(),
+            "[A11Y] falta lang".to_string(),
+        ];
+        let prompt = visual_qa_prompt_with(&findings);
+        assert!(prompt.contains("[CONTRASTE] par roto"));
+        assert!(prompt.contains("[A11Y] falta lang"));
+        assert!(prompt.contains("facts, not opinions"));
+        // Without findings, the rubric stays untouched.
+        assert_eq!(visual_qa_prompt_with(&[]), visual_qa_prompt());
     }
 
     #[test]

@@ -63,11 +63,30 @@ pub enum Complexity {
 pub struct Plan {
     pub vision: String,
     pub scope: Vec<String>,
+    /// What this build deliberately does NOT include — the cheapest
+    /// scope-creep brake there is: agents honor an explicit "don't".
+    pub non_goals: Vec<String>,
     pub stack: StackDecision,
     pub epics: Vec<Epic>,
+    /// Real copy per page, decided up front: downstream agents that invent
+    /// headlines produce lorem-ipsum-grade filler the QA then has to catch.
+    pub page_content: Vec<PageContent>,
     pub milestones: Vec<String>,
     pub risks: Vec<String>,
     pub open_questions: Vec<String>,
+}
+
+/// The Director's real copy for one page: enough for developers to ship
+/// content-complete pages without inventing text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PageContent {
+    /// Route or page name ("/", "/pricing", "onboarding").
+    pub page: String,
+    pub headline: String,
+    pub subheadline: String,
+    /// Call-to-action labels, in priority order.
+    pub ctas: Vec<String>,
 }
 
 /// Stack decision: simple static project vs. full stack, with justification.
@@ -130,6 +149,10 @@ pub struct TaskSpec {
     pub constraints: Vec<String>,
     pub risks: Vec<String>,
     pub definition_of_done: Vec<String>,
+    /// Concrete click-through steps a human (or the QA agent) can follow to
+    /// verify the task works — "open /login, submit empty form, expect
+    /// inline errors" beats any abstract acceptance phrase.
+    pub manual_test: Vec<String>,
     pub priority: u32,
     pub complexity: Complexity,
     pub estimated_minutes: u32,
@@ -166,7 +189,7 @@ impl TaskSpec {
              ## Justification\n{justification}\n\
              {files_create}{files_modify}{interfaces}{functions}{models}{endpoints}\
              {dependencies}{libraries}{env}{edge}{validations}{errors}{logging}\
-             {tests}{constraints}{risks}{dod}\n\
+             {tests}{constraints}{risks}{dod}{manual}\n\
              ## Rules\n\
              - Work ONLY inside module `{module}` and the files listed above.\n\
              - Never touch files owned by other modules.\n\
@@ -195,6 +218,10 @@ impl TaskSpec {
             constraints = section("Constraints", &self.constraints),
             risks = section("Risks", &self.risks),
             dod = section("Definition of Done", &self.definition_of_done),
+            manual = section(
+                "Manual test (walk through it yourself before reporting)",
+                &self.manual_test,
+            ),
         )
     }
 }
@@ -284,6 +311,9 @@ pub struct SupervisionIssue {
     pub file: String,
     pub description: String,
     pub suggested_fix: String,
+    /// The exact offending line(s), quoted. An issue that cannot cite its
+    /// evidence is a hunch — the Fixer needs the former, not the latter.
+    pub evidence: String,
 }
 
 #[cfg(test)]
@@ -344,10 +374,47 @@ mod tests {
         spec.module = "cart".to_string();
         spec.functional_objective = "shopping cart".to_string();
         spec.definition_of_done = vec!["tests pass".to_string()];
+        spec.manual_test = vec!["open /cart".to_string(), "add an item".to_string()];
         let prompt = spec.render_prompt();
         assert!(prompt.contains("module `cart`"));
         assert!(prompt.contains("src/cart.ts"));
         assert!(prompt.contains("Never touch files owned by other modules"));
         assert!(prompt.contains("Definition of Done"));
+        // The click-through script reaches the developer verbatim.
+        assert!(prompt.contains("Manual test (walk through it yourself before reporting)"));
+        assert!(prompt.contains("open /cart"));
+    }
+
+    #[test]
+    fn plan_and_taskspec_load_json_from_before_the_new_fields() {
+        // Saved plan.json/state from older builds must keep loading (resume).
+        let old_plan = r#"{"vision": "v", "scope": ["s"], "stack": {"kind": "simple"},
+            "epics": [], "milestones": [], "risks": [], "open_questions": []}"#;
+        let plan: Plan = serde_json::from_str(old_plan).expect("old plan loads");
+        assert!(plan.non_goals.is_empty());
+        assert!(plan.page_content.is_empty());
+
+        let old_task = r#"{"id": "T1", "module": "m", "functional_objective": "f",
+            "technical_objective": "t", "justification": "j"}"#;
+        let spec: TaskSpec = serde_json::from_str(old_task).expect("old task loads");
+        assert!(spec.manual_test.is_empty());
+        // And an issue without evidence (old supervisor output) still parses.
+        let old_issue = r#"{"severity": "low", "file": "a.ts",
+            "description": "d", "suggested_fix": "s"}"#;
+        let issue: SupervisionIssue = serde_json::from_str(old_issue).expect("old issue loads");
+        assert!(issue.evidence.is_empty());
+    }
+
+    #[test]
+    fn director_plan_carries_real_page_copy_and_non_goals() {
+        let json = r#"{"vision": "v", "scope": [], "non_goals": ["no blog"],
+            "stack": {"kind": "simple"}, "epics": [],
+            "page_content": [{"page": "/", "headline": "Compra sin fricción",
+                "subheadline": "sub", "ctas": ["Empezar"]}],
+            "milestones": [], "risks": [], "open_questions": []}"#;
+        let plan: Plan = serde_json::from_str(json).expect("plan with copy loads");
+        assert_eq!(plan.non_goals, vec!["no blog".to_string()]);
+        assert_eq!(plan.page_content[0].headline, "Compra sin fricción");
+        assert_eq!(plan.page_content[0].ctas, vec!["Empezar".to_string()]);
     }
 }

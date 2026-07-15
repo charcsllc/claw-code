@@ -121,13 +121,19 @@ pub struct RunSummary {
 const DIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
 {
   "vision": "...", "scope": ["..."],
+  "non_goals": ["what this build deliberately does NOT include"],
   "stack": {"kind": "simple|fullstack", "frontend": [], "backend": [], "database": [],
              "orm": [], "auth": [], "platforms": [], "framework": [], "deploy": [],
              "justification": "..."},
   "epics": [{"name": "...", "stories": [{"as_a": "...", "i_want": "...", "so_that": "...",
              "acceptance_criteria": ["..."]}]}],
+  "page_content": [{"page": "/", "headline": "real copy, not placeholder",
+             "subheadline": "...", "ctas": ["primary CTA label"]}],
   "milestones": ["..."], "risks": ["..."], "open_questions": ["..."]
-}"#;
+}
+Write REAL, publishable copy in page_content for every page the scope implies —
+downstream agents use it verbatim; placeholder text there becomes lorem ipsum in
+the product. non_goals is binding: nothing listed there gets built."#;
 
 const SUBDIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
 {"tasks": [{
@@ -137,12 +143,15 @@ const SUBDIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced ob
   "endpoints": [], "libraries": ["lib@version"], "env_vars": [], "edge_cases": [],
   "validations": [], "error_handling": [], "logging": [], "tests_required": [],
   "constraints": [], "risks": [], "definition_of_done": ["..."],
+  "manual_test": ["open /login", "submit empty form", "expect inline errors"],
   "priority": 1, "complexity": "simple|medium|complex", "estimated_minutes": 30,
   "wave": 0, "depends_on": []
 }]}
 Rules: tasks MUST follow the architects' designs exactly (files, interfaces, names);
 modules must be independent; two tasks in the same wave must NEVER touch the same
-file; assign complexity honestly (it selects the AI model per task)."#;
+file; assign complexity honestly (it selects the AI model per task); every task
+carries a manual_test with CONCRETE click-through steps; never create a task for
+anything listed in the plan's non_goals."#;
 
 /// Process-global Ctrl+C state. The handler can only be installed once per
 /// process (a second install fails), so it must be shared across every
@@ -318,7 +327,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         // Phase 1: Director General.
         let director_task = if options.mode.is_improve() {
             format!(
-                "You are improving an EXISTING project.{repo_context}\n\nRequested \
+                "OUTPUT CONTRACT: reply with a single fenced ```json object and \
+                 nothing else (schema at the end).\n\n\
+                 You are improving an EXISTING project.{repo_context}\n\nRequested \
                  change:\n{}\n\nProduce a FOCUSED plan for THIS CHANGE ONLY — do not \
                  re-plan or rewrite the whole product. `vision` describes the change; \
                  `scope` lists exactly what will be touched; `stack` must reflect the \
@@ -329,7 +340,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             )
         } else {
             format!(
-                "User prompt:\n{}\n\nProduce the complete product plan.\n{}",
+                "OUTPUT CONTRACT: reply with a single fenced ```json object and \
+                 nothing else (schema at the end).\n\n\
+                 User prompt:\n{}\n\nProduce the complete product plan.\n{}",
                 options.prompt, DIRECTOR_JSON_SCHEMA
             )
         };
@@ -398,13 +411,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         let architect_roles = architects_for(options.kind, &plan);
         let mut architect_handles = Vec::new();
         for role in &architect_roles {
-            // The graphic designer gets a structured brief (archetype art
-            // direction + the 8 sections its document must cover); the
-            // generic "deliver your design document" left it rudderless.
+            // Every architect gets a structured brief with the mandatory
+            // sections its document must cover — the graphic designer's
+            // (archetype art direction + 8 sections) proved that a concrete
+            // checklist beats "deliver your design document" by a mile.
             let designer_brief = if *role == Role::UxUiDesigner {
                 crate::design::designer_planning_brief(effective_archetype(options, &plan))
             } else {
-                String::new()
+                crate::roles::architect_planning_brief(*role).to_string()
             };
             let handle = spawn_agent(
                 role.slug(),
@@ -451,7 +465,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         // Phase 3: Subdirector turns plan + designs into the backlog.
         workflow.phase("Subdirector Técnico: creando el backlog desde los diseños");
         let subdirector_prompt = format!(
-            "Approved plan:\n```json\n{plan_json}\n```{decisions}{repo_context}\n\n\
+            "OUTPUT CONTRACT: reply with a single fenced ```json object and nothing \
+             else (schema at the end).\n\n\
+             Approved plan:\n```json\n{plan_json}\n```{decisions}{repo_context}\n\n\
              Architect designs (authoritative):{designs_digest}\n\nBreak {} into \
              fully specified, parallelizable TaskSpecs that implement these \
              designs.{}\n{SUBDIRECTOR_JSON_SCHEMA}",
@@ -1103,7 +1119,8 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         //      rendered DOM. Computable failures never reach the (paid)
         //      visual-QA agent unfixed. Token discipline is only enforced
         //      on greenfield builds; /improve respects the user's CSS. ----
-        run_design_gate_phase(options, &workflow, &supervision_md, &docs, greenfield)?;
+        let leftover_findings =
+            run_design_gate_phase(options, &workflow, &supervision_md, &docs, greenfield)?;
 
         // ---- Visual QA: critique what actually rendered, not the source ----
         if docs.join("rendered-dom.html").exists() {
@@ -1112,7 +1129,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 Role::UxUiDesigner,
                 &options.catalog.supervisor,
                 options,
-                &crate::design::visual_qa_prompt(),
+                &crate::design::visual_qa_prompt_with(&leftover_findings),
             ) {
                 Ok(review) => {
                     save_doc(&docs, "visual-qa-report.md", &review.report)?;
@@ -1391,7 +1408,20 @@ fn spawn_developer(
          .env.example); sanitize user input; httpOnly cookies; strict CORS.\n\
          - Performance: route-level code-splitting, lazy-load heavy \
          components/images, no heavyweight dependencies for trivial work.\n\
-         - Accessibility: semantic landmarks, labeled form controls, alt text.",
+         - Accessibility: semantic landmarks, labeled form controls, alt text.\n\
+         - No dead UI, ever: no href=\"#\", no buttons without a working \
+         handler, no clickable <div>/<span>; if an interaction is out of \
+         scope, do not render the control.\n\n\
+         ## Before you report (mandatory)\n\
+         1. RUN the project's build (and lint, if configured) yourself. If it \
+         fails, fix it — never report success over a broken build.\n\
+         2. Walk through the Manual test steps above if present.\n\n\
+         ## Report format (your final message)\n\
+         - `## Files touched` — every file created/modified.\n\
+         - `## Decisions` — anything the spec did not cover, with a one-line \
+         justification each.\n\
+         - `## Left out` — anything you consciously did not do, and why.\n\
+         - `## Build output` — the tail of the build/lint run you executed.",
     );
     if let Some(failure) = verification_failure {
         let _ = write!(
@@ -1965,18 +1995,20 @@ fn run_security_gate(
 /// Deterministic design audit (token contrast + rendered-DOM a11y) with the
 /// same shape as the security gate: findings go to SUPERVISION.md and one
 /// Fixer pass repairs them.
+/// Returns the findings that remain AFTER the fixer round, so the visual-QA
+/// agent can receive them as explicit input instead of rediscovering them.
 fn run_design_gate_phase(
     options: &RunOptions,
     workflow: &WorkflowLog,
     supervision_md: &Path,
     docs: &Path,
     require_tokens: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     workflow.phase("Gate de diseño: contraste WCAG y accesibilidad del DOM renderizado");
     let findings = crate::design::run_design_gate(&options.project_dir, docs, require_tokens);
     if findings.is_empty() {
         workflow.phase("  diseño: OK");
-        return Ok(());
+        return Ok(Vec::new());
     }
     workflow.phase(&format!(
         "  diseño: {} hallazgo(s) → despachando Técnico",
@@ -2011,7 +2043,13 @@ fn run_design_gate_phase(
             workflow.phase(&format!("  aviso: Fixer de diseño no disponible ({error})"));
         }
     }
-    Ok(())
+    // Whatever the fixer could not (or did not) resolve flows into the
+    // visual-QA prompt as explicit targets.
+    Ok(crate::design::run_design_gate(
+        &options.project_dir,
+        docs,
+        require_tokens,
+    ))
 }
 
 // ---------- Performance budget ----------
@@ -3049,11 +3087,52 @@ fn truncate_chars(text: &str, max: usize) -> String {
 
 /// Spawns the Supervisor for one delivery WITHOUT waiting: verdicts are
 /// polled by the scheduler so reviews overlap ongoing development.
+/// Gathers the reviewable evidence for a delivery: the real `git diff` of
+/// the task's modified files plus the content of newly created ones. A
+/// supervisor told to "inspect the repository" may or may not look; one
+/// handed the actual diff reviews what actually changed.
+fn supervisor_evidence(project_dir: &Path, task: &TaskSpec) -> String {
+    let mut evidence = String::new();
+    if !task.files_to_modify.is_empty() {
+        let mut args: Vec<&str> = vec!["diff", "HEAD", "--"];
+        args.extend(task.files_to_modify.iter().map(String::as_str));
+        if let Ok(output) = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(project_dir)
+            .output()
+        {
+            let diff = String::from_utf8_lossy(&output.stdout);
+            if !diff.trim().is_empty() {
+                let _ = write!(
+                    evidence,
+                    "\n\n## Diff of modified files\n```diff\n{}\n```",
+                    truncate_chars(&diff, 8_000)
+                );
+            }
+        }
+    }
+    let mut new_files = String::new();
+    for file in task.files_to_create.iter().take(8) {
+        if let Ok(contents) = std::fs::read_to_string(project_dir.join(file)) {
+            let _ = write!(
+                new_files,
+                "\n### {file}\n```\n{}\n```",
+                truncate_chars(&contents, 3_000)
+            );
+        }
+    }
+    if !new_files.is_empty() {
+        let _ = write!(evidence, "\n\n## New files created{new_files}");
+    }
+    evidence
+}
+
 fn spawn_supervisor(
     options: &RunOptions,
     task: &TaskSpec,
     delivery: &AgentResult,
 ) -> Result<AgentHandle, String> {
+    let evidence = supervisor_evidence(&options.project_dir, task);
     spawn_agent(
         &format!("sup-{}", task.id),
         Role::Supervisor.title(),
@@ -3062,13 +3141,18 @@ fn spawn_supervisor(
         &system_prompt(Role::Supervisor, options.kind),
         &format!(
             "Task delivered:\n```json\n{}\n```\n\nDeveloper report:\n{}\n\nDelivery \
-             status: {}. Inspect the repository files this task touched. Evaluate \
-             quality, architecture, conventions, duplication and coverage. \
+             status: {}.{evidence}\n\nThe diff/new files above are the primary \
+             evidence — review THEM (open other repository files only to check \
+             conventions or duplication). Evaluate quality, architecture, \
+             conventions, duplication and coverage. \
              Mandatory security lens: XSS, injection (SQL/command), authorization \
              gaps, hardcoded secrets, unsafe CORS/CSP, cookies without httpOnly.\n\
              Respond with ```json {{\"approved\": bool, \"summary\": \"...\", \
              \"issues\": [{{\"severity\": \"low|medium|high\", \"file\": \"...\", \
-             \"description\": \"...\", \"suggested_fix\": \"...\"}}]}} ```",
+             \"description\": \"...\", \"suggested_fix\": \"...\", \
+             \"evidence\": \"the exact offending line(s), quoted\"}}]}} ```\n\
+             Every issue MUST quote its evidence; an issue you cannot back with a \
+             quoted line does not go in the list.",
             serde_json::to_string(task).unwrap_or_default(),
             delivery.report,
             delivery.status,
@@ -3121,6 +3205,9 @@ fn process_supervision(
             "- [{}] `{}` — {} (fix: {})",
             issue.severity, issue.file, issue.description, issue.suggested_fix
         );
+        if !issue.evidence.trim().is_empty() {
+            let _ = writeln!(entry, "  - evidencia: `{}`", issue.evidence.trim());
+        }
     }
     append_file(supervision_md, &entry)?;
 
@@ -3554,6 +3641,37 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    #[test]
+    fn planning_schemas_demand_copy_non_goals_manual_tests_and_evidence() {
+        // Director: real page copy + binding non-goals.
+        assert!(DIRECTOR_JSON_SCHEMA.contains("\"non_goals\""));
+        assert!(DIRECTOR_JSON_SCHEMA.contains("\"page_content\""));
+        assert!(DIRECTOR_JSON_SCHEMA.contains("REAL, publishable copy"));
+        // Subdirector: click-through script per task, non-goals enforced.
+        assert!(SUBDIRECTOR_JSON_SCHEMA.contains("\"manual_test\""));
+        assert!(SUBDIRECTOR_JSON_SCHEMA.contains("non_goals"));
+    }
+
+    #[test]
+    fn supervisor_evidence_includes_new_file_contents_and_skips_missing() {
+        let dir = improve_temp_dir("evidence");
+        std::fs::create_dir_all(dir.join("src")).expect("src dir");
+        std::fs::write(dir.join("src/nuevo.ts"), "export const x = 1;\n").expect("write");
+        let task = TaskSpec {
+            id: "T1".to_string(),
+            files_to_create: vec!["src/nuevo.ts".to_string(), "src/no-existe.ts".to_string()],
+            ..TaskSpec::default()
+        };
+        let evidence = supervisor_evidence(&dir, &task);
+        assert!(evidence.contains("## New files created"));
+        assert!(evidence.contains("src/nuevo.ts"));
+        assert!(evidence.contains("export const x = 1;"));
+        assert!(!evidence.contains("no-existe"));
+        // No git repo + no modified files → no diff section, no panic.
+        assert!(!evidence.contains("## Diff of modified files"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
