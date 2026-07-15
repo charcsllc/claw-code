@@ -289,7 +289,14 @@ ${COLOR_DIM}---------------${COLOR_RESET}
 EOF
 }
 
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then error "installation failed (exit ${rc})"; print_troubleshooting; fi' EXIT
+on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        error "installation failed (exit ${rc})"
+        print_troubleshooting
+    fi
+}
+trap on_exit EXIT
 
 # ---------------------------------------------------------------------------
 # Helpers
