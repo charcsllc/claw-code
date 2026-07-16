@@ -1,0 +1,17 @@
+Respond with a single ```json fenced object:
+{"tasks": [{
+  "id": "T1", "module": "auth", "functional_objective": "...", "technical_objective": "...",
+  "justification": "...", "files_to_create": ["src/auth/login.ts"], "files_to_modify": [],
+  "interfaces": ["..."], "functions": ["exact signatures"], "data_models": [],
+  "endpoints": [], "libraries": ["lib@version"], "env_vars": [], "edge_cases": [],
+  "validations": [], "error_handling": [], "logging": [], "tests_required": [],
+  "constraints": [], "risks": [], "definition_of_done": ["..."],
+  "manual_test": ["open /login", "submit empty form", "expect inline errors"],
+  "priority": 1, "complexity": "simple|medium|complex", "estimated_minutes": 30,
+  "wave": 0, "depends_on": []
+}]}
+Rules: tasks MUST follow the architects' designs exactly (files, interfaces, names);
+modules must be independent; two tasks in the same wave must NEVER touch the same
+file; assign complexity honestly (it selects the AI model per task); every task
+carries a manual_test with CONCRETE click-through steps; never create a task for
+anything listed in the plan's non_goals.

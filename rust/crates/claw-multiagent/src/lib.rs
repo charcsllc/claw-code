@@ -26,6 +26,7 @@ pub mod agents;
 pub mod catalog;
 pub mod contracts;
 pub mod design;
+pub mod lessons;
 pub mod orchestrator;
 pub mod roles;
 

@@ -45,6 +45,15 @@ impl BuildMode {
     pub const fn is_improve(self) -> bool {
         matches!(self, Self::Improve)
     }
+
+    /// Machine-readable name (used by `docs/build-report.json`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Greenfield => "greenfield",
+            Self::Improve => "improve",
+        }
+    }
 }
 
 /// Task complexity drives the model tier that executes it.

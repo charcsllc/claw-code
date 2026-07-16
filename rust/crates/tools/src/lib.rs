@@ -8,8 +8,8 @@ use aspect_std::LoggingAspect;
 
 use api::{
     max_tokens_for_model, model_family_identity_for, resolve_model_alias, AnalyticsEvent, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, JsonlTelemetrySink, MessageRequest,
-    MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
+    ContentBlockDelta, ImageAttachment, InputContentBlock, InputMessage, JsonlTelemetrySink,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -677,7 +677,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "images": {
+                        "type": "array",
+                        "description": "Base64 images attached to the agent's initial message (max 4, max 1.5 MB base64 each).",
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "media_type": { "type": "string" },
+                                "base64_data": { "type": "string" }
+                            },
+                            "required": ["media_type", "base64_data"],
+                            "additionalProperties": false
+                        }
+                    }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -2837,6 +2851,52 @@ struct AgentInput {
     model: Option<String>,
     /// Module isolation: restrict file-writing tools to these path prefixes.
     allowed_write_paths: Option<Vec<String>>,
+    /// Base64 images attached to the agent's initial user message (visual
+    /// QA hand-off). Capped by [`validate_agent_images`].
+    images: Option<Vec<AgentImageInput>>,
+}
+
+/// One base64 image handed to a sub-agent through the `Agent` tool input.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct AgentImageInput {
+    media_type: String,
+    base64_data: String,
+}
+
+/// Defensive caps for `Agent` tool image attachments: more images or bigger
+/// payloads than this and the sub-agent request would blow provider body
+/// limits long before producing value.
+const MAX_AGENT_IMAGES: usize = 4;
+const MAX_AGENT_IMAGE_BASE64_BYTES: usize = 3 * 512 * 1024; // 1.5 MB
+
+/// Validates `Agent` tool image attachments against the defensive caps,
+/// returning a clear, field-indexed error message on the first violation.
+fn validate_agent_images(images: &[AgentImageInput]) -> Result<(), String> {
+    if images.len() > MAX_AGENT_IMAGES {
+        return Err(format!(
+            "images: at most {MAX_AGENT_IMAGES} images are allowed per agent, got {}",
+            images.len()
+        ));
+    }
+    for (index, image) in images.iter().enumerate() {
+        if !image.media_type.starts_with("image/") {
+            return Err(format!(
+                "images[{index}]: media_type must be an image/* MIME type, got `{}`",
+                image.media_type
+            ));
+        }
+        if image.base64_data.trim().is_empty() {
+            return Err(format!("images[{index}]: base64_data must not be empty"));
+        }
+        if image.base64_data.len() > MAX_AGENT_IMAGE_BASE64_BYTES {
+            return Err(format!(
+                "images[{index}]: base64 payload is {} bytes, above the \
+                 {MAX_AGENT_IMAGE_BASE64_BYTES}-byte (1.5 MB) per-image limit",
+                image.base64_data.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3223,6 +3283,8 @@ struct AgentOutput {
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
+    /// Validated image attachments for the job's opening user message.
+    images: Vec<AgentImageInput>,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
     allowed_write_paths: Vec<PathBuf>,
@@ -4105,6 +4167,10 @@ where
     if input.prompt.trim().is_empty() {
         return Err(String::from("prompt must not be empty"));
     }
+    // Enforce image caps before any disk state is created so an oversized
+    // request leaves no half-written manifest behind.
+    let images = input.images.unwrap_or_default();
+    validate_agent_images(&images)?;
 
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
@@ -4170,6 +4236,7 @@ where
     let job = AgentJob {
         manifest: manifest_for_spawn,
         prompt: input.prompt,
+        images,
         system_prompt,
         allowed_tools,
         allowed_write_paths: input
@@ -4186,6 +4253,70 @@ where
     }
 
     Ok(manifest)
+}
+
+/// Process-wide queue of one-line notices emitted when a background agent
+/// job reaches a terminal state (`completed`/`failed`/`cancelled`). The REPL
+/// drains it between prompts via [`take_agent_notices`] to print
+/// "agent finished" lines without polling manifests.
+static AGENT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Agent ids that already produced their terminal notice. Terminal
+/// persistence can legitimately run twice for one job (e.g. an explicit stop
+/// races the job thread's own failure path); only the first transition
+/// should notify.
+static NOTIFIED_TERMINAL_AGENT_IDS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Oldest notices are discarded once the queue holds this many entries, so
+/// an unattended REPL session cannot accumulate unbounded strings.
+const AGENT_NOTICES_CAP: usize = 50;
+
+/// Shortened form of `agent-<nanos>` ids for terminal notices: the
+/// `agent-` prefix is dropped and the remainder is capped at 8 characters
+/// (respecting UTF-8 boundaries for externally-produced ids).
+fn short_agent_id(agent_id: &str) -> &str {
+    let bare = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    match bare.char_indices().nth(8) {
+        Some((byte_index, _)) => &bare[..byte_index],
+        None => bare,
+    }
+}
+
+/// Queues the terminal notice for one agent job, deduplicated per agent id
+/// and capped at [`AGENT_NOTICES_CAP`] entries (oldest dropped first).
+fn push_agent_notice(agent_id: &str, name: &str, status: &str) {
+    let mut notified = NOTIFIED_TERMINAL_AGENT_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !notified.insert(agent_id.to_string()) {
+        return;
+    }
+    let symbol = if status == "completed" { "✔" } else { "✘" };
+    let notice = format!(
+        "{symbol} agente {} ({name}) → {status}",
+        short_agent_id(agent_id)
+    );
+    let mut notices = AGENT_NOTICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    notices.push(notice);
+    if notices.len() > AGENT_NOTICES_CAP {
+        let excess = notices.len() - AGENT_NOTICES_CAP;
+        notices.drain(..excess);
+    }
+}
+
+/// Drains and returns all queued terminal notices for background agent
+/// jobs, oldest first. Intended for the interactive REPL loop, which prints
+/// them between prompts.
+#[must_use]
+pub fn take_agent_notices() -> Vec<String> {
+    std::mem::take(
+        &mut *AGENT_NOTICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// Process-global registry of cooperative cancellation flags for running
@@ -4275,10 +4406,30 @@ fn run_agent_job(
         .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
         .with_cancellation_flag(std::sync::Arc::clone(cancel_flag));
     let summary = runtime
-        .run_turn(job.prompt.clone(), None)
+        .run_turn_message(agent_initial_message(&job.prompt, &job.images), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+}
+
+/// Builds the sub-agent's opening user message: image attachments first
+/// (matching the provider serialization order), then the prompt text.
+fn agent_initial_message(prompt: &str, images: &[AgentImageInput]) -> ConversationMessage {
+    let mut blocks: Vec<ContentBlock> = images
+        .iter()
+        .map(|image| ContentBlock::Image {
+            media_type: image.media_type.clone(),
+            base64_data: image.base64_data.clone(),
+        })
+        .collect();
+    blocks.push(ContentBlock::Text {
+        text: prompt.to_string(),
+    });
+    ConversationMessage {
+        role: MessageRole::User,
+        blocks,
+        usage: None,
+    }
 }
 
 fn build_agent_runtime(
@@ -4440,6 +4591,9 @@ fn persist_agent_terminal_state(
     result: Option<&str>,
     error: Option<String>,
 ) -> Result<(), String> {
+    // Notify before touching disk so the REPL learns about the terminal
+    // transition even when manifest/output persistence fails below.
+    push_agent_notice(&manifest.agent_id, &manifest.name, status);
     if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
         let event = if status == "completed" {
             AnalyticsEvent::agent_finished(&manifest.agent_id)
@@ -5604,13 +5758,22 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    // Only the most recent user turn re-sends real image payloads: that is
+    // the turn the model is being asked about, and re-uploading megabytes of
+    // base64 for every older message would balloon each request. Earlier
+    // image blocks degrade to their size placeholder.
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::User);
     messages
         .iter()
-        .filter_map(|message| {
+        .enumerate()
+        .filter_map(|(index, message)| {
             let role = match message.role {
                 MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
             };
+            let images_travel = last_user_index == Some(index);
             let content = message
                 .blocks
                 .iter()
@@ -5641,6 +5804,24 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::Image {
+                        media_type,
+                        base64_data,
+                    } => {
+                        if images_travel {
+                            InputContentBlock::from(ImageAttachment {
+                                media_type: media_type.clone(),
+                                base64_data: base64_data.clone(),
+                            })
+                        } else {
+                            InputContentBlock::Text {
+                                text: runtime::image_placeholder_text(
+                                    media_type,
+                                    base64_data.len(),
+                                ),
+                            }
+                        }
+                    }
                 })
                 .filter(
                     |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
@@ -7342,6 +7523,355 @@ mod tests {
                  tool: nested agents would allow unbounded recursion"
             );
         }
+    }
+
+    #[test]
+    fn agent_input_parses_optional_images_field() {
+        let input: AgentInput = serde_json::from_value(json!({
+            "description": "Visual QA",
+            "prompt": "Compare the screenshot against the spec.",
+            "images": [
+                { "media_type": "image/png", "base64_data": "aGVsbG8=" },
+                { "media_type": "image/jpeg", "base64_data": "d29ybGQ=" }
+            ]
+        }))
+        .expect("images payload should deserialize");
+
+        let images = input.images.expect("images should be present");
+        assert_eq!(
+            images,
+            vec![
+                super::AgentImageInput {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                super::AgentImageInput {
+                    media_type: "image/jpeg".to_string(),
+                    base64_data: "d29ybGQ=".to_string(),
+                },
+            ]
+        );
+
+        // Legacy payloads without the field keep parsing.
+        let legacy: AgentInput = serde_json::from_value(json!({
+            "description": "No images",
+            "prompt": "text only"
+        }))
+        .expect("legacy payload should deserialize");
+        assert!(legacy.images.is_none());
+
+        // The advertised tool schema exposes the new field with its cap.
+        let specs = mvp_tool_specs();
+        let agent_spec = specs
+            .iter()
+            .find(|spec| spec.name == "Agent")
+            .expect("Agent tool spec exists");
+        assert_eq!(
+            agent_spec.input_schema["properties"]["images"]["maxItems"],
+            json!(4)
+        );
+    }
+
+    #[test]
+    fn validate_agent_images_enforces_defensive_caps() {
+        let ok_image = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "aGVsbG8=".to_string(),
+        };
+        assert_eq!(
+            super::validate_agent_images(std::slice::from_ref(&ok_image)),
+            Ok(())
+        );
+
+        let five = vec![ok_image.clone(); 5];
+        let error = super::validate_agent_images(&five).expect_err("five images exceed the cap");
+        assert!(
+            error.contains("at most 4 images") && error.contains("got 5"),
+            "count error should be self-explanatory: {error}"
+        );
+
+        let oversized = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "A".repeat(super::MAX_AGENT_IMAGE_BASE64_BYTES + 1),
+        };
+        let error = super::validate_agent_images(&[ok_image.clone(), oversized])
+            .expect_err("oversized payload must be rejected");
+        assert!(
+            error.contains("images[1]") && error.contains("1.5 MB"),
+            "size error should point at the offending image: {error}"
+        );
+
+        let not_an_image = super::AgentImageInput {
+            media_type: "application/pdf".to_string(),
+            base64_data: "aGVsbG8=".to_string(),
+        };
+        let error = super::validate_agent_images(&[not_an_image])
+            .expect_err("non-image MIME types must be rejected");
+        assert!(error.contains("image/*"), "media type error: {error}");
+
+        let empty = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "   ".to_string(),
+        };
+        let error =
+            super::validate_agent_images(&[empty]).expect_err("blank payloads must be rejected");
+        assert!(error.contains("must not be empty"), "empty error: {error}");
+    }
+
+    /// Cap violations must be rejected before any store IO, so no agent id,
+    /// manifest, or output file is minted for an invalid request (this also
+    /// lets the test run without a CLAWD_AGENT_STORE override).
+    #[test]
+    fn execute_agent_rejects_over_cap_images_before_creating_state() {
+        let images: Vec<super::AgentImageInput> = (0..5)
+            .map(|index| super::AgentImageInput {
+                media_type: "image/png".to_string(),
+                base64_data: format!("cGF5bG9hZC0{index}"),
+            })
+            .collect();
+        let error = execute_agent_with_spawn(
+            AgentInput {
+                description: "Visual QA".to_string(),
+                prompt: "look at these".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                allowed_write_paths: None,
+                images: Some(images),
+            },
+            |_job| panic!("spawn must not be reached when validation fails"),
+        )
+        .expect_err("five images must be rejected");
+        assert!(error.contains("at most 4 images"), "error: {error}");
+    }
+
+    /// The job's opening user message carries image blocks first, then the
+    /// prompt text, matching the provider serialization order.
+    #[test]
+    fn agent_initial_message_orders_images_before_prompt_text() {
+        let message = super::agent_initial_message(
+            "compare against the mock",
+            &[super::AgentImageInput {
+                media_type: "image/png".to_string(),
+                base64_data: "aGVsbG8=".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, runtime::MessageRole::User);
+        assert_eq!(
+            message.blocks,
+            vec![
+                runtime::ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                runtime::ContentBlock::Text {
+                    text: "compare against the mock".to_string(),
+                },
+            ]
+        );
+
+        // Without images the message is exactly the classic text-only turn.
+        let text_only = super::agent_initial_message("just text", &[]);
+        assert_eq!(
+            text_only,
+            runtime::ConversationMessage::user_text("just text")
+        );
+    }
+
+    /// Adapter contract: only the most recent user message re-sends real
+    /// image attachments; older image blocks degrade to size placeholders.
+    #[test]
+    fn convert_messages_forwards_only_last_user_images_as_attachments() {
+        use api::InputContentBlock;
+
+        let old_payload = "b2xk".repeat(512); // 2 KiB
+        let messages = vec![
+            runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![
+                    runtime::ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: old_payload.clone(),
+                    },
+                    runtime::ContentBlock::Text {
+                        text: "first screenshot".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "looks fine".to_string(),
+            }]),
+            runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![
+                    runtime::ContentBlock::Image {
+                        media_type: "image/jpeg".to_string(),
+                        base64_data: "bmV3".to_string(),
+                    },
+                    runtime::ContentBlock::Text {
+                        text: "second screenshot".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+        ];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 3);
+
+        // Older user message: image degraded to its placeholder text.
+        assert_eq!(
+            converted[0].content[0],
+            InputContentBlock::Text {
+                text: "[imagen adjunta: image/png, 2 KB]".to_string(),
+            }
+        );
+        // Latest user message: image travels as a real attachment block.
+        assert_eq!(
+            converted[2].content[0],
+            InputContentBlock::from(api::ImageAttachment {
+                media_type: "image/jpeg".to_string(),
+                base64_data: "bmV3".to_string(),
+            })
+        );
+        assert_eq!(
+            converted[2].content[1],
+            InputContentBlock::Text {
+                text: "second screenshot".to_string(),
+            }
+        );
+    }
+
+    fn notice_manifest_fixture(label: &str) -> AgentOutput {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = temp_path(&format!("notices-{label}"));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let output_file = dir.join("out.md");
+        fs::write(&output_file, "# agent output\n").expect("fixture output file");
+        AgentOutput {
+            agent_id: format!("agent-{nanos}-{label}"),
+            name: format!("{label}-name"),
+            description: "notice fixture".to_string(),
+            subagent_type: None,
+            model: None,
+            status: "running".to_string(),
+            output_file: output_file.display().to_string(),
+            manifest_file: dir.join("manifest.json").display().to_string(),
+            created_at: "2026-07-16T00:00:00Z".to_string(),
+            started_at: None,
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        }
+    }
+
+    /// Reaching a terminal state queues exactly one notice per agent id
+    /// (dedup guards the stop-request/thread-failure double persist), and
+    /// `take_agent_notices` drains the queue.
+    #[test]
+    fn terminal_agent_transitions_queue_notices_once_and_drain() {
+        let completed = notice_manifest_fixture("done");
+        let failed = notice_manifest_fixture("boom");
+        let cancelled = notice_manifest_fixture("halt");
+
+        persist_agent_terminal_state(&completed, "completed", Some("all good"), None)
+            .expect("completed state persists");
+        persist_agent_terminal_state(&failed, "failed", None, Some("exploded".to_string()))
+            .expect("failed state persists");
+        persist_agent_terminal_state(&cancelled, "cancelled", None, Some("stop".to_string()))
+            .expect("cancelled state persists");
+        // Double persistence for an already-terminal agent must not notify twice.
+        persist_agent_terminal_state(&completed, "failed", None, Some("late".to_string()))
+            .expect("re-persist is tolerated");
+
+        let notices = super::take_agent_notices();
+        let expected_completed = format!(
+            "✔ agente {} ({}) → completed",
+            super::short_agent_id(&completed.agent_id),
+            completed.name
+        );
+        let expected_failed = format!(
+            "✘ agente {} ({}) → failed",
+            super::short_agent_id(&failed.agent_id),
+            failed.name
+        );
+        let expected_cancelled = format!(
+            "✘ agente {} ({}) → cancelled",
+            super::short_agent_id(&cancelled.agent_id),
+            cancelled.name
+        );
+        assert!(notices.contains(&expected_completed), "{notices:?}");
+        assert!(notices.contains(&expected_failed), "{notices:?}");
+        assert!(notices.contains(&expected_cancelled), "{notices:?}");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains(&completed.name))
+                .count(),
+            1,
+            "dedup must keep a single notice per agent id: {notices:?}"
+        );
+
+        // Drained: a second take returns none of the notices above.
+        let drained = super::take_agent_notices();
+        assert!(
+            !drained.contains(&expected_completed)
+                && !drained.contains(&expected_failed)
+                && !drained.contains(&expected_cancelled),
+            "take_agent_notices must drain: {drained:?}"
+        );
+    }
+
+    /// The queue keeps at most 50 notices, discarding the oldest first.
+    /// Assertions are containment-based so concurrently running agent tests
+    /// (which also push notices) cannot make this flaky.
+    #[test]
+    fn agent_notices_cap_discards_oldest_entries() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let marker = format!("cap-{nanos}");
+        for index in 0..55 {
+            super::push_agent_notice(
+                &format!("agent-{marker}-{index}"),
+                &format!("{marker}-{index}"),
+                "completed",
+            );
+        }
+
+        let notices = super::take_agent_notices();
+        assert!(
+            notices.len() <= super::AGENT_NOTICES_CAP,
+            "queue must never exceed the cap: {}",
+            notices.len()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains(&format!("{marker}-54"))),
+            "newest notice must survive: {notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains(&format!("({marker}-0)"))),
+            "oldest notices past the cap must be discarded: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn short_agent_id_strips_prefix_and_caps_length() {
+        assert_eq!(super::short_agent_id("agent-1234567890123"), "12345678");
+        assert_eq!(super::short_agent_id("agent-42"), "42");
+        assert_eq!(super::short_agent_id("custom"), "custom");
     }
 
     /// Contract: even a direct `Agent` invocation against a sub-agent's tool
@@ -9514,6 +10044,7 @@ mod tests {
                 name: Some("traced-agent".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |_job| Ok(()),
         )
@@ -9568,6 +10099,7 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9650,6 +10182,7 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9708,6 +10241,7 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9756,6 +10290,7 @@ mod tests {
                 name: Some("summary-floor".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9802,6 +10337,7 @@ mod tests {
                 name: Some("recovery-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9851,6 +10387,7 @@ mod tests {
                 name: Some("review-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9892,6 +10429,7 @@ mod tests {
                 name: Some("backlog-scan".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9939,6 +10477,7 @@ mod tests {
                 name: Some("artifact-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10010,6 +10549,7 @@ mod tests {
                 name: Some("cron-closeout".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -10052,6 +10592,7 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |_| Err(String::from("thread creation failed")),
         )

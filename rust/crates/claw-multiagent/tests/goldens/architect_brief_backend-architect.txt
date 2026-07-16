@@ -1,0 +1,9 @@
+
+
+Your design document MUST contain these sections, each with concrete values:
+1. Endpoint table: method, path, auth requirement, request DTO, response DTO, error codes — one row per endpoint, NO exceptions.
+2. Data model: every entity with fields, types, relations and indexes (text ERD).
+3. Validation: which layer validates what, with the library named.
+4. AuthN/AuthZ: token/session mechanism, where checks happen, role model if any.
+5. Error contract: the exact JSON error envelope every endpoint returns.
+6. Migrations & seed strategy: tool, naming, how dev data is seeded.

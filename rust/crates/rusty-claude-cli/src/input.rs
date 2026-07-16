@@ -189,6 +189,16 @@ impl LineEditor {
         }
     }
 
+    /// A handle other threads can use to print lines WHILE `read_line` is
+    /// active — rustyline redraws the edit buffer underneath, so the notice
+    /// lands above the prompt instead of corrupting it. `None` off-TTY.
+    pub fn external_printer(&mut self) -> Option<impl rustyline::ExternalPrinter + Send + 'static> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return None;
+        }
+        self.editor.create_external_printer().ok()
+    }
+
     pub fn read_line(&mut self) -> io::Result<ReadOutcome> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return self.read_line_fallback();

@@ -118,7 +118,9 @@ pub struct RunSummary {
     pub base_branch: Option<String>,
 }
 
-const DIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
+/// The Director's output contract. Public because the prompt-golden tests
+/// snapshot it: a diff on the golden file IS the prompt review.
+pub const DIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
 {
   "vision": "...", "scope": ["..."],
   "non_goals": ["what this build deliberately does NOT include"],
@@ -135,7 +137,8 @@ Write REAL, publishable copy in page_content for every page the scope implies �
 downstream agents use it verbatim; placeholder text there becomes lorem ipsum in
 the product. non_goals is binding: nothing listed there gets built."#;
 
-const SUBDIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
+/// The Subdirector's output contract. Public for the prompt-golden tests.
+pub const SUBDIRECTOR_JSON_SCHEMA: &str = r#"Respond with a single ```json fenced object:
 {"tasks": [{
   "id": "T1", "module": "auth", "functional_objective": "...", "technical_objective": "...",
   "justification": "...", "files_to_create": ["src/auth/login.ts"], "files_to_modify": [],
@@ -246,6 +249,9 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     }
 
     let abort_guard = BuildGuard::new();
+    // Wall-clock start for docs/build-report.json (no absolute timestamps:
+    // a duration keeps the report deterministic enough to test).
+    let run_started = Instant::now();
 
     let workflow = WorkflowLog::new();
     workflow.event(
@@ -296,6 +302,8 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // the sequential phase boundaries below. Inactive without telemetry.
     let mut role_ledger = RoleSpendLedger::default();
     let mut spend_cursor = budget.spent().unwrap_or(0.0);
+    // The 80% budget warning fires once per run.
+    let mut budget_warned = false;
 
     if let Some(archetype) = options.archetype {
         workflow.phase(&format!(
@@ -403,6 +411,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             "Director",
             &workflow,
         );
+        enforce_budget_checkpoint(&budget, &mut budget_warned, &workflow, &options.project_dir)?;
         let plan_json = serde_json::to_string(&plan).unwrap_or_default();
 
         // Phase 2: Architects design BEFORE the backlog exists, so TaskSpecs
@@ -461,6 +470,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             "Arquitectos",
             &workflow,
         );
+        enforce_budget_checkpoint(&budget, &mut budget_warned, &workflow, &options.project_dir)?;
 
         // Phase 3: Subdirector turns plan + designs into the backlog.
         workflow.phase("Subdirector Técnico: creando el backlog desde los diseños");
@@ -530,6 +540,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             "Subdirector",
             &workflow,
         );
+        enforce_budget_checkpoint(&budget, &mut budget_warned, &workflow, &options.project_dir)?;
 
         (plan, tasks)
     };
@@ -697,6 +708,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     if greenfield {
         record_phase(&options.project_dir, PHASE_FOUNDATION);
     }
+    enforce_budget_checkpoint(&budget, &mut budget_warned, &workflow, &options.project_dir)?;
 
     // ---- Developer waves + Supervisor per delivery ----
     let mut state = BuildState::load(&options.project_dir);
@@ -743,6 +755,14 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     let mut busy: BTreeSet<usize> = BTreeSet::new();
     let mut devs: Vec<DevSlot> = Vec::new();
     let mut sups: Vec<SupSlot> = Vec::new();
+    // The catalog every agent from here on uses. It diverges from
+    // `options.catalog` only when the opt-in provider failover
+    // (CLAW_MA_FAILOVER) remaps it after repeated provider outages.
+    let mut active_catalog = options.catalog.clone();
+    // Consecutive provider-outage failures (5xx/overloaded); any success or
+    // non-outage failure breaks the streak.
+    let mut outage_streak = 0_usize;
+    let mut failover_attempted = false;
 
     'scheduler: loop {
         if abort_guard.aborted() {
@@ -766,7 +786,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 break;
             };
             let task = &tasks[task_index];
-            let model = options.catalog.model_for(task.complexity);
+            let model = active_catalog.model_for(task.complexity);
             let context = render_wave_context(&built_context);
             let handle = spawn_developer(options, task, model, &context, None)?;
             workflow.phase(&format!(
@@ -842,6 +862,17 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             };
             let task = &tasks[slot.task_index];
             workflow.phase(&format!("  entrega {} → {}", result.name, result.status));
+            // Provider-outage bookkeeping uses the ORIGINAL delivery status:
+            // a quick-check failure below is a code problem, not an outage.
+            track_provider_outages(
+                &mut outage_streak,
+                &mut failover_attempted,
+                &mut active_catalog,
+                result.succeeded(),
+                result.error.as_deref(),
+                &workflow,
+                &supervision_md,
+            );
 
             // Per-delivery quick check (#4): a broken module is caught the
             // moment it lands, not at the end of the whole build. Failures
@@ -864,7 +895,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             let delivery_failed = !result.succeeded() || check_failure.is_some();
             if delivery_failed && !retried.contains(&slot.task_index) {
                 if let Some(escalated) = escalate(task.complexity) {
-                    let retry_model = options.catalog.model_for(escalated);
+                    let retry_model = active_catalog.model_for(escalated).to_string();
                     workflow.phase(&format!(
                         "  {} falló → reintento con modelo superior {retry_model}",
                         task.id
@@ -875,7 +906,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                         &format!(
                             "\n- Escalation: task {} — {} → {retry_model}\n",
                             task.id,
-                            options.catalog.model_for(task.complexity)
+                            active_catalog.model_for(task.complexity)
                         ),
                     )?;
                     retried.insert(slot.task_index);
@@ -883,7 +914,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                     let handle = spawn_developer(
                         options,
                         task,
-                        retry_model,
+                        &retry_model,
                         &context,
                         check_failure.as_deref(),
                     )?;
@@ -928,7 +959,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             }
 
             // Supervisor reviews in parallel; the files stay locked.
-            match spawn_supervisor(options, task, &result) {
+            match spawn_supervisor(options, &active_catalog, task, &result) {
                 Ok(handle) => sups.push(SupSlot {
                     task_index: slot.task_index,
                     handle,
@@ -967,8 +998,18 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 }
             };
             let task = &tasks[sup.task_index];
+            track_provider_outages(
+                &mut outage_streak,
+                &mut failover_attempted,
+                &mut active_catalog,
+                supervisor_result.succeeded(),
+                supervisor_result.error.as_deref(),
+                &workflow,
+                &supervision_md,
+            );
             supervision_issues += process_supervision(
                 options,
+                &active_catalog,
                 &workflow,
                 &supervision_md,
                 task,
@@ -994,20 +1035,56 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
     // offer names where the interrupted build actually stopped.
     if !budget_aborted && !user_aborted {
         record_phase(&options.project_dir, PHASE_DEVELOPMENT);
+        // The scheduler already aborts gracefully mid-development; this hard
+        // checkpoint catches spend that landed between its last poll and the
+        // drain, BEFORE the (paid) gates/QA/docs phases start.
+        enforce_budget_checkpoint(&budget, &mut budget_warned, &workflow, &options.project_dir)?;
     }
+
+    // Gate finding counts for docs/build-report.json (0 when a gate did not
+    // run, e.g. after an abort).
+    let mut design_findings_count = 0_usize;
+    let mut security_findings_count = 0_usize;
+    let mut perf_findings_count = 0_usize;
 
     // Full build gate at the end: per-delivery quick checks ran throughout,
     // this is the cross-module confirmation (with Fixer retry on failure).
     if !budget_aborted && !user_aborted {
-        run_build_gate(options, &workflow, &supervision_md, waves.len())?;
+        run_build_gate(
+            options,
+            &active_catalog,
+            &workflow,
+            &supervision_md,
+            waves.len(),
+        )?;
     }
+
+    // Incremental design gate (/improve): audit only what this build touched
+    // (committed on the work branch + anything dirty), never the whole
+    // legacy tree. Greenfield audits everything; aborted runs skip the gates
+    // so there is nothing to scope.
+    let changed_files: Option<Vec<String>> =
+        if options.mode.is_improve() && !budget_aborted && !user_aborted {
+            let changed = changed_files_for_improve(&options.project_dir, base_branch.as_deref());
+            if let Some(changed) = &changed {
+                workflow.phase(&format!(
+                    "Gate de diseño incremental: {} archivo(s) cambiados en esta mejora",
+                    changed.len()
+                ));
+            }
+            changed
+        } else {
+            None
+        };
 
     if !budget_aborted && !user_aborted {
         // ---- Security gate: deterministic, zero-token checks first ----
-        run_security_gate(options, &workflow, &supervision_md)?;
+        security_findings_count =
+            run_security_gate(options, &active_catalog, &workflow, &supervision_md)?;
 
         // ---- Performance budget over the built bundle ----
-        run_performance_gate(options, &workflow, &supervision_md)?;
+        perf_findings_count =
+            run_performance_gate(options, &active_catalog, &workflow, &supervision_md)?;
 
         // ---- Seed data: the first impression must never be an empty
         //      table and a spinner (greenfield only) ----
@@ -1015,7 +1092,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             workflow.phase("Seed data: poblando la app con datos de demostración");
             match run_single(
                 Role::Developer,
-                &options.catalog.medium,
+                &active_catalog.medium,
                 options,
                 "The project is built. Create realistic seed/demo data so the FIRST \
                  RUN shows a fully populated UI — never an empty table and a \
@@ -1038,7 +1115,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         workflow.phase("Agente QA: generando y ejecutando pruebas");
         let qa = run_single(
             Role::Qa,
-            &options.catalog.medium,
+            &active_catalog.medium,
             options,
             "Generate and run the unit/integration/E2E/smoke tests this project needs. \
              Report coverage, failures found and fixes applied.",
@@ -1064,7 +1141,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                 // instead of erroring out the whole run.
                 match run_single(
                     Role::Fixer,
-                    &options.catalog.supervisor,
+                    &active_catalog.supervisor,
                     options,
                     &format!(
                         "The generated tests are failing:\n\n```\n{}\n```\n\n\
@@ -1118,18 +1195,36 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         //      the token stylesheets and an accessibility audit of the
         //      rendered DOM. Computable failures never reach the (paid)
         //      visual-QA agent unfixed. Token discipline is only enforced
-        //      on greenfield builds; /improve respects the user's CSS. ----
-        let leftover_findings =
-            run_design_gate_phase(options, &workflow, &supervision_md, &docs, greenfield)?;
+        //      on greenfield builds; /improve respects the user's CSS and
+        //      its per-file audits only look at what this build changed. ----
+        let (leftover_findings, initial_design_findings) = run_design_gate_phase(
+            options,
+            &active_catalog,
+            &workflow,
+            &supervision_md,
+            &docs,
+            greenfield,
+            changed_files.as_deref(),
+        )?;
+        design_findings_count = initial_design_findings;
 
         // ---- Visual QA: critique what actually rendered, not the source ----
         if docs.join("rendered-dom.html").exists() {
-            workflow.phase("QA visual: revisando el DOM renderizado (rúbrica de 10 puntos)");
-            match run_single(
+            let screenshots = qa_screenshots(&docs);
+            workflow.phase(&format!(
+                "QA visual: revisando el DOM renderizado (rúbrica de 10 puntos{})",
+                if screenshots.is_empty() {
+                    String::new()
+                } else {
+                    format!(" + {} screenshot(s) adjuntos", screenshots.len())
+                }
+            ));
+            match run_single_with_images(
                 Role::UxUiDesigner,
-                &options.catalog.supervisor,
+                &active_catalog.supervisor,
                 options,
                 &crate::design::visual_qa_prompt_with(&leftover_findings),
+                &screenshots,
             ) {
                 Ok(review) => {
                     save_doc(&docs, "visual-qa-report.md", &review.report)?;
@@ -1137,8 +1232,12 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
                     // Advisory re-check: the QA agent's own fixes must not
                     // have regressed anything computable. Report-only — a
                     // second Fixer round here could ping-pong forever.
-                    let regressions =
-                        crate::design::run_design_gate(&options.project_dir, &docs, greenfield);
+                    let regressions = crate::design::run_design_gate_scoped(
+                        &options.project_dir,
+                        &docs,
+                        greenfield,
+                        changed_files.as_deref(),
+                    );
                     if regressions.is_empty() {
                         workflow.phase("  verificación post-QA: diseño OK");
                     } else {
@@ -1166,7 +1265,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
             workflow.phase("Pack de deploy: Dockerfile, CI y config de plataforma");
             match run_single(
                 Role::DevOpsArchitect,
-                &options.catalog.medium,
+                &active_catalog.medium,
                 options,
                 "Write the REAL deployment files for this project as built: a \
                  multi-stage Dockerfile, .dockerignore, a CI workflow at \
@@ -1190,7 +1289,7 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         workflow.phase("Agente de Documentación: README, ADRs y changelog");
         let docs_agent = run_single(
             Role::Docs,
-            &options.catalog.simple,
+            &active_catalog.simple,
             options,
             "Create/update README.md, docs/ARCHITECTURE.md, docs/adr/ (one ADR per key \
              decision from docs/*.md), CHANGELOG.md and deployment/development guides, \
@@ -1266,6 +1365,37 @@ pub fn run(options: &RunOptions) -> Result<RunSummary, String> {
         improve_branch: improve_branch.as_deref(),
     });
     let _ = save_doc(&docs, "SUMMARY.md", &summary_md);
+    // Machine-readable twin of SUMMARY.md: same facts, parseable by tooling
+    // (dashboards, CI annotations) without scraping Markdown.
+    let report = BuildReport {
+        mode: options.mode.as_str().to_string(),
+        archetype: effective_archetype(options, &plan).label().to_string(),
+        phases: role_spend
+            .iter()
+            .map(|(name, usd)| PhaseSpend {
+                name: name.clone(),
+                spend_usd: *usd,
+            })
+            .collect(),
+        tasks: TaskCounts {
+            total: tasks.len(),
+            completed,
+            failed,
+            retried: retried.len(),
+        },
+        gates: GateCounts {
+            design_findings: design_findings_count,
+            security_findings: security_findings_count,
+            perf_findings: perf_findings_count,
+        },
+        duration_secs: run_started.elapsed().as_secs(),
+        models: active_catalog.clone(),
+    };
+    let _ = save_doc(
+        &docs,
+        "build-report.json",
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
+    );
     if !budget_aborted && !user_aborted {
         record_phase(&options.project_dir, PHASE_FINISHED);
     }
@@ -1379,6 +1509,27 @@ fn spawn_developer(
     wave_context: &str,
     verification_failure: Option<&str>,
 ) -> Result<AgentHandle, String> {
+    spawn_agent(
+        &format!("dev-{}", task.id),
+        &task.functional_objective,
+        model,
+        Role::Developer.subagent_type(),
+        &system_prompt(Role::Developer, options.kind),
+        &developer_prompt(options, task, wave_context, verification_failure),
+        &write_scope_for(task),
+    )
+}
+
+/// The exact prompt a developer agent receives. Extracted from
+/// [`spawn_developer`] so its composition (TaskSpec, wave context, contracts
+/// and design-system pointers, accumulated lessons, quality bar, retry
+/// feedback) is testable without spawning anything.
+fn developer_prompt(
+    options: &RunOptions,
+    task: &TaskSpec,
+    wave_context: &str,
+    verification_failure: Option<&str>,
+) -> String {
     let mut prompt = format!("{}{}", task.render_prompt(), wave_context);
     if options
         .project_dir
@@ -1402,6 +1553,10 @@ fn spawn_developer(
              tokens and base components (src/components/ui/); never write ad-hoc \
              styles or duplicate base components.",
         );
+    }
+    // Cross-build memory: what past supervisions flagged in THIS project.
+    if let Some(lessons) = crate::lessons::load_lessons(&options.project_dir) {
+        prompt.push_str(&crate::lessons::lessons_prompt_section(&lessons));
     }
     prompt.push_str(
         "\n\n## Quality bar\n- Security: never hardcode secrets (env vars + \
@@ -1432,15 +1587,7 @@ fn spawn_developer(
             truncate_chars(failure, 8_000)
         );
     }
-    spawn_agent(
-        &format!("dev-{}", task.id),
-        &task.functional_objective,
-        model,
-        Role::Developer.subagent_type(),
-        &system_prompt(Role::Developer, options.kind),
-        &prompt,
-        &write_scope_for(task),
-    )
+    prompt
 }
 
 /// Cheap per-delivery verification. Full builds stay at the final gate;
@@ -1822,6 +1969,56 @@ fn git_status_short(project_dir: &Path) -> Option<String> {
     Some(shown)
 }
 
+/// Files an /improve build changed, project-relative: everything committed
+/// on the work branch since `base` (`git diff --name-only <base>...HEAD`)
+/// plus anything the working tree still holds uncommitted or untracked
+/// (`git status --short` — a superset of the spec'd untracked files: a
+/// dirty modification is changed too). `None` (git failed or no base
+/// branch recorded) tells the caller to fall back to the full audit.
+fn changed_files_for_improve(project_dir: &Path, base: Option<&str>) -> Option<Vec<String>> {
+    let base = base?;
+    let mut files: BTreeSet<String> = BTreeSet::new();
+
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--name-only", &format!("{base}...HEAD")])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !diff.status.success() {
+        return None;
+    }
+    files.extend(
+        String::from_utf8_lossy(&diff.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string),
+    );
+
+    let status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(project_dir)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if status.status.success() {
+        for line in String::from_utf8_lossy(&status.stdout).lines() {
+            // Porcelain format: `XY path` (or `XY old -> new` for renames).
+            let Some(path) = line.get(3..) else { continue };
+            let path = path
+                .rsplit_once(" -> ")
+                .map_or(path, |(_, renamed)| renamed)
+                .trim()
+                .trim_matches('"');
+            if !path.is_empty() {
+                files.insert(path.to_string());
+            }
+        }
+    }
+    Some(files.into_iter().collect())
+}
+
 /// The last 20 one-line commits, or `None` outside a repo with history.
 fn recent_git_log(project_dir: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
@@ -1921,11 +2118,13 @@ pub fn scan_for_secrets(project_dir: &Path) -> Vec<String> {
 
 /// Deterministic security pass (zero tokens until something is found):
 /// dependency audit + hardcoded-secret scan; findings go to the Fixer.
+/// Returns how many findings the gate raised (before fixes) for the report.
 fn run_security_gate(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     workflow: &WorkflowLog,
     supervision_md: &Path,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     workflow.phase("Gate de seguridad: auditoría de dependencias y escaneo de secretos");
     let dir = &options.project_dir;
     let mut findings: Vec<String> = Vec::new();
@@ -1953,7 +2152,7 @@ fn run_security_gate(
 
     if findings.is_empty() {
         workflow.phase("  seguridad: OK");
-        return Ok(());
+        return Ok(0);
     }
     workflow.phase(&format!(
         "  seguridad: {} hallazgo(s) → despachando Técnico",
@@ -1965,7 +2164,7 @@ fn run_security_gate(
     )?;
     match run_single(
         Role::Fixer,
-        &options.catalog.supervisor,
+        &catalog.supervisor,
         options,
         &format!(
             "Security findings in the repository:\n\n{}\n\nFix them: upgrade or \
@@ -1987,28 +2186,33 @@ fn run_security_gate(
             ));
         }
     }
-    Ok(())
+    Ok(findings.len())
 }
 
 // ---------- Design gate ----------
 
 /// Deterministic design audit (token contrast + rendered-DOM a11y) with the
 /// same shape as the security gate: findings go to SUPERVISION.md and one
-/// Fixer pass repairs them.
-/// Returns the findings that remain AFTER the fixer round, so the visual-QA
-/// agent can receive them as explicit input instead of rediscovering them.
+/// Fixer pass repairs them. `changed` (Some on /improve) scopes the
+/// per-file audits to what this build actually touched.
+/// Returns `(leftover, initial_count)`: the findings that remain AFTER the
+/// fixer round (explicit input for the visual-QA agent) and how many the
+/// gate raised initially (for docs/build-report.json).
 fn run_design_gate_phase(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     workflow: &WorkflowLog,
     supervision_md: &Path,
     docs: &Path,
     require_tokens: bool,
-) -> Result<Vec<String>, String> {
+    changed: Option<&[String]>,
+) -> Result<(Vec<String>, usize), String> {
     workflow.phase("Gate de diseño: contraste WCAG y accesibilidad del DOM renderizado");
-    let findings = crate::design::run_design_gate(&options.project_dir, docs, require_tokens);
+    let findings =
+        crate::design::run_design_gate_scoped(&options.project_dir, docs, require_tokens, changed);
     if findings.is_empty() {
         workflow.phase("  diseño: OK");
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     workflow.phase(&format!(
         "  diseño: {} hallazgo(s) → despachando Técnico",
@@ -2020,7 +2224,7 @@ fn run_design_gate_phase(
     )?;
     match run_single(
         Role::Fixer,
-        &options.catalog.supervisor,
+        &catalog.supervisor,
         options,
         &format!(
             "Deterministic design-gate findings (WCAG contrast over the design \
@@ -2045,11 +2249,9 @@ fn run_design_gate_phase(
     }
     // Whatever the fixer could not (or did not) resolve flows into the
     // visual-QA prompt as explicit targets.
-    Ok(crate::design::run_design_gate(
-        &options.project_dir,
-        docs,
-        require_tokens,
-    ))
+    let leftover =
+        crate::design::run_design_gate_scoped(&options.project_dir, docs, require_tokens, changed);
+    Ok((leftover, findings.len()))
 }
 
 // ---------- Performance budget ----------
@@ -2105,23 +2307,24 @@ pub fn oversized_bundles(dist: &Path) -> Vec<(PathBuf, u64)> {
 }
 
 /// Checks the built bundle against the budget; breaches go to the Fixer
-/// with the exact file list.
+/// with the exact file list. Returns the number of oversized chunks found.
 fn run_performance_gate(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     workflow: &WorkflowLog,
     supervision_md: &Path,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let dist = ["dist", "build", ".output/public"]
         .iter()
         .map(|candidate| options.project_dir.join(candidate))
         .find(|path| path.is_dir());
     let Some(dist) = dist else {
-        return Ok(()); // nothing built to measure (e.g. pure backend)
+        return Ok(0); // nothing built to measure (e.g. pure backend)
     };
     let heavy = oversized_bundles(&dist);
     if heavy.is_empty() {
         workflow.phase("Performance budget: OK");
-        return Ok(());
+        return Ok(0);
     }
     let listing = heavy
         .iter()
@@ -2147,7 +2350,7 @@ fn run_performance_gate(
     )?;
     match run_single(
         Role::Fixer,
-        &options.catalog.supervisor,
+        &catalog.supervisor,
         options,
         &format!(
             "These built JS chunks exceed the {budget_kb} KB performance budget:\n\n\
@@ -2169,7 +2372,7 @@ fn run_performance_gate(
             ));
         }
     }
-    Ok(())
+    Ok(heavy.len())
 }
 
 // ---------- Plan checkpoint (--approve) ----------
@@ -2531,6 +2734,122 @@ pub fn escalate(complexity: Complexity) -> Option<Complexity> {
     }
 }
 
+// ---------- Mid-build provider failover (opt-in) ----------
+
+/// Consecutive provider-outage failures that trigger the failover attempt.
+const FAILOVER_CONSECUTIVE_FAILURES: usize = 3;
+
+/// Parses the `CLAW_MA_FAILOVER` toggle. Opt-in: only the usual truthy
+/// spellings enable it; anything else (including unset) keeps it off — a
+/// silent provider swap mid-build must never be a surprise default.
+#[must_use]
+pub fn parse_ma_failover(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Thin env wrapper over [`parse_ma_failover`] (`CLAW_MA_FAILOVER`).
+#[must_use]
+fn ma_failover_enabled() -> bool {
+    parse_ma_failover(std::env::var("CLAW_MA_FAILOVER").ok().as_deref())
+}
+
+/// True when the text contains a standalone 5xx status code (500..=599),
+/// i.e. three digits starting with 5 that are not part of a longer number.
+fn contains_5xx_code(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    for start in 0..bytes.len().saturating_sub(2) {
+        if bytes[start] != b'5'
+            || !bytes[start + 1].is_ascii_digit()
+            || !bytes[start + 2].is_ascii_digit()
+        {
+            continue;
+        }
+        let digit_before = start > 0 && bytes[start - 1].is_ascii_digit();
+        let digit_after = bytes.get(start + 3).is_some_and(u8::is_ascii_digit);
+        if !digit_before && !digit_after {
+            return true;
+        }
+    }
+    false
+}
+
+/// Heuristic for "the provider is down, not the code": HTTP 5xx status
+/// codes, "overloaded" and "internal server error" in the agent's error.
+#[must_use]
+pub fn is_provider_outage_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("overloaded")
+        || lower.contains("internal server error")
+        || lower.contains("5xx")
+        || contains_5xx_code(&lower)
+}
+
+/// Streak arithmetic for consecutive provider outages: any success resets,
+/// an outage-shaped failure extends, and any OTHER failure also resets
+/// (it breaks the "consecutive" chain — the provider answered).
+#[must_use]
+pub fn next_outage_streak(current: usize, succeeded: bool, error: Option<&str>) -> usize {
+    if !succeeded && error.is_some_and(is_provider_outage_error) {
+        current + 1
+    } else {
+        0
+    }
+}
+
+/// Feeds one agent result into the outage streak and, at
+/// [`FAILOVER_CONSECUTIVE_FAILURES`], attempts the (opt-in, once per run)
+/// provider failover: the remaining agents switch to the other family's
+/// default models. The swap is logged live and recorded in SUPERVISION.md.
+fn track_provider_outages(
+    streak: &mut usize,
+    attempted: &mut bool,
+    active_catalog: &mut ModelCatalog,
+    succeeded: bool,
+    error: Option<&str>,
+    workflow: &WorkflowLog,
+    supervision_md: &Path,
+) {
+    *streak = next_outage_streak(*streak, succeeded, error);
+    if *streak < FAILOVER_CONSECUTIVE_FAILURES || *attempted {
+        return;
+    }
+    *attempted = true; // one attempt per run, whatever the outcome
+    if !ma_failover_enabled() {
+        workflow.phase(&format!(
+            "{FAILOVER_CONSECUTIVE_FAILURES} fallos de proveedor consecutivos \
+             (5xx/overloaded); exporta CLAW_MA_FAILOVER=1 para habilitar el \
+             failover automático a la otra familia de modelos"
+        ));
+        return;
+    }
+    match crate::catalog::failover_catalog(active_catalog, |key| std::env::var(key).ok()) {
+        Some((remapped, description)) => {
+            workflow.phase(&format!(
+                "Failover tras {FAILOVER_CONSECUTIVE_FAILURES} fallos de proveedor \
+                 consecutivos — {description}; aplica a los agentes restantes"
+            ));
+            workflow.event("provider_failover", &[("description", description.clone())]);
+            let _ = append_file(
+                supervision_md,
+                &format!(
+                    "\n## Provider failover\n\n- After {FAILOVER_CONSECUTIVE_FAILURES} \
+                     consecutive provider failures: {description}\n"
+                ),
+            );
+            *active_catalog = remapped;
+        }
+        None => workflow.phase(
+            "Failover habilitado pero sin alternativa: el catálogo es mixto o la \
+             otra familia no tiene credenciales; se continúa con el catálogo actual",
+        ),
+    }
+}
+
 // ---------- Resume state (#5) ----------
 
 /// Pipeline phases persisted in `.multiagent/state.json` after each major
@@ -2733,6 +3052,83 @@ impl Budget {
     }
 }
 
+/// Verdict of comparing this run's spend against the `--max-cost` ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetVerdict {
+    /// Under 80% of the ceiling (or no ceiling configured).
+    Ok,
+    /// At or past 80% of the ceiling but not over it yet.
+    Warn,
+    /// Over the ceiling: the build must stop at the next checkpoint.
+    Stop,
+}
+
+/// Share of the ceiling at which the one-time warning fires.
+const BUDGET_WARN_RATIO: f64 = 0.8;
+
+/// Pure cutoff policy for the hard cost ceiling: `Stop` when `spent`
+/// exceeds `max`, `Warn` from 80% of `max`, `Ok` below (and always `Ok`
+/// without a ceiling). The "warn once" bookkeeping belongs to the caller.
+#[must_use]
+pub fn budget_breach(spent: f64, max: Option<f64>) -> BudgetVerdict {
+    let Some(max) = max else {
+        return BudgetVerdict::Ok;
+    };
+    if spent > max {
+        BudgetVerdict::Stop
+    } else if spent >= max * BUDGET_WARN_RATIO {
+        BudgetVerdict::Warn
+    } else {
+        BudgetVerdict::Ok
+    }
+}
+
+/// Hard budget checkpoint, evaluated wherever spend has just been
+/// attributed: warns once at 80% of the ceiling and, when the ceiling is
+/// breached, persists the resume state and aborts the build with an error
+/// that names `--resume`. A no-op without telemetry or without a ceiling.
+fn enforce_budget_checkpoint(
+    budget: &Budget,
+    warned: &mut bool,
+    workflow: &WorkflowLog,
+    project_dir: &Path,
+) -> Result<(), String> {
+    let Some(spent) = budget.spent() else {
+        return Ok(());
+    };
+    let ceiling = budget.ceiling();
+    match budget_breach(spent, ceiling) {
+        BudgetVerdict::Ok => Ok(()),
+        BudgetVerdict::Warn => {
+            if !*warned {
+                *warned = true;
+                workflow.phase(&format!(
+                    "Aviso de presupuesto: {spent:.2} USD gastados — 80% del tope \
+                     de {:.2} USD alcanzado",
+                    ceiling.unwrap_or_default()
+                ));
+            }
+            Ok(())
+        }
+        BudgetVerdict::Stop => {
+            let ceiling = ceiling.unwrap_or_default();
+            workflow.phase(&format!(
+                "Presupuesto superado en checkpoint: {spent:.2} USD > tope {ceiling:.2} USD \
+                 — se corta la construcción y se guarda el estado"
+            ));
+            // Persist the resume state atomically so `--resume` picks up
+            // exactly where the money ran out (completed tasks + last phase
+            // are already in the state; this guarantees the file exists).
+            BuildState::load(project_dir).save(project_dir);
+            Err(format!(
+                "presupuesto superado: {spent:.2} USD gastados con un tope de \
+                 {ceiling:.2} USD; el estado quedó guardado — reanuda con --resume \
+                 (sube o quita --max-cost) para continuar donde se cortó"
+            ))
+        }
+    }
+}
+
 // ---------- Per-role spend ledger ----------
 
 /// Spend attributed per role family, fed with deltas of [`Budget::spent`]
@@ -2897,6 +3293,50 @@ pub fn render_summary_md(inputs: &SummaryInputs<'_>) -> String {
     )
 }
 
+// ---------- Machine-readable build report (docs/build-report.json) ----------
+
+/// Machine-readable twin of docs/SUMMARY.md, emitted as
+/// `docs/build-report.json`. Serde-stable: fields only get added, never
+/// renamed, so tooling that parses it keeps working across versions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BuildReport {
+    /// `greenfield` or `improve`.
+    pub mode: String,
+    /// Effective design archetype label.
+    pub archetype: String,
+    /// Per-phase spend from the [`RoleSpendLedger`], biggest spender first.
+    pub phases: Vec<PhaseSpend>,
+    pub tasks: TaskCounts,
+    pub gates: GateCounts,
+    /// Wall-clock duration of the run (no absolute timestamps by design:
+    /// the report stays deterministic enough to golden-test).
+    pub duration_secs: u64,
+    /// The model catalog the run ended with (reflects a mid-build failover).
+    pub models: ModelCatalog,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PhaseSpend {
+    pub name: String,
+    pub spend_usd: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskCounts {
+    pub total: usize,
+    pub completed: usize,
+    pub failed: usize,
+    /// Tasks that needed the escalated retry.
+    pub retried: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateCounts {
+    pub design_findings: usize,
+    pub security_findings: usize,
+    pub perf_findings: usize,
+}
+
 /// The archetype the build actually uses: the `--archetype` override when
 /// given, keyword detection over the plan otherwise.
 fn effective_archetype(options: &RunOptions, plan: &Plan) -> crate::design::DesignArchetype {
@@ -2977,6 +3417,7 @@ pub fn detect_build_command(project_dir: &Path, explicit: Option<&str>) -> Optio
 /// (superior model) with the compiler output and re-checks once.
 fn run_build_gate(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     workflow: &WorkflowLog,
     supervision_md: &Path,
     wave_number: usize,
@@ -3010,7 +3451,7 @@ fn run_build_gate(
                 )?;
                 let fixer = run_single(
                     Role::Fixer,
-                    &options.catalog.supervisor,
+                    &catalog.supervisor,
                     options,
                     &format!(
                         "The project build failed after wave {wave_number}.\nCommand: \
@@ -3129,6 +3570,7 @@ fn supervisor_evidence(project_dir: &Path, task: &TaskSpec) -> String {
 
 fn spawn_supervisor(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     task: &TaskSpec,
     delivery: &AgentResult,
 ) -> Result<AgentHandle, String> {
@@ -3136,7 +3578,7 @@ fn spawn_supervisor(
     spawn_agent(
         &format!("sup-{}", task.id),
         Role::Supervisor.title(),
-        &options.catalog.supervisor,
+        &catalog.supervisor,
         Role::Supervisor.subagent_type(),
         &system_prompt(Role::Supervisor, options.kind),
         &format!(
@@ -3162,10 +3604,12 @@ fn spawn_supervisor(
 }
 
 /// Processes a finished Supervisor: records the verdict in SUPERVISION.md,
+/// distills each issue into `.multiagent/lessons.md` (cross-build memory),
 /// triggers the reindex hook, and dispatches the Fixer (superior model)
 /// with the exact issue list when the review found problems.
 fn process_supervision(
     options: &RunOptions,
+    catalog: &ModelCatalog,
     workflow: &WorkflowLog,
     supervision_md: &Path,
     task: &TaskSpec,
@@ -3211,6 +3655,24 @@ fn process_supervision(
     }
     append_file(supervision_md, &entry)?;
 
+    // Cross-build memory: one distilled line per issue, capped FIFO and
+    // deduplicated — future developer agents of this project receive them.
+    if !verdict.issues.is_empty() {
+        let lessons: Vec<String> = verdict
+            .issues
+            .iter()
+            .filter(|issue| !issue.description.trim().is_empty())
+            .map(|issue| {
+                crate::lessons::distill_issue_line(
+                    &issue.severity,
+                    &task.module,
+                    &issue.description,
+                )
+            })
+            .collect();
+        crate::lessons::record_lessons(&options.project_dir, &lessons);
+    }
+
     // Reindex hook (codebase-memory): pluggable command so the knowledge
     // graph stays current after every delivery.
     run_reindex_hook();
@@ -3224,7 +3686,7 @@ fn process_supervision(
         let issues_json = serde_json::to_string_pretty(&verdict.issues).unwrap_or_default();
         let fixer = run_single(
             Role::Fixer,
-            &options.catalog.supervisor,
+            &catalog.supervisor,
             options,
             &format!(
                 "The Supervisor found these issues in task {} (module {}):\n```json\n\
@@ -3248,7 +3710,56 @@ fn run_single(
     options: &RunOptions,
     prompt: &str,
 ) -> Result<AgentResult, String> {
-    let handle = spawn_agent(
+    run_single_with_images(role, model, options, prompt, &[])
+}
+
+/// Up to 3 smoke-test screenshots as base64 attachments, oldest path order
+/// first (mobile/tablet/desktop when the smoke test names them that way).
+/// Files whose base64 form exceeds the Agent tool's 1.5MB cap are skipped —
+/// a skipped screenshot degrades to DOM-only review, never to an error.
+fn qa_screenshots(docs: &Path) -> Vec<crate::agents::AgentImage> {
+    let Ok(entries) = std::fs::read_dir(docs.join("screenshots")) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+        .collect();
+    paths.sort();
+    let mut images = Vec::new();
+    for path in paths {
+        if images.len() == 3 {
+            break;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let encoded = crate::agents::base64_encode(&bytes);
+        if encoded.len() > 1_500_000 {
+            continue;
+        }
+        images.push(crate::agents::AgentImage {
+            media_type: "image/png".to_string(),
+            base64_data: encoded,
+        });
+    }
+    images
+}
+
+/// [`run_single`] plus base64 image attachments on the initial message —
+/// the visual-QA agent reviews the real screenshots, not just DOM text.
+fn run_single_with_images(
+    role: Role,
+    model: &str,
+    options: &RunOptions,
+    prompt: &str,
+    images: &[crate::agents::AgentImage],
+) -> Result<AgentResult, String> {
+    let handle = crate::agents::spawn_agent_with_images(
         role.slug(),
         role.title(),
         model,
@@ -3256,6 +3767,7 @@ fn run_single(
         &system_prompt(role, options.kind),
         prompt,
         &[],
+        images,
     )?;
     let mut results = wait_all(vec![handle], options.agent_timeout, |_| {});
     let result = results.pop().ok_or("agent produced no result")?;
@@ -3652,6 +4164,28 @@ mod tests {
         // Subdirector: click-through script per task, non-goals enforced.
         assert!(SUBDIRECTOR_JSON_SCHEMA.contains("\"manual_test\""));
         assert!(SUBDIRECTOR_JSON_SCHEMA.contains("non_goals"));
+    }
+
+    #[test]
+    fn qa_screenshots_collects_pngs_capped_and_sorted() {
+        let docs = improve_temp_dir("qa-shots");
+        let shots = docs.join("screenshots");
+        std::fs::create_dir_all(&shots).expect("shots dir");
+        for name in ["c-desktop.png", "a-mobile.png", "b-tablet.png", "d.png"] {
+            std::fs::write(shots.join(name), [0x89, 0x50, 0x4E, 0x47]).expect("png");
+        }
+        std::fs::write(shots.join("notes.txt"), "no soy imagen").expect("txt");
+        let images = qa_screenshots(&docs);
+        // Cap 3, path order, PNG only, correctly encoded.
+        assert_eq!(images.len(), 3);
+        assert!(images
+            .iter()
+            .all(|image| image.media_type == "image/png" && image.base64_data == "iVBORw=="));
+        // No screenshots dir → empty, never an error.
+        let empty = improve_temp_dir("qa-none");
+        assert!(qa_screenshots(&empty).is_empty());
+        std::fs::remove_dir_all(&docs).ok();
+        std::fs::remove_dir_all(&empty).ok();
     }
 
     #[test]
@@ -4402,6 +4936,272 @@ mod tests {
             effective_archetype(&detected, &plan),
             crate::design::DesignArchetype::Ecommerce
         );
+    }
+
+    #[test]
+    fn budget_breach_verdicts_cover_ok_warn_and_stop() {
+        // No ceiling: always Ok, spend whatever.
+        assert_eq!(budget_breach(999.0, None), BudgetVerdict::Ok);
+        // Under 80%: Ok.
+        assert_eq!(budget_breach(0.79, Some(1.0)), BudgetVerdict::Ok);
+        assert_eq!(budget_breach(0.0, Some(1.0)), BudgetVerdict::Ok);
+        // From 80% up to (and including) the ceiling: Warn.
+        assert_eq!(budget_breach(0.80, Some(1.0)), BudgetVerdict::Warn);
+        assert_eq!(budget_breach(1.0, Some(1.0)), BudgetVerdict::Warn);
+        // Over the ceiling: Stop.
+        assert_eq!(budget_breach(1.01, Some(1.0)), BudgetVerdict::Stop);
+        assert_eq!(budget_breach(50.0, Some(5.0)), BudgetVerdict::Stop);
+    }
+
+    #[test]
+    fn budget_checkpoint_warns_once_and_stops_over_the_ceiling() {
+        let dir = improve_temp_dir("budgetcut");
+        let events = dir.join("events.jsonl");
+        let event = |cost: f64| {
+            format!(
+                r#"{{"type":"session_trace","session_id":"x","sequence":0,"name":"analytics","timestamp_ms":1,"attributes":{{"namespace":"api","action":"message_usage","estimated_cost_usd_value":{cost}}}}}"#
+            )
+        };
+        std::fs::write(&events, format!("{}\n", event(0.9))).expect("events");
+        let budget = Budget {
+            ceiling: Some(1.0),
+            events_path: Some(events.clone()),
+            baseline: 0.0,
+        };
+        let workflow = WorkflowLog { tracer: None };
+        let mut warned = false;
+
+        // 0.9 of 1.0 → warn zone; the checkpoint passes but marks the warn.
+        assert!(enforce_budget_checkpoint(&budget, &mut warned, &workflow, &dir).is_ok());
+        assert!(warned, "80% warning recorded");
+
+        // Push spend over the ceiling → hard stop with a --resume hint, and
+        // the resume state persisted (file exists).
+        let mut content = std::fs::read_to_string(&events).expect("read");
+        content.push_str(&format!("{}\n", event(0.2)));
+        std::fs::write(&events, content).expect("append");
+        let error = enforce_budget_checkpoint(&budget, &mut warned, &workflow, &dir)
+            .expect_err("must stop over the ceiling");
+        assert!(error.contains("--resume"), "{error}");
+        assert!(error.contains("1.10"), "names the spend: {error}");
+        assert!(error.contains("1.00"), "names the ceiling: {error}");
+        assert!(dir.join(".multiagent/state.json").exists(), "state saved");
+
+        // Without a ceiling the checkpoint is inert even with huge spend.
+        let no_ceiling = Budget {
+            ceiling: None,
+            events_path: Some(events),
+            baseline: 0.0,
+        };
+        let mut warned = false;
+        assert!(enforce_budget_checkpoint(&no_ceiling, &mut warned, &workflow, &dir).is_ok());
+        assert!(!warned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ma_failover_toggle_is_opt_in() {
+        assert!(!parse_ma_failover(None), "default is OFF");
+        for on in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(parse_ma_failover(Some(on)), "`{on}` enables");
+        }
+        for off in ["", "0", "false", "no", "off", "junk"] {
+            assert!(!parse_ma_failover(Some(off)), "`{off}` must not enable");
+        }
+    }
+
+    #[test]
+    fn provider_outage_errors_are_recognized_and_streak_counts_them() {
+        for outage in [
+            "API error 529: overloaded_error",
+            "Internal Server Error",
+            "upstream returned 503 Service Unavailable",
+            "provider replied with a 5xx status",
+            "HTTP 500",
+        ] {
+            assert!(is_provider_outage_error(outage), "{outage}");
+        }
+        for not_outage in [
+            "agent timed out after 1800s",
+            "invalid api key (401)",
+            "rate limited: 429 too many requests",
+            "expected 1500 items", // 5xx-lookalike inside a longer number
+            "src/app.ts:50 type error",
+        ] {
+            assert!(!is_provider_outage_error(not_outage), "{not_outage}");
+        }
+
+        // Streak: outage failures accumulate…
+        let mut streak = 0;
+        streak = next_outage_streak(streak, false, Some("503 from provider"));
+        streak = next_outage_streak(streak, false, Some("overloaded"));
+        assert_eq!(streak, 2);
+        // …a success resets…
+        assert_eq!(next_outage_streak(streak, true, None), 0);
+        // …and a NON-outage failure breaks the consecutive chain too.
+        assert_eq!(next_outage_streak(streak, false, Some("compile error")), 0);
+        assert_eq!(next_outage_streak(streak, false, None), 0);
+    }
+
+    #[test]
+    fn changed_files_for_improve_lists_branch_commits_and_dirty_files() {
+        let dir = improve_temp_dir("changed");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(dir.join("base.txt"), "base").expect("w");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "base"]);
+        let base = current_git_branch(&dir).expect("base branch");
+
+        // Work branch: one committed change + one untracked file.
+        git(&["checkout", "--quiet", "-b", "multiagent/improve-test"]);
+        std::fs::create_dir_all(dir.join("src")).expect("src");
+        std::fs::write(dir.join("src/feature.css"), ".a { color: red; }").expect("w");
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "feature"]);
+        std::fs::write(dir.join("untracked.css"), "x").expect("w");
+
+        let changed = changed_files_for_improve(&dir, Some(&base)).expect("changed files");
+        assert!(
+            changed.contains(&"src/feature.css".to_string()),
+            "{changed:?}"
+        );
+        assert!(
+            changed.contains(&"untracked.css".to_string()),
+            "{changed:?}"
+        );
+        assert!(
+            !changed.contains(&"base.txt".to_string()),
+            "pre-existing files are not 'changed': {changed:?}"
+        );
+
+        // No base branch recorded → no scoping (full audit).
+        assert_eq!(changed_files_for_improve(&dir, None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn developer_prompt_injects_lessons_only_when_they_exist() {
+        let dir = improve_temp_dir("lessons-prompt");
+        let options = RunOptions {
+            kind: ProjectKind::Web,
+            mode: BuildMode::Greenfield,
+            prompt: "x".to_string(),
+            project_dir: dir.clone(),
+            catalog: ModelCatalog::default(),
+            parallel: 1,
+            dry_run: false,
+            agent_timeout: Duration::from_secs(1),
+            resume: false,
+            max_cost_usd: None,
+            build_command: None,
+            scaffold: false,
+            approve: false,
+            archetype: None,
+        };
+        let task = TaskSpec {
+            id: "T1".to_string(),
+            module: "auth".to_string(),
+            functional_objective: "login".to_string(),
+            files_to_create: vec!["src/auth/login.ts".to_string()],
+            ..TaskSpec::default()
+        };
+
+        // Without lessons: no section.
+        let before = developer_prompt(&options, &task, "", None);
+        assert!(!before.contains("Lessons from previous builds"));
+
+        // With lessons on disk: header + content, before the quality bar.
+        crate::lessons::record_lessons(&dir, &["- [high] auth: never log raw tokens".to_string()]);
+        let after = developer_prompt(&options, &task, "", None);
+        assert!(
+            after.contains(
+                "## Lessons from previous builds in THIS project (avoid repeating these)"
+            ),
+            "{after}"
+        );
+        assert!(after.contains("never log raw tokens"), "{after}");
+        // The rest of the prompt contract is intact.
+        assert!(after.contains("## Quality bar"));
+        assert!(after.contains("module `auth`"));
+
+        // An empty lessons file must not inject an empty section.
+        std::fs::write(crate::lessons::lessons_path(&dir), "  \n").expect("blank");
+        let blank = developer_prompt(&options, &task, "", None);
+        assert!(!blank.contains("Lessons from previous builds"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_report_round_trips_with_all_fields() {
+        let report = BuildReport {
+            mode: "improve".to_string(),
+            archetype: "ecommerce".to_string(),
+            phases: vec![
+                PhaseSpend {
+                    name: "Director".to_string(),
+                    spend_usd: 0.25,
+                },
+                PhaseSpend {
+                    name: "Desarrollo y supervisión".to_string(),
+                    spend_usd: 1.5,
+                },
+            ],
+            tasks: TaskCounts {
+                total: 9,
+                completed: 7,
+                failed: 1,
+                retried: 2,
+            },
+            gates: GateCounts {
+                design_findings: 3,
+                security_findings: 0,
+                perf_findings: 1,
+            },
+            duration_secs: 420,
+            models: ModelCatalog::default(),
+        };
+        let json = serde_json::to_string_pretty(&report).expect("serialize");
+        // Every top-level field of the contract is present in the JSON.
+        for key in [
+            "\"mode\"",
+            "\"archetype\"",
+            "\"phases\"",
+            "\"tasks\"",
+            "\"gates\"",
+            "\"duration_secs\"",
+            "\"models\"",
+            "\"spend_usd\"",
+            "\"retried\"",
+            "\"design_findings\"",
+            "\"security_findings\"",
+            "\"perf_findings\"",
+        ] {
+            assert!(json.contains(key), "missing {key} in {json}");
+        }
+        let parsed: BuildReport = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(parsed.mode, "improve");
+        assert_eq!(parsed.archetype, "ecommerce");
+        assert_eq!(parsed.phases.len(), 2);
+        assert!((parsed.phases[1].spend_usd - 1.5).abs() < 1e-9);
+        assert_eq!(parsed.tasks.total, 9);
+        assert_eq!(parsed.tasks.retried, 2);
+        assert_eq!(parsed.gates.design_findings, 3);
+        assert_eq!(parsed.duration_secs, 420);
+        assert_eq!(parsed.models.simple, ModelCatalog::default().simple);
     }
 
     #[test]

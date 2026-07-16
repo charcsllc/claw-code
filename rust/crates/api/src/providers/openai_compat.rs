@@ -1334,7 +1334,9 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                             "arguments": input.to_string(),
                         }
                     })),
-                    InputContentBlock::ToolResult { .. } => {}
+                    // Assistant turns never carry inbound images; drop them
+                    // alongside tool results rather than corrupting the text.
+                    InputContentBlock::ToolResult { .. } | InputContentBlock::Image { .. } => {}
                 }
             }
             let needs_reasoning = model_requires_reasoning_content_in_history(model);
@@ -1359,6 +1361,13 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                 }
                 vec![msg]
             }
+        }
+        _ if message
+            .content
+            .iter()
+            .any(|block| matches!(block, InputContentBlock::Image { .. })) =>
+        {
+            translate_user_message_with_image_parts(message, supports_is_error)
         }
         _ => message
             .content
@@ -1385,10 +1394,63 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. }
+                | InputContentBlock::ToolUse { .. }
+                | InputContentBlock::Image { .. } => None,
             })
             .collect(),
     }
+}
+
+/// Translates a user-role message that carries image blocks into the OpenAI
+/// multimodal parts form: a single `role:"user"` message whose `content` is
+/// an array of `image_url` (data URL) and `text` parts, preserving block
+/// order. Tool-result blocks in the same message are emitted first as
+/// separate `role:"tool"` messages so they stay adjacent to the assistant
+/// `tool_calls` turn they answer.
+fn translate_user_message_with_image_parts(
+    message: &InputMessage,
+    supports_is_error: bool,
+) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut parts = Vec::new();
+    for block in &message.content {
+        match block {
+            InputContentBlock::Text { text } => parts.push(json!({
+                "type": "text",
+                "text": text,
+            })),
+            InputContentBlock::Image { source } => parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", source.media_type, source.data),
+                }
+            })),
+            InputContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                let mut msg = json!({
+                    "role": "tool",
+                    "tool_call_id": tool_use_id,
+                    "content": flatten_tool_result_content(content),
+                });
+                if supports_is_error {
+                    msg["is_error"] = json!(is_error);
+                }
+                messages.push(msg);
+            }
+            InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => {}
+        }
+    }
+    if !parts.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": parts,
+        }));
+    }
+    messages
 }
 
 /// Remove `role:"tool"` messages from `messages` that have no valid paired
@@ -2716,6 +2778,75 @@ mod tests {
         ];
         let out = sanitize_tool_message_pairing(two_results);
         assert_eq!(out.len(), 3, "both valid tool results must be preserved");
+    }
+
+    /// User messages carrying images must translate into a single OpenAI
+    /// multimodal message whose content is an `image_url`/`text` parts array
+    /// (data URL form), preserving image-before-text ordering.
+    #[test]
+    fn translate_message_renders_images_as_openai_image_url_parts() {
+        use crate::types::{ImageAttachment, InputMessage};
+
+        let message = InputMessage::user_text_with_images(
+            "describe the diff",
+            vec![ImageAttachment {
+                media_type: "image/png".to_string(),
+                base64_data: "aGVsbG8=".to_string(),
+            }],
+        );
+
+        let translated = super::translate_message(&message, "gpt-4o");
+
+        assert_eq!(
+            translated,
+            vec![json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": "data:image/png;base64,aGVsbG8=" }
+                    },
+                    { "type": "text", "text": "describe the diff" }
+                ]
+            })]
+        );
+    }
+
+    /// Image-bearing user messages must survive the full request builder,
+    /// and text-only messages must keep the legacy plain-string content form.
+    #[test]
+    fn build_chat_completion_request_keeps_image_parts_and_plain_text_form() {
+        use crate::types::{ImageAttachment, InputMessage};
+
+        let request = MessageRequest {
+            model: "gpt-4o".to_string(),
+            max_tokens: 128,
+            messages: vec![
+                InputMessage::user_text("plain question"),
+                InputMessage::user_text_with_images(
+                    "and this screenshot",
+                    vec![ImageAttachment {
+                        media_type: "image/jpeg".to_string(),
+                        base64_data: "d29ybGQ=".to_string(),
+                    }],
+                ),
+            ],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"], json!("plain question"));
+        assert_eq!(
+            messages[1]["content"][0]["image_url"]["url"],
+            json!("data:image/jpeg;base64,d29ybGQ=")
+        );
+        assert_eq!(
+            messages[1]["content"][1]["text"],
+            json!("and this screenshot")
+        );
     }
 
     #[test]

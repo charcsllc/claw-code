@@ -174,9 +174,10 @@ pub use sandbox::{
     SandboxRequest, SandboxStatus,
 };
 pub use session::{
-    max_session_mb, parse_max_session_mb, redact_secrets, session_size_exceeds_limit, ContentBlock,
-    ConversationMessage, MessageRole, Session, SessionCompaction, SessionError, SessionFork,
-    SessionHeartbeat, SessionLiveness, SessionPin, SessionPromptEntry,
+    image_placeholder_text, max_session_mb, parse_max_session_mb, redact_secrets,
+    session_size_exceeds_limit, ContentBlock, ConversationMessage, MessageRole, Session,
+    SessionCompaction, SessionError, SessionFork, SessionHeartbeat, SessionLiveness, SessionPin,
+    SessionPromptEntry,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use stale_base::{

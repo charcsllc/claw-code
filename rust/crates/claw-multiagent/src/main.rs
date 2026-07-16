@@ -78,9 +78,10 @@ struct CommonArgs {
 
     /// Cost ceiling in USD. DISABLED by default (subscription accounts
     /// don't bill per token); pass a value to enable enforcement — the
-    /// build aborts cleanly between waves when spend exceeds it.
+    /// build warns once at 80% and cuts at the next checkpoint (or between
+    /// waves) when spend exceeds it, resumable with --resume.
     /// Requires telemetry (--dashboard or CLAW_DASHBOARD_EVENTS).
-    #[arg(long)]
+    #[arg(long, alias = "max-cost")]
     max_cost_usd: Option<f64>,
 
     /// Build-gate command run after each wave (auto-detected from

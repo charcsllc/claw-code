@@ -28,12 +28,16 @@ const DIRECTOR_PATTERN: &str = "Produce the complete product plan";
 const ARCHITECT_PATTERN: &str = "Deliver your complete design document";
 const SUBDIRECTOR_PATTERN: &str = "parallelizable TaskSpecs";
 
+// A FULLSTACK plan so the architect fan-out covers all five roles —
+// software, UX, devops, frontend AND backend (a simple stack would skip the
+// backend architect and leave its prompt contract untested).
 const DIRECTOR_RESPONSE: &str = r#"Plan listo.
 ```json
 {
   "vision": "Tienda online de electrónica con catálogo y carrito",
   "scope": ["catálogo de productos", "carrito de compra"],
-  "stack": {"kind": "simple", "frontend": ["react"], "justification": "demo estática"},
+  "stack": {"kind": "fullstack", "frontend": ["react"], "backend": ["express"],
+            "database": ["sqlite"], "justification": "catálogo con API propia"},
   "epics": [{"name": "Catálogo", "stories": []}],
   "milestones": ["mvp"],
   "risks": [],
@@ -141,10 +145,11 @@ fn dry_run_planning_pipeline_completes_against_the_mock() {
     assert!(stdout.contains("dry-run"), "{stdout}");
 
     // Every pipeline phase actually reached the mock: one Director call,
-    // the architect fan-out (software/UX/devops/frontend for a simple web
-    // stack), and one Subdirector call — all attributed to their routes.
-    // The API client also preflights each call via /v1/messages/count_tokens
-    // with the same body; count only the real message calls.
+    // the full architect fan-out (software/UX/devops/frontend/backend for a
+    // fullstack plan), and one Subdirector call — all attributed to their
+    // routes. The API client also preflights each call via
+    // /v1/messages/count_tokens with the same body; count only the real
+    // message calls.
     let captured = runtime.block_on(server.captured_requests());
     let count = |pattern: &str| {
         captured
@@ -154,14 +159,14 @@ fn dry_run_planning_pipeline_completes_against_the_mock() {
             .count()
     };
     assert_eq!(count(DIRECTOR_PATTERN), 1, "director calls");
-    assert_eq!(count(ARCHITECT_PATTERN), 4, "architect fan-out");
+    assert_eq!(count(ARCHITECT_PATTERN), 5, "architect fan-out");
     assert_eq!(count(SUBDIRECTOR_PATTERN), 1, "subdirector calls");
     assert_eq!(
         captured
             .iter()
             .filter(|request| request.path == "/v1/messages")
             .count(),
-        6,
+        7,
         "no unexpected message traffic"
     );
     // Nothing fell through to the parity scenarios: every request (message
@@ -177,7 +182,97 @@ fn dry_run_planning_pipeline_completes_against_the_mock() {
             .collect::<Vec<_>>()
     );
 
+    // ---- Prompt-contract evals over the bodies REALLY sent to the API ----
+    // These assertions pin the full prompt wiring: role → system context →
+    // output contract → structured brief. If a refactor drops a section,
+    // the E2E fails here even though the JSON responses still parse.
+    let sent: Vec<String> = captured
+        .iter()
+        .filter(|request| request.path == "/v1/messages")
+        .map(|request| decoded_message_text(&request.raw_body))
+        .collect();
+    let sent_to = |role_marker: &str| -> &String {
+        sent.iter()
+            .find(|text| text.contains(role_marker))
+            .unwrap_or_else(|| panic!("no request carried the role marker `{role_marker}`"))
+    };
+
+    // (a) Director: the OUTPUT CONTRACT leads the user task text (right
+    // after the system-context separator) and the schema demands the
+    // scope-creep brakes (non_goals) and real page copy (page_content).
+    let director = sent_to("Director General (Chief Orchestrator)");
+    let task_text = director
+        .split_once("\n\n---\n\n")
+        .map(|(_, task)| task)
+        .expect("system-context separator present in the director prompt");
+    assert!(
+        task_text.trim_start().starts_with("OUTPUT CONTRACT"),
+        "director task must LEAD with the output contract:\n{task_text}"
+    );
+    assert!(director.contains("\"non_goals\""), "{director}");
+    assert!(director.contains("\"page_content\""), "{director}");
+
+    // (b) Every architect got ITS structured six-section brief.
+    assert!(
+        sent_to("Arquitecto Backend").contains("Endpoint table"),
+        "backend architect brief missing"
+    );
+    assert!(
+        sent_to("Arquitecto Frontend").contains("Route tree"),
+        "frontend architect brief missing"
+    );
+    assert!(
+        sent_to("Arquitecto de Software").contains("Module map"),
+        "software architect brief missing"
+    );
+    assert!(
+        sent_to("Arquitecto DevOps").contains("Environment matrix"),
+        "devops architect brief missing"
+    );
+
+    // (c) Subdirector: output contract up front and the manual_test field
+    // (the per-task click-through script) demanded by its schema.
+    let subdirector = sent_to("Subdirector Técnico");
+    assert!(subdirector.contains("OUTPUT CONTRACT"), "{subdirector}");
+    assert!(subdirector.contains("\"manual_test\""), "{subdirector}");
+
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Concatenated text of every message in a captured `/v1/messages` body —
+/// the words the model actually received, JSON-decoded (string content and
+/// content-block arrays both supported).
+fn decoded_message_text(raw_body: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(raw_body).unwrap_or_default();
+    let mut out = String::new();
+    // The top-level system prompt (if any) counts as received text too.
+    if let Some(system) = value.get("system").and_then(|system| system.as_str()) {
+        out.push_str(system);
+        out.push('\n');
+    }
+    if let Some(messages) = value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    {
+        for message in messages {
+            match message.get("content") {
+                Some(serde_json::Value::String(text)) => {
+                    out.push_str(text);
+                    out.push('\n');
+                }
+                Some(serde_json::Value::Array(blocks)) => {
+                    for block in blocks {
+                        if let Some(text) = block.get("text").and_then(|text| text.as_str()) {
+                            out.push_str(text);
+                            out.push('\n');
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Phase-2 E2E: scheduler + delivery + supervision without `--dry-run`.
@@ -319,6 +414,23 @@ fn development_wave_delivers_a_file_end_to_end() {
         .expect("SUPERVISION.md written");
     assert!(supervision.contains("Task T1"), "{supervision}");
     assert!(supervision.contains("Approved: true"), "{supervision}");
+
+    // The machine-readable build report landed next to the SUMMARY with the
+    // real task counters and the run's model catalog.
+    let report_raw = std::fs::read_to_string(project.join("docs/build-report.json"))
+        .expect("build-report.json written");
+    let report: serde_json::Value =
+        serde_json::from_str(&report_raw).expect("build report is valid JSON");
+    assert_eq!(report["mode"], "greenfield", "{report_raw}");
+    assert_eq!(report["tasks"]["total"], 1, "{report_raw}");
+    assert_eq!(report["tasks"]["completed"], 1, "{report_raw}");
+    assert_eq!(report["tasks"]["failed"], 0, "{report_raw}");
+    assert!(report["gates"]["design_findings"].is_u64(), "{report_raw}");
+    assert!(report["duration_secs"].is_u64(), "{report_raw}");
+    assert!(
+        report["models"]["simple"].is_string(),
+        "catalog serialized: {report_raw}"
+    );
 
     // The developer route answered exactly two real message calls (the
     // tool_use turn + the final report) and the supervisor one.

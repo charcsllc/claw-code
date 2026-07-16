@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "
 walkdir = "2"
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [lints]

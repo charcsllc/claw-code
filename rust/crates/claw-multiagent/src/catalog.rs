@@ -139,6 +139,51 @@ pub fn provider_for_model(model: &str) -> ProviderKind {
     detect_provider_kind(&resolve_model_alias(model))
 }
 
+/// Mid-build provider failover: when every model in `catalog` belongs to one
+/// family (Anthropic or OpenAI) and the OTHER family has a credential in the
+/// injected `lookup`, returns a catalog remapped to sensible defaults of that
+/// other family plus a human-readable description of the swap. Returns `None`
+/// for mixed catalogs (no single family to fail away from) and when the
+/// destination family has no credential. Pure: the env lookup is injected so
+/// tests never touch process env.
+#[must_use]
+pub fn failover_catalog(
+    catalog: &ModelCatalog,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<(ModelCatalog, String)> {
+    let has = |key: &str| lookup(key).is_some_and(|value| !value.trim().is_empty());
+    let mut providers: Vec<ProviderKind> = catalog
+        .all_models()
+        .into_iter()
+        .map(provider_for_model)
+        .collect();
+    providers.dedup();
+    let [family] = providers.as_slice() else {
+        return None; // mixed-family catalog: nothing coherent to fail over
+    };
+    // Sensible defaults from the known presets: a fast tier for simple tasks,
+    // the family's strong general model everywhere else.
+    let (fast, strong, label) = match family {
+        ProviderKind::Anthropic if has("OPENAI_API_KEY") => ("gpt-4o-mini", "gpt-4o", "OpenAI"),
+        ProviderKind::OpenAi if has("ANTHROPIC_API_KEY") || has("ANTHROPIC_AUTH_TOKEN") => {
+            ("claude-haiku-4-5", "claude-sonnet-4-6", "Anthropic")
+        }
+        _ => return None,
+    };
+    let remapped = ModelCatalog {
+        simple: fast.to_string(),
+        medium: strong.to_string(),
+        complex: strong.to_string(),
+        director: strong.to_string(),
+        supervisor: strong.to_string(),
+    };
+    let description = format!(
+        "failover de proveedor → {label}: simple={fast}, \
+         medium/complex/director/supervisor={strong}"
+    );
+    Some((remapped, description))
+}
+
 #[must_use]
 pub fn provider_label(kind: ProviderKind) -> &'static str {
     match kind {
@@ -267,6 +312,63 @@ mod tests {
         assert_eq!(catalog.medium, DEFAULT_MEDIUM);
         assert_eq!(catalog.complex, DEFAULT_COMPLEX);
         assert_eq!(catalog.director, DEFAULT_COMPLEX);
+    }
+
+    #[test]
+    fn failover_remaps_anthropic_to_openai_when_the_key_exists() {
+        // Default catalog is all-Anthropic; an OPENAI_API_KEY enables the swap.
+        let (remapped, description) = failover_catalog(&ModelCatalog::default(), |key| match key {
+            "OPENAI_API_KEY" => Some("sk-test".to_string()),
+            _ => None,
+        })
+        .expect("failover available");
+        assert_eq!(remapped.simple, "gpt-4o-mini");
+        assert_eq!(remapped.medium, "gpt-4o");
+        assert_eq!(remapped.complex, "gpt-4o");
+        assert_eq!(remapped.director, "gpt-4o");
+        assert_eq!(remapped.supervisor, "gpt-4o");
+        assert!(description.contains("OpenAI"), "{description}");
+        assert!(description.contains("gpt-4o-mini"), "{description}");
+
+        // Without the destination credential there is nothing to fail to.
+        assert!(failover_catalog(&ModelCatalog::default(), |_| None).is_none());
+        // A blank key is not a credential.
+        assert!(
+            failover_catalog(&ModelCatalog::default(), |key| (key == "OPENAI_API_KEY")
+                .then(|| "   ".to_string()))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn failover_remaps_openai_to_anthropic_and_rejects_mixed_catalogs() {
+        let openai = ModelCatalog {
+            simple: "gpt-4o-mini".to_string(),
+            medium: "gpt-4o".to_string(),
+            complex: "gpt-4o".to_string(),
+            director: "gpt-4o".to_string(),
+            supervisor: "gpt-4o".to_string(),
+        };
+        // Either Anthropic credential works (API key or subscription token).
+        for credential in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+            let (remapped, description) = failover_catalog(&openai, |key| {
+                (key == credential).then(|| "token".to_string())
+            })
+            .expect("failover available");
+            assert_eq!(remapped.simple, "claude-haiku-4-5");
+            assert_eq!(remapped.supervisor, "claude-sonnet-4-6");
+            assert!(description.contains("Anthropic"), "{description}");
+        }
+
+        // A mixed-family catalog has no single provider to fail away from.
+        let mixed = ModelCatalog {
+            simple: "gpt-4o-mini".to_string(),
+            ..ModelCatalog::default()
+        };
+        assert!(
+            failover_catalog(&mixed, |_| Some("anything".to_string())).is_none(),
+            "mixed catalogs must not fail over"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ on:
       - .github/scripts/check_release_readiness.py
       - .github/scripts/check_usage_commands.py
       - .github/FUNDING.yml
+      - .github/coverage-floor.txt
       - CODE_OF_CONDUCT.md
       - CONTRIBUTING.md
       - LICENSE
@@ -36,6 +37,7 @@ on:
       - .github/scripts/check_release_readiness.py
       - .github/scripts/check_usage_commands.py
       - .github/FUNDING.yml
+      - .github/coverage-floor.txt
       - CODE_OF_CONDUCT.md
       - CONTRIBUTING.md
       - LICENSE
@@ -135,6 +137,55 @@ jobs:
         # warnings fail the build, and tests/benches are linted too.
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cargo-deny:
+    name: cargo deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    # continue-on-error while rust/deny.toml is unproven: cargo-deny could not
+    # be executed in the environment that authored it, so its allow-lists come
+    # from a manual Cargo.lock review. Harden (delete this line) once the
+    # first CI run passes.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # Docker-based action: the workflow-level `working-directory: rust`
+      # default only applies to `run:` steps, so the workspace is selected via
+      # manifest-path instead. cargo-deny picks up rust/deny.toml because it
+      # sits next to this manifest.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+
+  coverage:
+    name: coverage ratchet
+    runs-on: ubuntu-latest
+    # continue-on-error while the initial 50% floor in
+    # .github/coverage-floor.txt is unproven against a real cargo-llvm-cov
+    # run (not runnable in the environment that authored this job). Promote
+    # to blocking -- delete this line and set the floor to the measured
+    # percentage -- once the job passes in green. Ratchet rules:
+    # .github/COVERAGE.md
+    continue-on-error: true
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      # Version must match rust/rust-toolchain.toml. llvm-tools-preview is
+      # required by cargo-llvm-cov for instrumentation and report generation.
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Enforce line-coverage floor (ratchet, see .github/COVERAGE.md)
+        # Runs in rust/ (workflow default), so the floor file is read via
+        # GITHUB_WORKSPACE rather than a cwd-relative path.
+        run: |
+          floor="$(cat "$GITHUB_WORKSPACE/.github/coverage-floor.txt")"
+          echo "enforcing line-coverage floor: ${floor}%"
+          cargo llvm-cov --workspace --summary-only --fail-under-lines "$floor"
+
   bench-startup:
     name: startup benchmark
     runs-on: ubuntu-latest
@@ -204,3 +255,25 @@ jobs:
           } finally {
             Pop-Location
           }
+
+  test-windows:
+    name: cargo test --workspace (windows)
+    runs-on: windows-latest
+    # continue-on-error: workspace tests have only ever gated on Linux, so
+    # accumulated path/line-ending assumptions may fail here at first. Let the
+    # first runs report without blocking merges; promote to blocking (delete
+    # this line) once the job passes in green.
+    continue-on-error: true
+    env:
+      # One-shot CI runs get no benefit from incremental compilation, and the
+      # incremental artifacts bloat the Windows cache.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      # Version must match rust/rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust -> target
+      - name: Run workspace tests
+        run: cargo test --workspace

@@ -1012,8 +1012,26 @@ pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiErro
     Ok(())
 }
 
+/// Flat token estimate for one image block. Vision inputs bill by
+/// resolution, not payload bytes (Anthropic caps a single image around
+/// ~1,600 tokens); the bytes/4 text heuristic would count a 1.5 MB base64
+/// screenshot as ~390K tokens and falsely reject it against a 200K window.
+const IMAGE_BLOCK_TOKEN_ESTIMATE: u32 = 1_600;
+
 fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
     let mut estimate = estimate_serialized_tokens(&request.messages);
+    // Swap each image's byte-derived contribution for the flat per-image
+    // vision estimate.
+    for message in &request.messages {
+        for block in &message.content {
+            if let crate::types::InputContentBlock::Image { source } = block {
+                let payload_tokens = u32::try_from(source.data.len() / 4).unwrap_or(u32::MAX);
+                estimate = estimate
+                    .saturating_sub(payload_tokens)
+                    .saturating_add(IMAGE_BLOCK_TOKEN_ESTIMATE);
+            }
+        }
+    }
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tool_choice));
@@ -1648,6 +1666,33 @@ mod tests {
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }
+    }
+
+    /// Regression: image payloads must be estimated at the flat per-image
+    /// vision cost, not bytes/4 — otherwise a single 1.5 MB base64
+    /// screenshot (~390K "tokens") would falsely exceed the 200K claude
+    /// window and block valid multimodal requests in preflight.
+    #[test]
+    fn preflight_allows_large_image_payloads_within_context_window() {
+        let request = MessageRequest {
+            model: "claude-sonnet-4-6".to_string(),
+            max_tokens: 64_000,
+            messages: vec![InputMessage::user_text_with_images(
+                "what does this screenshot show?",
+                vec![crate::types::ImageAttachment {
+                    media_type: "image/png".to_string(),
+                    base64_data: "A".repeat(1_500_000),
+                }],
+            )],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            ..Default::default()
+        };
+
+        preflight_message_request(&request)
+            .expect("a single large image must not trip the context-window preflight");
     }
 
     #[test]

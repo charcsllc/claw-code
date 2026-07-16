@@ -1646,3 +1646,31 @@ mod tests {
         assert!(!component_contains_glob("src"));
     }
 }
+
+#[cfg(test)]
+mod read_limit_property_tests {
+    use super::parse_read_file_max_bytes;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `CLAW_READ_FILE_MAX_BYTES` parsing never leaves its
+        /// 64 KiB..=50 MiB clamp, whatever the raw value.
+        #[test]
+        fn parse_read_file_max_bytes_stays_within_clamp(
+            raw in proptest::option::of("\\PC{0,24}"),
+        ) {
+            let value = parse_read_file_max_bytes(raw.as_deref());
+            prop_assert!((65_536..=52_428_800).contains(&value));
+        }
+
+        /// Numeric strings — the parseable subset — are clamped, not passed
+        /// through.
+        #[test]
+        fn parse_read_file_max_bytes_clamps_all_numeric_inputs(value in any::<u64>()) {
+            let parsed = parse_read_file_max_bytes(Some(&value.to_string()));
+            prop_assert!((65_536..=52_428_800).contains(&parsed));
+        }
+    }
+}

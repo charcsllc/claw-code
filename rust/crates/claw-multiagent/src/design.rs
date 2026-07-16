@@ -1193,12 +1193,30 @@ pub fn audit_rendered_html(html: &str) -> Vec<String> {
     findings
 }
 
+/// True when `path` (project-relative) is inside the incremental-audit
+/// scope: `None` means "everything" (full audit); `Some(list)` restricts the
+/// per-file audits to exactly the listed project-relative paths (the format
+/// `git diff --name-only` / `git status --short` produce).
+fn file_in_scope(project_dir: &Path, path: &Path, changed: Option<&[String]>) -> bool {
+    let Some(changed) = changed else {
+        return true;
+    };
+    let rel = path.strip_prefix(project_dir).unwrap_or(path);
+    changed.iter().any(|candidate| Path::new(candidate) == rel)
+}
+
 /// Scans the project's stylesheets (tokens AND components) for `@font-face`
 /// rules without `font-display`. Lives next to the HTML audit because the
 /// rendered DOM only carries inline styles — linked stylesheets need their
 /// own pass. Capped: one finding per file.
 #[must_use]
 pub fn audit_font_display(project_dir: &Path) -> Vec<String> {
+    audit_font_display_scoped(project_dir, None)
+}
+
+/// [`audit_font_display`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_font_display_scoped(project_dir: &Path, changed: Option<&[String]>) -> Vec<String> {
     let mut findings = Vec::new();
     let mut pending: Vec<PathBuf> = ["src", "public", "assets", "static", "styles"]
         .iter()
@@ -1225,6 +1243,9 @@ pub fn audit_font_display(project_dir: &Path) -> Vec<String> {
             if !name.ends_with(".css") || name.ends_with(".min.css") {
                 continue;
             }
+            if !file_in_scope(project_dir, &path, changed) {
+                continue;
+            }
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -1247,6 +1268,15 @@ pub fn audit_font_display(project_dir: &Path) -> Vec<String> {
 /// prefixed as [TOKENS] by the gate.
 #[must_use]
 pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
+    audit_hardcoded_colors_scoped(project_dir, None)
+}
+
+/// [`audit_hardcoded_colors`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_hardcoded_colors_scoped(
+    project_dir: &Path,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     const COLOR_PROPS: &[&str] = &[
         "color",
         "background",
@@ -1278,6 +1308,9 @@ pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
             }
             // The token foundation itself is the one legitimate home of hex.
             if !name.ends_with(".css") || name.ends_with(".min.css") || name.contains("token") {
+                continue;
+            }
+            if !file_in_scope(project_dir, &path, changed) {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -1347,6 +1380,16 @@ fn img_budget_kb() -> u64 {
 /// bounded so a pathological tree cannot stall the gate.
 #[must_use]
 pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
+    audit_heavy_images_scoped(project_dir, budget_kb, None)
+}
+
+/// [`audit_heavy_images`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_heavy_images_scoped(
+    project_dir: &Path,
+    budget_kb: u64,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     // Same KB convention as the performance gate (1 KB = 1000 B).
     let budget_bytes = budget_kb * 1_000;
     let mut heavy: Vec<(String, u64)> = Vec::new();
@@ -1377,7 +1420,7 @@ pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
                         .iter()
                         .any(|known| known.eq_ignore_ascii_case(extension))
                 });
-            if !is_image {
+            if !is_image || !file_in_scope(project_dir, &path, changed) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -1427,6 +1470,16 @@ const MAX_FONT_FINDINGS: usize = 8;
 /// size), capped at [`MAX_FONT_FINDINGS`].
 #[must_use]
 pub fn audit_heavy_fonts(project_dir: &Path, budget_kb: u64) -> Vec<String> {
+    audit_heavy_fonts_scoped(project_dir, budget_kb, None)
+}
+
+/// [`audit_heavy_fonts`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_heavy_fonts_scoped(
+    project_dir: &Path,
+    budget_kb: u64,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     let budget_bytes = budget_kb * 1_000;
     let mut fonts: Vec<(PathBuf, String, u64)> = Vec::new(); // (path, ext, size)
     let mut pending: Vec<PathBuf> = IMAGE_DIRS.iter().map(|dir| project_dir.join(dir)).collect();
@@ -1456,6 +1509,9 @@ pub fn audit_heavy_fonts(project_dir: &Path, budget_kb: u64) -> Vec<String> {
             else {
                 continue;
             };
+            if !file_in_scope(project_dir, &path, changed) {
+                continue;
+            }
             let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
             fonts.push((path, extension, size));
         }
@@ -1511,6 +1567,23 @@ pub fn audit_heavy_fonts(project_dir: &Path, budget_kb: u64) -> Vec<String> {
 /// foundation.
 #[must_use]
 pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) -> Vec<String> {
+    run_design_gate_scoped(project_dir, docs, require_tokens, None)
+}
+
+/// Incremental design gate: like [`run_design_gate`], but when `changed` is
+/// `Some`, the PER-FILE audits (hardcoded colors, @font-face hygiene, heavy
+/// images/fonts) only consider the listed project-relative paths — an
+/// /improve run must be judged on what it touched, not on the whole legacy
+/// tree. The GLOBAL audits (token contrast, rendered-DOM accessibility)
+/// always run in full: a token edit or a rendered regression breaks the
+/// product no matter which file introduced it. `None` is the full audit.
+#[must_use]
+pub fn run_design_gate_scoped(
+    project_dir: &Path,
+    docs: &Path,
+    require_tokens: bool,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     let mut findings = Vec::new();
     let stylesheets = find_token_stylesheets(project_dir);
     if stylesheets.is_empty() && require_tokens {
@@ -1533,22 +1606,22 @@ pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) ->
         }
     }
     if require_tokens {
-        for finding in audit_hardcoded_colors(project_dir) {
+        for finding in audit_hardcoded_colors_scoped(project_dir, changed) {
             findings.push(format!("[TOKENS] {finding}"));
         }
     }
     // Linked stylesheets never reach the rendered-DOM audit, so @font-face
     // hygiene gets its own pass over the project CSS (same [A11Y] bucket:
     // an invisible-text flash is an accessibility failure, not taste).
-    for finding in audit_font_display(project_dir) {
+    for finding in audit_font_display_scoped(project_dir, changed) {
         findings.push(format!("[A11Y] {finding}"));
     }
     // Asset weight is objective in every mode: an oversized hero or a
     // 900 KB TTF costs the same first paint on /improve as on greenfield.
-    for finding in audit_heavy_images(project_dir, img_budget_kb()) {
+    for finding in audit_heavy_images_scoped(project_dir, img_budget_kb(), changed) {
         findings.push(format!("[PESO] {finding}"));
     }
-    for finding in audit_heavy_fonts(project_dir, img_budget_kb()) {
+    for finding in audit_heavy_fonts_scoped(project_dir, img_budget_kb(), changed) {
         findings.push(format!("[PESO] {finding}"));
     }
     findings
@@ -1925,6 +1998,63 @@ mod tests {
         // No token stylesheet anywhere: greenfield complains, improve doesn't.
         assert!(!run_design_gate(&dir, &docs, true).is_empty());
         assert!(run_design_gate(&dir, &docs, false).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_gate_limits_per_file_audits_to_the_changed_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-scoped-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(dir.join("src/styles")).expect("styles dir");
+        std::fs::create_dir_all(dir.join("public/img")).expect("img dir");
+        std::fs::create_dir_all(&docs).expect("docs");
+        // Two offending component stylesheets (hardcoded color + bare
+        // @font-face each), but only one of them is in the changed list.
+        let bad_css = ".btn { color: #ff0000; }\n@font-face { font-family: X; }\n";
+        std::fs::write(dir.join("src/styles/changed.css"), bad_css).expect("changed css");
+        std::fs::write(dir.join("src/styles/legacy.css"), bad_css).expect("legacy css");
+        // Two oversized images; only one is changed.
+        std::fs::write(dir.join("public/img/changed.png"), vec![0_u8; 900_000]).expect("png");
+        std::fs::write(dir.join("public/img/legacy.png"), vec![0_u8; 900_000]).expect("png");
+        // A broken token pair: the GLOBAL contrast audit must fire even when
+        // the token stylesheet is not in the changed list.
+        std::fs::write(
+            dir.join("src/styles/design-tokens.css"),
+            ":root {\n  --text-primary: #bbbbbb;\n  --surface-page: #cccccc;\n}\n",
+        )
+        .expect("tokens");
+
+        let changed = vec![
+            "src/styles/changed.css".to_string(),
+            "public/img/changed.png".to_string(),
+        ];
+        let findings = run_design_gate_scoped(&dir, &docs, true, Some(changed.as_slice()));
+        let joined = findings.join("\n");
+        // Per-file audits: only the changed files are reported.
+        assert!(joined.contains("changed.css"), "{joined}");
+        assert!(joined.contains("changed.png"), "{joined}");
+        assert!(!joined.contains("legacy.css"), "{joined}");
+        assert!(!joined.contains("legacy.png"), "{joined}");
+        // Global audit: the contrast failure survives the scoping.
+        assert!(joined.contains("[CONTRASTE]"), "{joined}");
+
+        // `None` (and the compat wrapper) audit everything.
+        let full = run_design_gate_scoped(&dir, &docs, true, None);
+        let full_joined = full.join("\n");
+        assert!(full_joined.contains("legacy.css"), "{full_joined}");
+        assert!(full_joined.contains("legacy.png"), "{full_joined}");
+        assert_eq!(run_design_gate(&dir, &docs, true), full);
+
+        // An EMPTY changed list means "nothing touched": per-file audits go
+        // quiet, global ones stay.
+        let none_changed = run_design_gate_scoped(&dir, &docs, true, Some(&[][..]));
+        assert!(none_changed.iter().all(|f| f.starts_with("[CONTRASTE]")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

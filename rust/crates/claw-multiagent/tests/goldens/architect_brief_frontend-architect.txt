@@ -1,0 +1,9 @@
+
+
+Your design document MUST contain these sections, each with concrete values:
+1. Route tree: every route, its page component file, and whether it is static, server-rendered or client-only.
+2. Data fetching per route: which data, from which endpoint, fetched where (loader/server/client), with loading and error states named.
+3. State management: what lives in URL, what in local state, what in a store (and WHICH store) — justify anything global.
+4. Component hierarchy for the 3 most complex pages (tree of component names mapped to files).
+5. Forms: validation library, error display pattern, submit states.
+6. Performance plan: code-splitting points, image strategy, what gets lazy-loaded.

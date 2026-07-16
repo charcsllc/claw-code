@@ -1,0 +1,15 @@
+Read docs/plan.json and the UX/UI design document under docs/. Product archetype: saas. Art direction (SaaS app): task flows first — forms with visible labels (never placeholder-as-label), inline validation on blur, primary action bottom-right of the form; onboarding empty states that teach (icon + one sentence + CTA); persistent left nav or topbar with the current section highlighted via more than color (weight/underline/background); destructive actions behind confirmation, styled --status-critical. Avoid: modal-on-modal, unsaved-changes traps, disabled buttons with no explanation.
+
+A VALIDATED token foundation already exists at `src/styles/design-tokens.css` (surfaces, ink, brand, status, 8 CVD-safe data slots, type scale, spacing, radii, shadows, z-index, motion, focus ring — light AND dark). Every text/surface pair in it meets WCAG AA. Build on it NOW:
+
+1. WIRE IT: import the tokens stylesheet AND `src/styles/base.css` (already written: focus-visible ring, selection, reduced-motion, .visually-hidden, sane defaults) globally — or map tokens through a Tailwind @theme block if tailwindcss is in devDependencies. Add a `data-theme` toggle (persisted to localStorage, defaulting to the OS preference) in the app shell.
+2. LAYOUT: containers use --container-sm/md/lg/xl; prose respects --measure; interactive elements respect --tap-target; transitions use --transition-base; modal backdrops use --backdrop.
+3. COMPONENTS under src/components/ui/ (or the stack's convention), each consuming ONLY tokens (a hardcoded hex/px is a review failure), each with default/hover/focus-visible/active/disabled states:
+- Button: primary (--color-primary + --color-primary-contrast), secondary (outline, --border-strong), ghost, destructive (--status-critical); loading state with inline spinner; min touch target 44px.
+- Input + Label + FieldError: visible label ALWAYS (placeholder is not a label), error state uses --status-critical border + message + aria-invalid/aria-describedby.
+- Card: --surface-raised, --radius-md, --shadow-1, hairline border.
+- Modal: --z-modal, focus trap, Escape closes, aria-modal, backdrop click.
+- Toast: --z-toast, status-colored left border + icon + label, auto-dismiss with pause-on-hover, aria-live=polite.
+- Badge, Skeleton (animated with --duration-base, honors reduced-motion), Spinner (with aria-label), EmptyState (icon + one sentence + CTA), Navbar (current section marked by MORE than color), Footer, Table (header --text-secondary, zebra --surface-sunken, numeric cells right-aligned with font-variant-numeric: tabular-nums).
+4. DOCUMENT: write docs/design-system.md — every token with its purpose, every component with a usage snippet and its states, the dark-mode toggle contract, and the rule that developers MUST use these components.
+5. VERIFY: the project still builds; both themes render; keyboard-tab reaches every control with a visible ring.

@@ -1,0 +1,11 @@
+docs/rendered-dom.html is the homepage DOM exactly as rendered after JavaScript ran (docs/screenshots/ may hold PNGs). Audit it against this rubric together with the UI source, FIX every failure directly in the repository, and write docs/visual-qa.md with a pass/fail per item:
+1. Hierarchy: exactly one h1; heading levels don't skip; the primary action of the page is visually dominant and unique.
+2. Real content: no lorem ipsum, no empty sections, no placeholder images, no {{unrendered}} template artifacts, no 'undefined'/'NaN' text.
+3. Spacing rhythm: section padding and gaps come from the spacing scale — no visually cramped (<8px) or accidental (>128px) gaps between siblings.
+4. Tokens discipline: computed styles use the CSS variables; flag any hardcoded hex colors in component styles.
+5. States: every button/link has hover and :focus-visible styles; forms show labels; disabled controls look disabled.
+6. Accessibility: landmarks (header/main/footer), img alt text, form label/aria wiring, touch targets >= 44px, contrast of any custom colors.
+7. Dark mode: toggle (or prefers-color-scheme) actually swaps surfaces and ink; nothing stays light-on-light or dark-on-dark.
+8. Responsive: at 320px nothing overflows horizontally; nav collapses; tables scroll inside their container, not the page.
+9. Dead UI: no href="#" links, no buttons that do nothing, no clickable divs, no target="_blank" without rel="noopener", no console errors visible in the DOM (error boundaries triggered).
+10. Feedback: async actions show loading state; failures surface a Toast or inline error, never silence; tables have <th> headers.

@@ -109,6 +109,25 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// A base64-encoded image attached to a user message (multimodal input).
+    /// Compaction replaces these with a [`image_placeholder_text`] text block
+    /// so giant base64 payloads never outlive a compaction cycle.
+    Image {
+        /// MIME type of the encoded image, e.g. `image/png`.
+        media_type: String,
+        /// Raw base64 payload (no `data:` URL prefix).
+        base64_data: String,
+    },
+}
+
+/// Human-readable stand-in for an image block once the base64 payload is
+/// dropped (compaction, adapters that only forward the latest images):
+/// `[imagen adjunta: image/png, 42 KB]`. `base64_len` is the length of the
+/// base64 payload in bytes; partial kilobytes round up.
+#[must_use]
+pub fn image_placeholder_text(media_type: &str, base64_len: usize) -> String {
+    let kilobytes = base64_len.div_ceil(1024);
+    format!("[imagen adjunta: {media_type}, {kilobytes} KB]")
 }
 
 /// One conversation message with optional token-usage metadata.
@@ -1083,6 +1102,20 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::Image {
+                media_type,
+                base64_data,
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "media_type".to_string(),
+                    JsonValue::String(media_type.clone()),
+                );
+                object.insert(
+                    "base64_data".to_string(),
+                    JsonValue::String(base64_data.clone()),
+                );
+            }
         }
         JsonValue::Object(object)
     }
@@ -1119,6 +1152,10 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "image" => Ok(Self::Image {
+                media_type: required_string(object, "media_type")?,
+                base64_data: required_string(object, "base64_data")?,
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -1381,6 +1418,26 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
                 JsonValue::String(sanitize_jsonl_field(output)),
             );
             object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
+        }
+        ContentBlock::Image {
+            media_type,
+            base64_data,
+        } => {
+            object.insert("type".to_string(), JsonValue::String("image".to_string()));
+            object.insert(
+                "media_type".to_string(),
+                JsonValue::String(media_type.clone()),
+            );
+            // Deliberately NOT sanitize_jsonl_field: the 16 KiB field
+            // truncation would corrupt any real image, and the secret
+            // scanner can false-positive on base64 runs (e.g. an embedded
+            // `npm_…`/`AKIA…` substring), also corrupting the payload.
+            // Base64 image data carries no shell/env text, and compaction
+            // guarantees the payload does not persist forever.
+            object.insert(
+                "base64_data".to_string(),
+                JsonValue::String(base64_data.clone()),
+            );
         }
     }
     JsonValue::Object(object)
@@ -1783,6 +1840,89 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    /// Image blocks must round-trip through the JSONL codec byte-for-byte,
+    /// even when the base64 payload exceeds the 16 KiB text-field truncation
+    /// threshold (image data is exempt from `sanitize_jsonl_field`).
+    #[test]
+    fn image_blocks_round_trip_through_session_jsonl() {
+        let base64_payload = "QUJDRA==".repeat(4 * 1024); // 32 KiB > MAX_JSONL_FIELD_CHARS
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: base64_payload.clone(),
+                    },
+                    ContentBlock::Text {
+                        text: "what does this show?".to_string(),
+                    },
+                ],
+                usage: None,
+            })
+            .expect("user message with image should append");
+
+        let path = temp_session_path("jsonl-image");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored, session);
+        let ContentBlock::Image {
+            media_type,
+            base64_data,
+        } = &restored.messages[0].blocks[0]
+        else {
+            panic!("first restored block should be an image");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64_data, &base64_payload,
+            "payload must not be truncated"
+        );
+    }
+
+    /// Backwards compatibility: session files written before the image
+    /// variant existed (only text/thinking/tool blocks) keep loading.
+    #[test]
+    fn pre_image_session_jsonl_still_loads() {
+        let path = write_temp_session_file(
+            "pre-image-compat",
+            concat!(
+                r#"{"type":"session_meta","version":1,"session_id":"sess-old","updated_at_ms":42}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"hi"}]}}"#,
+            ),
+        );
+        let restored = Session::load_from_path(&path).expect("old session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(
+            restored.messages[0].blocks[0],
+            ContentBlock::Text {
+                text: "hi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn image_placeholder_text_reports_media_type_and_rounded_kilobytes() {
+        assert_eq!(
+            super::image_placeholder_text("image/png", 42 * 1024),
+            "[imagen adjunta: image/png, 42 KB]"
+        );
+        assert_eq!(
+            super::image_placeholder_text("image/jpeg", 1025),
+            "[imagen adjunta: image/jpeg, 2 KB]"
+        );
+        assert_eq!(
+            super::image_placeholder_text("image/webp", 0),
+            "[imagen adjunta: image/webp, 0 KB]"
+        );
     }
 
     #[test]
@@ -2554,5 +2694,113 @@ mod workspace_sessions_dir_tests {
             session.heartbeat_at(1_000, 500, false).liveness,
             SessionLiveness::TransportDead
         );
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::{parse_max_session_mb, redact_secrets};
+    use proptest::prelude::*;
+
+    /// The known credential prefixes, rebuilt at runtime with `format!` so
+    /// no secret-shaped literal ever lands in the source tree (GitHub push
+    /// protection rejects them).
+    fn known_secret_prefixes() -> Vec<String> {
+        vec![
+            format!("sk-{}-", "ant"),
+            format!("sk{}", "-"),
+            format!("gh{}_", "p"),
+            format!("github_{}_", "pat"),
+            format!("gl{}-", "pat"),
+            format!("xox{}-", "b"),
+            format!("xox{}-", "p"),
+            format!("np{}_", "m"),
+            format!("AK{}", "IA"),
+        ]
+    }
+
+    /// True when `input` could plausibly trigger redaction: it embeds a
+    /// known prefix or the (case-sensitive) `Bearer` keyword.
+    fn has_secret_markers(input: &str) -> bool {
+        known_secret_prefixes()
+            .iter()
+            .any(|prefix| input.contains(prefix.as_str()))
+            || input.contains("Bearer")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Redaction is idempotent: a second pass never rewrites the first
+        /// pass's output (masked stubs stay below the length floors).
+        #[test]
+        fn redact_secrets_is_idempotent(input in "\\PC{0,128}") {
+            let once = redact_secrets(&input);
+            let twice = redact_secrets(&once);
+            prop_assert_eq!(twice, once);
+        }
+
+        /// Inputs with no secret markers pass through untouched — in
+        /// particular, redaction never lengthens them.
+        #[test]
+        fn redact_secrets_leaves_secret_free_input_unchanged(input in "\\PC{0,128}") {
+            prop_assume!(!has_secret_markers(&input));
+            let redacted = redact_secrets(&input);
+            prop_assert!(redacted.len() <= input.len());
+            prop_assert_eq!(redacted, input);
+        }
+
+        /// A token carrying a known prefix (and meeting the length floor)
+        /// never survives whole in the output, and redacting the redacted
+        /// text is still a fixed point.
+        #[test]
+        fn redact_secrets_never_leaks_full_known_prefix_tokens(
+            prefix_index in 0usize..9,
+            suffix in "[A-Za-z0-9_\\-]{26,48}",
+            lead in "[a-z ]{0,12}",
+            trail in "[a-z ]{0,12}",
+        ) {
+            let token = format!("{}{}", known_secret_prefixes()[prefix_index], suffix);
+            let input = format!("{lead} {token} {trail}");
+
+            let redacted = redact_secrets(&input);
+
+            prop_assert!(
+                !redacted.contains(&token),
+                "full token survived redaction: {redacted}"
+            );
+            let again = redact_secrets(&redacted);
+            prop_assert_eq!(again, redacted);
+        }
+
+        /// Long `Bearer` tokens are always masked as well.
+        #[test]
+        fn redact_secrets_never_leaks_long_bearer_tokens(
+            suffix in "[A-Za-z0-9_\\-]{30,60}",
+        ) {
+            let input = format!("Authorization: Bearer {suffix}");
+            let redacted = redact_secrets(&input);
+            prop_assert!(
+                !redacted.contains(&suffix),
+                "bearer token survived redaction: {redacted}"
+            );
+        }
+
+        /// `CLAW_MAX_SESSION_MB` parsing never leaves its 1..=1000 clamp.
+        #[test]
+        fn parse_max_session_mb_stays_within_clamp(
+            raw in proptest::option::of("\\PC{0,24}"),
+        ) {
+            let value = parse_max_session_mb(raw.as_deref());
+            prop_assert!((1..=1000).contains(&value));
+        }
+
+        /// Numeric strings — the parseable subset — are clamped, not passed
+        /// through.
+        #[test]
+        fn parse_max_session_mb_clamps_all_numeric_inputs(value in any::<u64>()) {
+            let parsed = parse_max_session_mb(Some(&value.to_string()));
+            prop_assert!((1..=1000).contains(&parsed));
+        }
     }
 }

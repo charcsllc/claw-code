@@ -282,8 +282,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "doctor",
         aliases: &[],
-        summary: "Diagnose setup issues and environment health",
-        argument_hint: Some("[online]"),
+        summary: "Diagnose setup issues and environment health (fix repairs them)",
+        argument_hint: Some("[online|fix]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -521,7 +521,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "design-review",
         aliases: &[],
         summary: "Deterministic design audit: WCAG token contrast + rendered-HTML accessibility (0 tokens)",
-        argument_hint: Some("[fix]"),
+        argument_hint: Some("[fix|changed]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1178,6 +1178,7 @@ pub enum SlashCommand {
     },
     Doctor {
         online: bool,
+        fix: bool,
     },
     Setup,
     Login,
@@ -1202,6 +1203,7 @@ pub enum SlashCommand {
     SecurityReview,
     DesignReview {
         fix: bool,
+        changed: bool,
     },
     Keybindings,
     PrivacySettings,
@@ -1512,10 +1514,20 @@ pub fn validate_slash_command_input(
             args: parse_skills_args(remainder.as_deref())?,
         },
         "doctor" | "providers" => match args.as_slice() {
-            [] => SlashCommand::Doctor { online: false },
-            ["online" | "--online"] => SlashCommand::Doctor { online: true },
+            [] => SlashCommand::Doctor {
+                online: false,
+                fix: false,
+            },
+            ["online" | "--online"] => SlashCommand::Doctor {
+                online: true,
+                fix: false,
+            },
+            ["fix" | "--fix"] => SlashCommand::Doctor {
+                online: false,
+                fix: true,
+            },
             _ => {
-                return Err(usage_error(command, "[online]"));
+                return Err(usage_error(command, "[online|fix]"));
             }
         },
         "setup" => {
@@ -1603,10 +1615,20 @@ pub fn validate_slash_command_input(
             SlashCommand::SecurityReview
         }
         "design-review" => match args.as_slice() {
-            [] => SlashCommand::DesignReview { fix: false },
-            ["fix" | "--fix"] => SlashCommand::DesignReview { fix: true },
+            [] => SlashCommand::DesignReview {
+                fix: false,
+                changed: false,
+            },
+            ["fix" | "--fix"] => SlashCommand::DesignReview {
+                fix: true,
+                changed: false,
+            },
+            ["changed" | "--changed"] => SlashCommand::DesignReview {
+                fix: false,
+                changed: true,
+            },
             _ => {
-                return Err(usage_error(command, "[fix]"));
+                return Err(usage_error(command, "[fix|changed]"));
             }
         },
         "keybindings" => {

@@ -1151,10 +1151,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
-        CliAction::DesignReview { output_format } => {
-            let findings = collect_design_review_findings();
+        CliAction::DesignReview {
+            changed,
+            output_format,
+        } => {
+            let findings = collect_design_review_findings(changed);
             match output_format {
-                CliOutputFormat::Text => println!("{}", format_design_review_report()),
+                CliOutputFormat::Text => println!("{}", format_design_review_report(changed)),
                 CliOutputFormat::Json => println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1300,6 +1303,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     DesignReview {
+        changed: bool,
         output_format: CliOutputFormat,
     },
     Export {
@@ -2069,13 +2073,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // contrast + HTML audit); exit code 1 on findings makes it usable
         // as a CI check.
         "design-review" => {
-            if rest.len() > 1 {
+            let changed = rest[1..]
+                .iter()
+                .any(|arg| arg == "--changed" || arg == "changed");
+            let extra: Vec<&String> = rest[1..]
+                .iter()
+                .filter(|arg| *arg != "--changed" && *arg != "changed")
+                .collect();
+            if !extra.is_empty() {
                 return Err(
-                    "Usage: claw design-review [--output-format json]\n  (sin argumentos; 'fix' solo existe dentro del REPL)"
+                    "Usage: claw design-review [--changed] [--output-format json]\n  ('fix' solo existe dentro del REPL)"
                         .to_string(),
                 );
             }
-            Ok(CliAction::DesignReview { output_format })
+            Ok(CliAction::DesignReview {
+                changed,
+                output_format,
+            })
         }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
@@ -2657,14 +2671,18 @@ fn parse_direct_slash_cli_action(
             path,
             output_format,
         }),
-        Ok(Some(SlashCommand::DesignReview { fix: false })) => {
-            Ok(CliAction::DesignReview { output_format })
-        }
-        Ok(Some(SlashCommand::DesignReview { fix: true })) => Err(
+        Ok(Some(SlashCommand::DesignReview {
+            fix: false,
+            changed,
+        })) => Ok(CliAction::DesignReview {
+            changed,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::DesignReview { fix: true, .. })) => Err(
             "design-review fix necesita una sesión con modelo. Arranca `claw` y ejecuta /design-review fix en el REPL.".to_string(),
         ),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
-        Ok(Some(SlashCommand::Doctor { online: _ })) => Ok(CliAction::Doctor {
+        Ok(Some(SlashCommand::Doctor { .. })) => Ok(CliAction::Doctor {
             output_format,
             permission_mode,
         }),
@@ -6418,6 +6436,9 @@ fn format_context_breakdown(session: &Session, system_prompt: &[String]) -> Stri
                     MessageRole::User => user_chars += text.len(),
                     MessageRole::Assistant | MessageRole::Tool => assistant_chars += text.len(),
                 },
+                // Vision pricing is flat per image, not per byte; count the
+                // same 1600-token estimate the runtime uses (×4 chars/token).
+                ContentBlock::Image { .. } => user_chars += 6_400,
                 ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { input, .. } => {
                     tool_chars += input.to_string().len();
@@ -7073,7 +7094,7 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
-        SlashCommand::Doctor { online } => {
+        SlashCommand::Doctor { online, fix } => {
             let report = render_doctor_report(
                 ConfigWarningMode::EmitStderr,
                 permission_mode_provenance_for_current_dir(),
@@ -7082,6 +7103,10 @@ fn run_resume_command(
             if *online {
                 message.push('\n');
                 message.push_str(&doctor_online_section());
+            }
+            if *fix {
+                message.push('\n');
+                message.push_str(&doctor_apply_fixes());
             }
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -7683,14 +7708,47 @@ fn format_security_review_report() -> String {
 /// current project — WCAG contrast of any token stylesheet, accessibility
 /// audit of `docs/rendered-dom.html`/`index.html` if present, and token
 /// discipline. Deterministic, zero tokens.
-fn collect_design_review_findings() -> Vec<String> {
+/// Working-tree changes vs HEAD (modified + staged + untracked) — the file
+/// scope `--changed` narrows the design audit to.
+fn changed_files_in_cwd() -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for args in [
+        &["diff", "--name-only", "HEAD"][..],
+        &["ls-files", "--others", "--exclude-standard"][..],
+    ] {
+        if let Ok(output) = std::process::Command::new("git").args(args).output() {
+            files.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+fn collect_design_review_findings(changed_only: bool) -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut findings = claw_multiagent::design::run_design_gate(&cwd, &cwd.join("docs"), false);
+    let changed = changed_only.then(changed_files_in_cwd);
+    let mut findings = claw_multiagent::design::run_design_gate_scoped(
+        &cwd,
+        &cwd.join("docs"),
+        false,
+        changed.as_deref(),
+    );
     // Outside a multiagent build there is rarely a rendered DOM capture;
     // fall back to auditing the source index.html so the command is useful
     // on any web project.
     if !cwd.join("docs/rendered-dom.html").exists() {
         for candidate in ["index.html", "public/index.html", "src/index.html"] {
+            if changed
+                .as_ref()
+                .is_some_and(|files| !files.iter().any(|file| file == candidate))
+            {
+                continue;
+            }
             if let Ok(html) = std::fs::read_to_string(cwd.join(candidate)) {
                 for finding in claw_multiagent::design::audit_rendered_html(&html) {
                     findings.push(format!("[A11Y] {candidate}: {finding}"));
@@ -7699,7 +7757,16 @@ fn collect_design_review_findings() -> Vec<String> {
             }
         }
     }
+    // Token discipline runs here (the gate itself only enforces it when
+    // require_tokens is set); with --changed, keep only findings that name
+    // a changed file.
     for finding in claw_multiagent::design::audit_hardcoded_colors(&cwd) {
+        if changed
+            .as_ref()
+            .is_some_and(|files| !files.iter().any(|file| finding.contains(file.as_str())))
+        {
+            continue;
+        }
         findings.push(format!("[TOKENS] {finding}"));
     }
     findings
@@ -7722,17 +7789,23 @@ fn design_review_fix_prompt(findings: &[String]) -> String {
     prompt
 }
 
-fn format_design_review_report() -> String {
+fn format_design_review_report(changed_only: bool) -> String {
     use std::fmt::Write as _;
-    let findings = collect_design_review_findings();
+    let findings = collect_design_review_findings(changed_only);
+    let scope_note = if changed_only {
+        " — solo archivos cambiados (git)"
+    } else {
+        ""
+    };
     if findings.is_empty() {
-        return "Design review (checks deterministas, 0 tokens)\n  Result           ok — \
+        return format!(
+            "Design review (checks deterministas, 0 tokens{scope_note})\n  Result           ok — \
                 sin fallos de contraste WCAG, accesibilidad HTML ni disciplina de tokens\n  \
                 Nota             audita stylesheets de tokens, index.html/rendered-dom y CSS de componentes"
-            .to_string();
+        );
     }
     let mut out = format!(
-        "Design review (checks deterministas, 0 tokens)\n  Findings         {}\n",
+        "Design review (checks deterministas, 0 tokens{scope_note})\n  Findings         {}\n",
         findings.len()
     );
     for finding in findings.iter().take(25) {
@@ -7959,6 +8032,84 @@ fn failover_hint(error: &str) -> Option<String> {
     ))
 }
 
+/// `/doctor fix`: repairs what the doctor can fix mechanically — lax
+/// permissions on files that hold credentials/conversations, and the
+/// unconfigured git hooks path when the repo ships hooks. Typing `fix`
+/// is the consent; every action taken (or not needed) is reported.
+fn doctor_apply_fixes() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("Doctor fix");
+    let mut acted = false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let targets = [
+            (runtime::default_config_home().join("settings.json"), 0o600),
+            (
+                runtime::default_config_home().join("settings.local.json"),
+                0o600,
+            ),
+        ];
+        for (path, mode) in targets {
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            acted = true;
+            match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                Ok(()) => {
+                    let _ = write!(out, "\n  Reparado         {} → {mode:o}", path.display());
+                }
+                Err(error) => {
+                    let _ = write!(out, "\n  Error            {}: {error}", path.display());
+                }
+            }
+        }
+        if let Ok(dir) = sessions_dir() {
+            if let Ok(metadata) = std::fs::metadata(&dir) {
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    acted = true;
+                    match std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                        Ok(()) => {
+                            let _ = write!(out, "\n  Reparado         {} → 700", dir.display());
+                        }
+                        Err(error) => {
+                            let _ = write!(out, "\n  Error            {}: {error}", dir.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Repo ships hooks but git is not pointed at them.
+    if std::path::Path::new(".githooks").is_dir() {
+        let configured = std::process::Command::new("git")
+            .args(["config", "core.hooksPath"])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty());
+        if configured.is_none() {
+            acted = true;
+            let result = std::process::Command::new("git")
+                .args(["config", "core.hooksPath", ".githooks"])
+                .status();
+            match result {
+                Ok(status) if status.success() => {
+                    out.push_str("\n  Reparado         core.hooksPath → .githooks");
+                }
+                _ => out.push_str("\n  Error            no se pudo configurar core.hooksPath"),
+            }
+        }
+    }
+    if !acted {
+        out.push_str("\n  Result           nada que reparar — permisos y hooks ya correctos");
+    }
+    out
+}
+
 /// `/doctor online`: the doctor report is static analysis; this appends one
 /// live 1-token probe of the active provider plus the credential env vars
 /// that are actually set.
@@ -8042,6 +8193,21 @@ fn run_repl(
     // or a killed terminal — surface the resume path once.
     if let Some(hint) = crashed_session_hint(&cli.session.id) {
         println!("{hint}");
+    }
+    // Background agents finish while the user is typing; the external
+    // printer interjects the notice above the prompt without corrupting
+    // the edit line. Polling beats a channel here: the queue is tiny and
+    // the thread dies with the process.
+    if let Some(mut printer) = editor.external_printer() {
+        std::thread::spawn(move || {
+            use rustyline::ExternalPrinter as _;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                for notice in tools::take_agent_notices() {
+                    let _ = printer.print(notice);
+                }
+            }
+        });
     }
 
     let mut exit_hint_shown = false;
@@ -9530,7 +9696,7 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Doctor { online } => {
+            SlashCommand::Doctor { online, fix } => {
                 println!(
                     "{}",
                     render_doctor_report(
@@ -9541,6 +9707,9 @@ impl LiveCli {
                 );
                 if online {
                     println!("{}", doctor_online_section());
+                }
+                if fix {
+                    println!("{}", doctor_apply_fixes());
                 }
                 false
             }
@@ -9906,10 +10075,10 @@ impl LiveCli {
                 println!("{}", format_security_review_report());
                 false
             }
-            SlashCommand::DesignReview { fix } => {
-                println!("{}", format_design_review_report());
+            SlashCommand::DesignReview { fix, changed } => {
+                println!("{}", format_design_review_report(changed));
                 if fix {
-                    let findings = collect_design_review_findings();
+                    let findings = collect_design_review_findings(changed);
                     if findings.is_empty() {
                         println!("  Fix              nada que corregir — la auditoría está limpia");
                     } else {
@@ -13504,6 +13673,13 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image {
+                    media_type,
+                    base64_data,
+                } => lines.push(runtime::image_placeholder_text(
+                    media_type,
+                    base64_data.len(),
+                )),
                 ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
@@ -13741,6 +13917,16 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Image {
+                    media_type,
+                    base64_data,
+                } => {
+                    lines.push(runtime::image_placeholder_text(
+                        media_type,
+                        base64_data.len(),
+                    ));
+                    lines.push(String::new());
                 }
                 ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
@@ -16027,6 +16213,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type,
+                        base64_data,
+                    } => InputContentBlock::from(api::ImageAttachment {
+                        media_type: media_type.clone(),
+                        base64_data: base64_data.clone(),
+                    }),
                     ContentBlock::Thinking {
                         thinking,
                         signature,

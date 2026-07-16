@@ -1,4 +1,6 @@
-use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::session::{
+    image_placeholder_text, ContentBlock, ConversationMessage, MessageRole, Session,
+};
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
@@ -165,7 +167,14 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         k
     };
     let removed = &session.messages[compacted_prefix_len..keep_from];
-    let preserved = session.messages[keep_from..].to_vec();
+    // Never keep giant base64 payloads past a compaction cycle: image blocks
+    // in the preserved tail collapse to a text placeholder. Removed messages
+    // already surface as placeholders through `summarize_block`.
+    let preserved = session.messages[keep_from..]
+        .iter()
+        .cloned()
+        .map(replace_images_with_placeholders)
+        .collect::<Vec<_>>();
     let summary =
         merge_compact_summaries(existing_summary.as_deref(), &summarize_messages(removed));
     let formatted_summary = format_compact_summary(&summary);
@@ -220,7 +229,9 @@ fn summarize_messages(messages: &[ConversationMessage]) -> String {
         .filter_map(|block| match block {
             ContentBlock::ToolUse { name, .. } => Some(name.as_str()),
             ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.as_str()),
-            ContentBlock::Text { .. } | ContentBlock::Thinking { .. } => None,
+            ContentBlock::Text { .. }
+            | ContentBlock::Thinking { .. }
+            | ContentBlock::Image { .. } => None,
         })
         .collect::<Vec<_>>();
     tool_names.sort_unstable();
@@ -324,6 +335,23 @@ fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str) ->
     lines.join("\n")
 }
 
+/// Swaps every [`ContentBlock::Image`] in `message` for its text
+/// placeholder, leaving all other blocks untouched.
+fn replace_images_with_placeholders(mut message: ConversationMessage) -> ConversationMessage {
+    for block in &mut message.blocks {
+        if let ContentBlock::Image {
+            media_type,
+            base64_data,
+        } = block
+        {
+            *block = ContentBlock::Text {
+                text: image_placeholder_text(media_type, base64_data.len()),
+            };
+        }
+    }
+    message
+}
+
 fn summarize_block(block: &ContentBlock) -> String {
     let raw = match block {
         ContentBlock::Text { text } => text.clone(),
@@ -340,6 +368,10 @@ fn summarize_block(block: &ContentBlock) -> String {
             "tool_result {tool_name}: {}{output}",
             if *is_error { "error " } else { "" }
         ),
+        ContentBlock::Image {
+            media_type,
+            base64_data,
+        } => image_placeholder_text(media_type, base64_data.len()),
     };
     truncate_summary(&raw, 160)
 }
@@ -392,6 +424,8 @@ fn collect_key_files(messages: &[ConversationMessage]) -> Vec<String> {
             ContentBlock::ToolUse { input, .. } => input.as_str(),
             ContentBlock::ToolResult { output, .. } => output.as_str(),
             ContentBlock::Thinking { thinking, .. } => thinking.as_str(),
+            // Base64 payloads never contain path candidates.
+            ContentBlock::Image { .. } => "",
         })
         .flat_map(extract_file_candidates)
         .collect::<Vec<_>>();
@@ -415,7 +449,8 @@ fn first_text_block(message: &ConversationMessage) -> Option<&str> {
         ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. }
         | ContentBlock::Thinking { .. }
-        | ContentBlock::Text { .. } => None,
+        | ContentBlock::Text { .. }
+        | ContentBlock::Image { .. } => None,
     })
 }
 
@@ -455,6 +490,12 @@ fn truncate_summary(content: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Flat token estimate for one image block. Vision models bill images by
+/// resolution, not payload bytes (Anthropic caps a single image around
+/// ~1_600 tokens); dividing base64 length by 4 would wildly overestimate
+/// and force compaction the moment any screenshot lands in the session.
+const IMAGE_BLOCK_TOKEN_ESTIMATE: usize = 1_600;
+
 fn estimate_message_tokens(message: &ConversationMessage) -> usize {
     message
         .blocks
@@ -469,6 +510,7 @@ fn estimate_message_tokens(message: &ConversationMessage) -> usize {
                 thinking,
                 signature,
             } => thinking.len() / 4 + signature.as_ref().map_or(0, |value| value.len() / 4 + 1),
+            ContentBlock::Image { .. } => IMAGE_BLOCK_TOKEN_ESTIMATE,
         })
         .sum()
 }
@@ -830,6 +872,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Compaction must never keep giant base64 payloads: images in removed
+    /// messages surface as placeholders in the summary, and images in the
+    /// preserved tail are swapped for placeholder text blocks.
+    #[test]
+    fn compaction_replaces_image_blocks_with_placeholders() {
+        let base64_payload = "QUJDRA==".repeat(1024); // 8 KiB
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: base64_payload.clone(),
+                    },
+                    ContentBlock::Text {
+                        text: "review this old screenshot ".repeat(100),
+                    },
+                ],
+                usage: None,
+            },
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "looked at it ".repeat(200),
+            }]),
+            ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Image {
+                        media_type: "image/jpeg".to_string(),
+                        base64_data: base64_payload.clone(),
+                    },
+                    ContentBlock::Text {
+                        text: "and this recent one?".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "recent answer".to_string(),
+            }]),
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 2,
+                max_estimated_tokens: 1,
+            },
+        );
+
+        // Placeholder for the removed image shows up in the summary timeline.
+        assert!(
+            result
+                .formatted_summary
+                .contains("[imagen adjunta: image/png, 8 KB]"),
+            "summary should describe the removed image: {}",
+            result.formatted_summary
+        );
+        // No message in the compacted session retains an image block or the
+        // base64 payload.
+        for message in &result.compacted_session.messages {
+            for block in &message.blocks {
+                assert!(
+                    !matches!(block, ContentBlock::Image { .. }),
+                    "compacted session must not retain image blocks"
+                );
+                if let ContentBlock::Text { text } = block {
+                    assert!(
+                        !text.contains(&base64_payload),
+                        "compacted session must not retain base64 payloads"
+                    );
+                }
+            }
+        }
+        // The preserved recent user message keeps its position and gains the
+        // placeholder text in place of the image.
+        let preserved_user = &result.compacted_session.messages[1];
+        assert_eq!(preserved_user.role, MessageRole::User);
+        assert_eq!(
+            preserved_user.blocks[0],
+            ContentBlock::Text {
+                text: "[imagen adjunta: image/jpeg, 8 KB]".to_string()
+            }
+        );
+        assert_eq!(
+            preserved_user.blocks[1],
+            ContentBlock::Text {
+                text: "and this recent one?".to_string()
+            }
+        );
     }
 
     #[test]

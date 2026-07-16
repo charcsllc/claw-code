@@ -35,7 +35,7 @@ impl Drop for ReplEnvGuard {
 }
 
 const USAGE: &str = "Usage: /web <prompt> [--dry-run] [--approve] [--parallel N] \
-[--output <dir>] [--resume] [--max-cost-usd X] [--build-cmd <cmd|off>] [--no-scaffold] \
+[--output <dir>] [--resume] [--max-cost X] [--build-cmd <cmd|off>] [--no-scaffold] \
 [--timeout-secs N] [--archetype <nombre>]\n\
                             /app <prompt> [same options]\n\
                             /improve <prompt> [same options; opera sobre el proyecto actual]\n\
@@ -45,7 +45,9 @@ docs/plan.json y docs/backlog.json con el desglose de presupuesto, y se detiene 
 sin desarrollar nada.\n\
                      --resume reanuda un build interrumpido; sin él, /web y /app detectan \
 el estado pendiente y ofrecen reanudar desde la última fase completada.\n\
-                     --max-cost-usd is OFF by default (subscription accounts).\n\
+                     --max-cost <usd> (alias --max-cost-usd) is OFF by default \
+(subscription accounts); con tope, el build avisa al 80% y se corta en el siguiente \
+checkpoint al superarlo (reanudable con --resume).\n\
                      --archetype fuerza la dirección de arte (landing, ecommerce, dashboard, \
 saas, content, fintech, social, booking, general) en vez de detectarla del plan.\n\
                      Env: CLAW_MA_{SIMPLE,MEDIUM,COMPLEX,DIRECTOR,SUPERVISOR}_MODEL \
@@ -70,6 +72,24 @@ pub(crate) fn take_archetype_value<'a>(
     tokens
         .get(*index)
         .copied()
+        .ok_or_else(|| MISSING.to_string())
+}
+
+/// Extracts the value of `--max-cost`, accepting both `--max-cost <usd>`
+/// (advances `index` past the value) and `--max-cost=<usd>` — the same
+/// conventions as `--archetype`. The value must be a positive number: a
+/// typo silently parsed as "no ceiling" would defeat the whole flag.
+pub(crate) fn take_max_cost_value(tokens: &[&str], index: &mut usize) -> Result<f64, String> {
+    const MISSING: &str = "--max-cost espera un número positivo (USD), p. ej. --max-cost 5";
+    let raw = if let Some(value) = tokens[*index].strip_prefix("--max-cost=") {
+        value
+    } else {
+        *index += 1;
+        tokens.get(*index).copied().ok_or(MISSING)?
+    };
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value > 0.0)
         .ok_or_else(|| MISSING.to_string())
 }
 
@@ -163,6 +183,9 @@ pub(crate) fn parse_build_args(raw: &str, mode: BuildMode) -> Result<Option<Buil
                         .and_then(|value| value.parse().ok())
                         .ok_or("--max-cost-usd expects a number (USD)")?,
                 );
+            }
+            word if word == "--max-cost" || word.starts_with("--max-cost=") => {
+                args.max_cost_usd = Some(take_max_cost_value(&tokens, &mut index)?);
             }
             "--build-cmd" => {
                 index += 1;
@@ -370,7 +393,9 @@ pub(crate) fn run_multiagent_build(
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_parallel, parse_build_args, parse_yes, take_archetype_value};
+    use super::{
+        clamp_parallel, parse_build_args, parse_yes, take_archetype_value, take_max_cost_value,
+    };
     use claw_multiagent::{parse_archetype, BuildMode, DesignArchetype};
     use std::path::PathBuf;
 
@@ -450,6 +475,52 @@ mod tests {
             "tienda --timeout-secs 0",
             "tienda --output",
             "tienda --build-cmd",
+        ] {
+            assert!(
+                parse_build_args(bad, BuildMode::Greenfield).is_err(),
+                "`{bad}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn max_cost_flag_accepts_both_token_forms_and_sets_the_ceiling() {
+        // Two-token form: `--max-cost 5` (index advances past the value).
+        let tokens = ["--max-cost", "5", "resto"];
+        let mut index = 0;
+        assert_eq!(take_max_cost_value(&tokens, &mut index), Ok(5.0));
+        assert_eq!(index, 1, "value token consumed");
+
+        // Inline form: `--max-cost=2.5` (index untouched).
+        let tokens = ["--max-cost=2.5"];
+        let mut index = 0;
+        assert_eq!(take_max_cost_value(&tokens, &mut index), Ok(2.5));
+        assert_eq!(index, 0);
+
+        // End-to-end through the argument parser, both forms.
+        let args = parse_build_args("una tienda --max-cost 3.5", BuildMode::Greenfield)
+            .expect("parses")
+            .expect("has prompt");
+        assert_eq!(args.max_cost_usd, Some(3.5));
+        assert_eq!(args.prompt, "una tienda");
+        let args = parse_build_args("--max-cost=0.75 una tienda", BuildMode::Improve)
+            .expect("parses")
+            .expect("has prompt");
+        assert_eq!(args.max_cost_usd, Some(0.75));
+        // The legacy spelling keeps working and maps to the same field.
+        let args = parse_build_args("una tienda --max-cost-usd 2.5", BuildMode::Greenfield)
+            .expect("parses")
+            .expect("has prompt");
+        assert_eq!(args.max_cost_usd, Some(2.5));
+
+        // Malformed values fail loudly instead of building without a ceiling.
+        for bad in [
+            "tienda --max-cost",
+            "tienda --max-cost gratis",
+            "tienda --max-cost=",
+            "tienda --max-cost -1",
+            "tienda --max-cost 0",
+            "tienda --max-cost=nan",
         ] {
             assert!(
                 parse_build_args(bad, BuildMode::Greenfield).is_err(),
