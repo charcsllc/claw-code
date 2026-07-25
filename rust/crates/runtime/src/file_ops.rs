@@ -1001,14 +1001,33 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
         return Ok(simplify_canonical(canonical));
     }
 
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .map(simplify_canonical)
-            .unwrap_or_else(|_| parent.to_path_buf());
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+    // The file — possibly part of its directory chain — does not exist yet:
+    // canonicalize the deepest existing ancestor and rejoin the missing
+    // suffix (resolving `.`/`..` lexically), so the result stays comparable
+    // with canonicalized workspace roots. Falling back to the raw candidate
+    // instead breaks that comparison on Windows, where the raw path may use
+    // 8.3 short names (RUNNER~1) while the root is in long form.
+    let mut existing = candidate.as_path();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
         }
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            let mut resolved = simplify_canonical(canonical_parent);
+            for part in missing.iter().rev() {
+                if part == "." {
+                    continue;
+                }
+                if part == ".." {
+                    resolved.pop();
+                    continue;
+                }
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+        existing = parent;
     }
 
     Ok(candidate)
