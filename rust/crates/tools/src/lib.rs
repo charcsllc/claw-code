@@ -2257,7 +2257,7 @@ fn has_dangerous_paths(command: &str) -> bool {
             return true;
         }
 
-        if looks_like_windows_absolute_path(token) {
+        if !cfg!(windows) && looks_like_windows_absolute_path(token) {
             return true;
         }
 
@@ -2613,7 +2613,7 @@ fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -2709,7 +2709,7 @@ fn is_within_workspace(path: &str) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -8333,7 +8333,11 @@ mod tests {
         let claw_dir = worktree.join(".claw");
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
-        let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
+        // JSON-escape the backslashes Windows temp paths contain.
+        let tmp_root = std::env::temp_dir()
+            .to_str()
+            .expect("utf-8")
+            .replace('\\', "\\\\");
         let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
@@ -9479,6 +9483,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -9498,6 +9503,7 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
@@ -9537,6 +9543,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
@@ -9546,6 +9553,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -9584,6 +9592,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -9646,11 +9655,13 @@ mod tests {
         assert!(omc_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
         assert!(agents_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
@@ -9706,6 +9717,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
@@ -9765,6 +9777,7 @@ mod tests {
         assert!(direct_skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
@@ -9775,6 +9788,7 @@ mod tests {
         assert!(legacy_command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
@@ -9832,6 +9846,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
@@ -11293,6 +11308,7 @@ mod tests {
         assert!(globbed_output["filenames"][0]
             .as_str()
             .expect("filename")
+            .replace('\\', "/")
             .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
@@ -11733,6 +11749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()

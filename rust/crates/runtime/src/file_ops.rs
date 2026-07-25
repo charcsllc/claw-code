@@ -525,10 +525,16 @@ fn glob_search_impl(
     workspace_root: Option<&Path>,
 ) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_dir = match path {
+        Some(path) => normalize_path(path)?,
+        None => {
+            // The raw cwd may be in 8.3 short form on Windows; normalize it
+            // the same way explicit paths are so boundary checks compare
+            // canonical forms.
+            let cwd = std::env::current_dir()?;
+            cwd.canonicalize().map(simplify_canonical).unwrap_or(cwd)
+        }
+    };
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
         validate_workspace_boundary(&base_dir, root)?;
@@ -613,12 +619,13 @@ fn grep_search_impl(
     input: &GrepSearchInput,
     workspace_root: Option<&Path>,
 ) -> io::Result<GrepSearchOutput> {
-    let base_path = input
-        .path
-        .as_deref()
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_path = match input.path.as_deref() {
+        Some(path) => normalize_path(path)?,
+        None => {
+            let cwd = std::env::current_dir()?;
+            cwd.canonicalize().map(simplify_canonical).unwrap_or(cwd)
+        }
+    };
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
         validate_workspace_boundary(&base_path, root)?;
