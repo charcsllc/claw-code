@@ -1,0 +1,9 @@
+
+
+Your design document MUST contain these sections, each with concrete values (names, paths, signatures — never adjectives):
+1. Module map: every module with its directory, single responsibility and owned files.
+2. Boundaries: which module may import which (a dependency diagram in text form); forbidden imports called out explicitly.
+3. Shared contracts: the exact types/interfaces shared across modules, with the file that owns each one.
+4. Data flow: how a request travels through the system for the two most important user stories, step by step.
+5. Error strategy: error types, where they are caught, what the user sees, what gets logged.
+6. Non-functional budgets: bundle size, response time targets, and what to measure.

@@ -666,6 +666,22 @@ pub fn design_system_prompt(archetype: DesignArchetype, tokens_path: &str) -> St
     )
 }
 
+/// Visual-QA rubric plus the deterministic gate's unresolved findings: the
+/// agent starts from known failures instead of rediscovering them.
+#[must_use]
+pub fn visual_qa_prompt_with(gate_findings: &[String]) -> String {
+    let mut prompt = visual_qa_prompt();
+    if !gate_findings.is_empty() {
+        prompt.push_str(
+            "\n\nADEMÁS — the deterministic design gate already verified these \
+             failures (they are facts, not opinions); fix every one of them \
+             first:\n- ",
+        );
+        prompt.push_str(&gate_findings.join("\n- "));
+    }
+    prompt
+}
+
 /// Visual-QA rubric: a concrete checklist beats "review the UI".
 #[must_use]
 pub fn visual_qa_prompt() -> String {
@@ -851,6 +867,212 @@ fn find_token_stylesheets(project_dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Extracts the value of `name="…"` / `name='…'` from a tag's attribute
+/// text. Requires a leading space so `id=` never matches `data-id=`.
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    for quote in ['"', '\''] {
+        let needle = format!(" {name}={quote}");
+        if let Some(position) = tag.find(&needle) {
+            let rest = &tag[position + needle.len()..];
+            if let Some(end) = rest.find(quote) {
+                return Some(&rest[..end]);
+            }
+        }
+    }
+    None
+}
+
+/// Counts `<input>`/`<select>`/`<textarea>` without an accessible name.
+///
+/// Textual heuristic — known limits, accepted by design (zero deps):
+/// - a control wrapped in `<label>…</label>` WITHOUT `for=` is still
+///   flagged (false positive; explicit `for=` is the sturdier pattern),
+/// - `for="id"` is matched anywhere in the document (no scoping),
+/// - attributes must use quotes (`id=foo` unquoted is not matched).
+fn unlabeled_form_controls(lower: &str) -> usize {
+    let mut count = 0;
+    for opener in ["<input", "<select", "<textarea"] {
+        let mut from = 0;
+        while let Some(position) = lower[from..].find(opener) {
+            let start = from + position;
+            let end = lower[start..]
+                .find('>')
+                .map_or(lower.len(), |offset| start + offset);
+            let tag = &lower[start..end];
+            from = end;
+            // Non-labelable input types are exempt.
+            if ["hidden", "submit", "button", "reset", "image"]
+                .iter()
+                .any(|kind| {
+                    tag.contains(&format!("type=\"{kind}\""))
+                        || tag.contains(&format!("type='{kind}'"))
+                })
+            {
+                continue;
+            }
+            if tag.contains("aria-label") || tag.contains("aria-labelledby") {
+                continue;
+            }
+            if let Some(id) = attr_value(tag, "id") {
+                if !id.is_empty()
+                    && (lower.contains(&format!("for=\"{id}\""))
+                        || lower.contains(&format!("for='{id}'")))
+                {
+                    continue;
+                }
+            }
+            count += 1;
+        }
+    }
+    count
+}
+
+/// First break in the heading sequence: a heading more than one level
+/// deeper than the previous one (e.g. `<h3>` right after an `<h1>`), or a
+/// document whose first heading is deeper than `<h1>`. Returns
+/// `(previous_level, offending_level)` with `previous_level == 0` for the
+/// first-heading case.
+fn heading_order_break(lower: &str) -> Option<(u32, u32)> {
+    let bytes = lower.as_bytes();
+    let mut previous = 0_u32;
+    let mut from = 0;
+    while let Some(position) = lower[from..].find("<h") {
+        let digit_at = from + position + 2;
+        from = digit_at;
+        let Some(digit @ b'1'..=b'6') = bytes.get(digit_at).copied() else {
+            continue; // <header>, <hr>, <html>, …
+        };
+        // Must be a real tag: `<h2>` or `<h2 …`.
+        if !matches!(
+            bytes.get(digit_at + 1),
+            Some(b'>' | b' ' | b'\t' | b'\n' | b'/')
+        ) {
+            continue;
+        }
+        let level = u32::from(digit - b'0');
+        if level > previous + 1 {
+            return Some((previous, level));
+        }
+        previous = level;
+    }
+    None
+}
+
+/// Link texts that describe nothing. Compared case-insensitively against
+/// the full (tag-stripped, trimmed) inner text of each `<a>`.
+const GENERIC_LINK_TEXTS: &[&str] = &["click aquí", "aquí", "click here", "read more", "más info"];
+
+/// Removes `<…>` spans so `<a><span>aquí</span></a>` still normalizes to
+/// "aquí".
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside_tag = false;
+    for character in text.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => out.push(character),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Counts links whose entire text is generic ("click aquí", "read more", …).
+fn generic_text_links(lower: &str) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(position) = lower[from..].find("<a") {
+        let start = from + position;
+        // `<a>` / `<a …`, not `<abbr>`/`<article>`.
+        if !matches!(
+            lower.as_bytes().get(start + 2),
+            Some(b'>' | b' ' | b'\t' | b'\n')
+        ) {
+            from = start + 2;
+            continue;
+        }
+        let Some(open_end) = lower[start..].find('>') else {
+            break;
+        };
+        let text_start = start + open_end + 1;
+        let Some(close) = lower[text_start..].find("</a") else {
+            from = text_start;
+            continue;
+        };
+        let inner = strip_tags(&lower[text_start..text_start + close]);
+        from = text_start + close;
+        let normalized = inner
+            .trim()
+            .trim_end_matches(['.', '…', '»', '›', '→'])
+            .trim();
+        if GENERIC_LINK_TEXTS.contains(&normalized) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Counts `@font-face` rules whose block lacks `font-display` (text stays
+/// invisible while the font loads). Works on any CSS text, including the
+/// inline `<style>` blocks of a rendered DOM.
+#[must_use]
+pub fn font_faces_missing_display(css: &str) -> usize {
+    let lower = css.to_lowercase();
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(position) = lower[from..].find("@font-face") {
+        let start = from + position;
+        let Some(brace) = lower[start..].find('{') else {
+            break;
+        };
+        let block_start = start + brace + 1;
+        let Some(end) = lower[block_start..].find('}') else {
+            break;
+        };
+        if !lower[block_start..block_start + end].contains("font-display") {
+            count += 1;
+        }
+        from = block_start + end;
+    }
+    count
+}
+
+/// Counts elements with an inline gradient background (`style="…
+/// linear-gradient(…)"` / `radial-gradient`) that have direct text content.
+/// Gradient contrast is not computable deterministically, so the finding is
+/// an explicit "verify manually" warning. Heuristic: only inline `style=`
+/// attributes are inspected (class-based gradients are invisible to it).
+fn text_over_inline_gradient(lower: &str) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(position) = lower[from..].find("-gradient(") {
+        let at = from + position;
+        from = at + "-gradient(".len();
+        let before = &lower[..at];
+        // The gradient must sit inside a tag's style attribute: an opening
+        // `<` with no `>` in between (a stylesheet inside <style> fails
+        // this, as the tag closed before the rule text).
+        let Some(tag_open) = before.rfind('<') else {
+            continue;
+        };
+        if before[tag_open..].contains('>') || !before[tag_open..].contains("style=") {
+            continue;
+        }
+        let Some(tag_end) = lower[at..].find('>') else {
+            continue;
+        };
+        let text_start = at + tag_end + 1;
+        let text_end = lower[text_start..]
+            .find('<')
+            .map_or(lower.len(), |offset| text_start + offset);
+        if !lower[text_start..text_end].trim().is_empty() {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Deterministic accessibility audit of the rendered homepage DOM. Cheap
 /// string checks by design — a real DOM parser would be sturdier but this
 /// catches the failures that actually ship, with zero dependencies.
@@ -928,6 +1150,115 @@ pub fn audit_rendered_html(html: &str) -> Vec<String> {
     if lower.contains(" autoplay") {
         findings.push("autoplay media — hostile default; require a user gesture".into());
     }
+    // Each of the checks below aggregates into ONE capped finding (a count),
+    // so a broken form with 40 inputs reads as one problem, not 40.
+    let unlabeled = unlabeled_form_controls(&lower);
+    if unlabeled > 0 {
+        findings.push(format!(
+            "{unlabeled} form control(s) (<input>/<select>/<textarea>) without an \
+             associated <label for=…> or aria-label — placeholder is not a label"
+        ));
+    }
+    if let Some((previous, level)) = heading_order_break(&lower) {
+        findings.push(if previous == 0 {
+            format!("heading order broken: the first heading is <h{level}> — start at <h1>")
+        } else {
+            format!(
+                "heading order broken: <h{level}> follows <h{previous}> — levels must \
+                 not skip (screen-reader outline)"
+            )
+        });
+    }
+    let generic_links = generic_text_links(&lower);
+    if generic_links > 0 {
+        findings.push(format!(
+            "{generic_links} link(s) with generic text (\"click aquí\", \"read more\", …) \
+             — link text must describe the destination"
+        ));
+    }
+    let bare_font_faces = font_faces_missing_display(html);
+    if bare_font_faces > 0 {
+        findings.push(format!(
+            "{bare_font_faces} @font-face rule(s) without font-display — text stays \
+             invisible while the font loads; add font-display: swap"
+        ));
+    }
+    let gradient_text = text_over_inline_gradient(&lower);
+    if gradient_text > 0 {
+        findings.push(format!(
+            "{gradient_text} element(s) with direct text over an inline CSS gradient \
+             background — contrast is not computable, verify it manually"
+        ));
+    }
+    findings
+}
+
+/// True when `path` (project-relative) is inside the incremental-audit
+/// scope: `None` means "everything" (full audit); `Some(list)` restricts the
+/// per-file audits to exactly the listed project-relative paths (the format
+/// `git diff --name-only` / `git status --short` produce).
+fn file_in_scope(project_dir: &Path, path: &Path, changed: Option<&[String]>) -> bool {
+    let Some(changed) = changed else {
+        return true;
+    };
+    let rel = path.strip_prefix(project_dir).unwrap_or(path);
+    changed.iter().any(|candidate| Path::new(candidate) == rel)
+}
+
+/// Scans the project's stylesheets (tokens AND components) for `@font-face`
+/// rules without `font-display`. Lives next to the HTML audit because the
+/// rendered DOM only carries inline styles — linked stylesheets need their
+/// own pass. Capped: one finding per file.
+#[must_use]
+pub fn audit_font_display(project_dir: &Path) -> Vec<String> {
+    audit_font_display_scoped(project_dir, None)
+}
+
+/// [`audit_font_display`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_font_display_scoped(project_dir: &Path, changed: Option<&[String]>) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut pending: Vec<PathBuf> = ["src", "public", "assets", "static", "styles"]
+        .iter()
+        .map(|dir| project_dir.join(dir))
+        .collect();
+    let mut budget = 400_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if budget == 0 || findings.len() >= 8 {
+                return findings;
+            }
+            budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !crate::orchestrator::REPO_SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            if !name.ends_with(".css") || name.ends_with(".min.css") {
+                continue;
+            }
+            if !file_in_scope(project_dir, &path, changed) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let missing = font_faces_missing_display(&content);
+            if missing > 0 {
+                findings.push(format!(
+                    "{}: {missing} @font-face rule(s) without font-display — add \
+                     font-display: swap",
+                    path.strip_prefix(project_dir).unwrap_or(&path).display()
+                ));
+            }
+        }
+    }
     findings
 }
 
@@ -937,6 +1268,15 @@ pub fn audit_rendered_html(html: &str) -> Vec<String> {
 /// prefixed as [TOKENS] by the gate.
 #[must_use]
 pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
+    audit_hardcoded_colors_scoped(project_dir, None)
+}
+
+/// [`audit_hardcoded_colors`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_hardcoded_colors_scoped(
+    project_dir: &Path,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     const COLOR_PROPS: &[&str] = &[
         "color",
         "background",
@@ -968,6 +1308,9 @@ pub fn audit_hardcoded_colors(project_dir: &Path) -> Vec<String> {
             }
             // The token foundation itself is the one legitimate home of hex.
             if !name.ends_with(".css") || name.ends_with(".min.css") || name.contains("token") {
+                continue;
+            }
+            if !file_in_scope(project_dir, &path, changed) {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(&path) else {
@@ -1037,6 +1380,16 @@ fn img_budget_kb() -> u64 {
 /// bounded so a pathological tree cannot stall the gate.
 #[must_use]
 pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
+    audit_heavy_images_scoped(project_dir, budget_kb, None)
+}
+
+/// [`audit_heavy_images`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_heavy_images_scoped(
+    project_dir: &Path,
+    budget_kb: u64,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     // Same KB convention as the performance gate (1 KB = 1000 B).
     let budget_bytes = budget_kb * 1_000;
     let mut heavy: Vec<(String, u64)> = Vec::new();
@@ -1067,7 +1420,7 @@ pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
                         .iter()
                         .any(|known| known.eq_ignore_ascii_case(extension))
                 });
-            if !is_image {
+            if !is_image || !file_in_scope(project_dir, &path, changed) {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -1097,6 +1450,116 @@ pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
         .collect()
 }
 
+// ---------- Heavy/legacy-font audit ([PESO]) ----------
+
+/// Font formats the weight audit weighs.
+const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2"];
+
+/// At most this many font findings reach the report (same rationale as
+/// [`MAX_IMAGE_FINDINGS`]).
+const MAX_FONT_FINDINGS: usize = 8;
+
+/// Audits the conventional asset directories ([`IMAGE_DIRS`], recursively)
+/// for font problems:
+/// - a `.ttf`/`.otf` with no same-stem `.woff2` next to it → recommend
+///   converting (woff2 is ~30-50% smaller and universally supported),
+/// - any font file over `budget_kb` (same KB convention as the image
+///   audit: 1 KB = 1000 B) → weight finding.
+///
+/// Deterministic order (recommendations first, then weight breaches by
+/// size), capped at [`MAX_FONT_FINDINGS`].
+#[must_use]
+pub fn audit_heavy_fonts(project_dir: &Path, budget_kb: u64) -> Vec<String> {
+    audit_heavy_fonts_scoped(project_dir, budget_kb, None)
+}
+
+/// [`audit_heavy_fonts`] restricted to `changed` files when `Some`.
+#[must_use]
+pub fn audit_heavy_fonts_scoped(
+    project_dir: &Path,
+    budget_kb: u64,
+    changed: Option<&[String]>,
+) -> Vec<String> {
+    let budget_bytes = budget_kb * 1_000;
+    let mut fonts: Vec<(PathBuf, String, u64)> = Vec::new(); // (path, ext, size)
+    let mut pending: Vec<PathBuf> = IMAGE_DIRS.iter().map(|dir| project_dir.join(dir)).collect();
+    let mut walk_budget = 2_000_usize;
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if walk_budget == 0 {
+                break;
+            }
+            walk_budget -= 1;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if !crate::orchestrator::REPO_SKIP_DIRS.contains(&name.as_str()) {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let Some(extension) = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase)
+                .filter(|extension| FONT_EXTENSIONS.contains(&extension.as_str()))
+            else {
+                continue;
+            };
+            if !file_in_scope(project_dir, &path, changed) {
+                continue;
+            }
+            let size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            fonts.push((path, extension, size));
+        }
+    }
+
+    let rel = |path: &Path| {
+        path.strip_prefix(project_dir)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    };
+    // Legacy formats without a modern sibling: same stem, same directory.
+    let mut recommendations: Vec<String> = fonts
+        .iter()
+        .filter(|(path, extension, _)| {
+            (extension == "ttf" || extension == "otf")
+                && !path.with_extension("woff2").exists()
+                && !path.with_extension("WOFF2").exists()
+        })
+        .map(|(path, extension, _)| {
+            format!(
+                "{} ships as .{extension} with no .woff2 next to it — convert it \
+                 (woff2 is ~30-50% smaller with universal support)",
+                rel(path)
+            )
+        })
+        .collect();
+    recommendations.sort();
+
+    let mut heavy: Vec<(String, u64)> = fonts
+        .iter()
+        .filter(|(_, _, size)| *size > budget_bytes)
+        .map(|(path, _, size)| (rel(path), *size))
+        .collect();
+    heavy.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut findings = recommendations;
+    findings.extend(heavy.into_iter().map(|(rel, size)| {
+        format!(
+            "font {rel} weighs {} KB (budget {budget_kb} KB) — subset it or \
+             convert it to woff2",
+            size / 1_000
+        )
+    }));
+    findings.truncate(MAX_FONT_FINDINGS);
+    findings
+}
+
 /// The whole gate: token contrast + rendered-DOM accessibility + token
 /// discipline + image weight, each finding prefixed by its category.
 /// `require_tokens` is true only for greenfield builds — an /improve run
@@ -1104,6 +1567,23 @@ pub fn audit_heavy_images(project_dir: &Path, budget_kb: u64) -> Vec<String> {
 /// foundation.
 #[must_use]
 pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) -> Vec<String> {
+    run_design_gate_scoped(project_dir, docs, require_tokens, None)
+}
+
+/// Incremental design gate: like [`run_design_gate`], but when `changed` is
+/// `Some`, the PER-FILE audits (hardcoded colors, @font-face hygiene, heavy
+/// images/fonts) only consider the listed project-relative paths — an
+/// /improve run must be judged on what it touched, not on the whole legacy
+/// tree. The GLOBAL audits (token contrast, rendered-DOM accessibility)
+/// always run in full: a token edit or a rendered regression breaks the
+/// product no matter which file introduced it. `None` is the full audit.
+#[must_use]
+pub fn run_design_gate_scoped(
+    project_dir: &Path,
+    docs: &Path,
+    require_tokens: bool,
+    changed: Option<&[String]>,
+) -> Vec<String> {
     let mut findings = Vec::new();
     let stylesheets = find_token_stylesheets(project_dir);
     if stylesheets.is_empty() && require_tokens {
@@ -1126,13 +1606,22 @@ pub fn run_design_gate(project_dir: &Path, docs: &Path, require_tokens: bool) ->
         }
     }
     if require_tokens {
-        for finding in audit_hardcoded_colors(project_dir) {
+        for finding in audit_hardcoded_colors_scoped(project_dir, changed) {
             findings.push(format!("[TOKENS] {finding}"));
         }
     }
-    // Image weight is objective in every mode: an oversized hero costs the
-    // same first paint on /improve as on a greenfield build.
-    for finding in audit_heavy_images(project_dir, img_budget_kb()) {
+    // Linked stylesheets never reach the rendered-DOM audit, so @font-face
+    // hygiene gets its own pass over the project CSS (same [A11Y] bucket:
+    // an invisible-text flash is an accessibility failure, not taste).
+    for finding in audit_font_display_scoped(project_dir, changed) {
+        findings.push(format!("[A11Y] {finding}"));
+    }
+    // Asset weight is objective in every mode: an oversized hero or a
+    // 900 KB TTF costs the same first paint on /improve as on greenfield.
+    for finding in audit_heavy_images_scoped(project_dir, img_budget_kb(), changed) {
+        findings.push(format!("[PESO] {finding}"));
+    }
+    for finding in audit_heavy_fonts_scoped(project_dir, img_budget_kb(), changed) {
         findings.push(format!("[PESO] {finding}"));
     }
     findings
@@ -1272,6 +1761,204 @@ mod tests {
     }
 
     #[test]
+    fn html_audit_flags_unlabeled_form_controls() {
+        let head = "<html lang=\"es\"><head><title>Ok</title>\
+                    <meta name=\"viewport\" content=\"w\"></head><body><main><h1>t</h1>";
+        let tail = "</main></body></html>";
+
+        // Positive: three unlabeled controls, one per element kind.
+        let bad = format!(
+            "{head}<input type=\"text\" placeholder=\"nombre\">\
+             <select><option>a</option></select><textarea></textarea>{tail}"
+        );
+        let joined = audit_rendered_html(&bad).join("\n");
+        assert!(joined.contains("3 form control(s)"), "{joined}");
+        assert!(joined.contains("aria-label"), "{joined}");
+
+        // Negative: label-for, aria-label and aria-labelledby all count as
+        // named; hidden/submit inputs are exempt.
+        let good = format!(
+            "{head}<label for=\"name\">Nombre</label><input id=\"name\" type=\"text\">\
+             <select aria-label=\"país\"></select>\
+             <textarea aria-labelledby=\"name\"></textarea>\
+             <input type=\"hidden\" name=\"csrf\"><input type=\"submit\" value=\"Ir\">{tail}"
+        );
+        assert!(
+            audit_rendered_html(&good).is_empty(),
+            "{:?}",
+            audit_rendered_html(&good)
+        );
+    }
+
+    #[test]
+    fn html_audit_flags_broken_heading_order() {
+        let wrap = |body: &str| {
+            format!(
+                "<html lang=\"es\"><head><title>Ok</title>\
+                 <meta name=\"viewport\" content=\"w\"></head><body><main>{body}</main></body></html>"
+            )
+        };
+        // Positive: h3 with no h2 before it.
+        let joined = audit_rendered_html(&wrap("<h1>t</h1><h3>skip</h3>")).join("\n");
+        assert!(joined.contains("heading order broken"), "{joined}");
+        assert!(joined.contains("<h3> follows <h1>"), "{joined}");
+
+        // Positive: the document's first heading is not an h1 (the no-<h1>
+        // finding fires too; the order finding names the jump explicitly).
+        let joined = audit_rendered_html(&wrap("<h2>t</h2>")).join("\n");
+        assert!(joined.contains("first heading is <h2>"), "{joined}");
+
+        // Negative: descending or stepwise sequences are legal, and
+        // <header>/<hr> are not headings.
+        let ok = wrap("<header><hr></header><h1>t</h1><h2>a</h2><h3>b</h3><h2>c</h2>");
+        assert!(
+            audit_rendered_html(&ok).is_empty(),
+            "{:?}",
+            audit_rendered_html(&ok)
+        );
+    }
+
+    #[test]
+    fn html_audit_flags_generic_link_text() {
+        let wrap = |body: &str| {
+            format!(
+                "<html lang=\"es\"><head><title>Ok</title>\
+                 <meta name=\"viewport\" content=\"w\"></head><body><main><h1>t</h1>{body}</main></body></html>"
+            )
+        };
+        // Positive: all five generic texts, case-insensitive, tags stripped.
+        let bad = wrap(
+            "<a href=\"/a\">Click AQUÍ</a><a href=\"/b\">aquí</a>\
+             <a href=\"/c\">Click here</a><a href=\"/d\"><span>Read more</span></a>\
+             <a href=\"/e\">más info…</a>",
+        );
+        let joined = audit_rendered_html(&bad).join("\n");
+        assert!(joined.contains("5 link(s) with generic text"), "{joined}");
+
+        // Negative: descriptive text, even when it CONTAINS a generic word.
+        let good = wrap("<a href=\"/precios\">Consulta aquí los precios de 2026</a>");
+        assert!(
+            audit_rendered_html(&good).is_empty(),
+            "{:?}",
+            audit_rendered_html(&good)
+        );
+    }
+
+    #[test]
+    fn font_face_audit_requires_font_display() {
+        // Pure CSS check (also applied to inline <style> in the DOM audit).
+        let bad_css = "@font-face { font-family: X; src: url(x.woff2); }\n\
+                       @font-face { font-family: Y; src: url(y.woff2); font-display: swap; }";
+        assert_eq!(font_faces_missing_display(bad_css), 1);
+        assert_eq!(font_faces_missing_display(".btn { color: var(--x); }"), 0);
+
+        // Rendered-DOM surface: inline <style> without font-display.
+        let bad_html = "<html lang=\"es\"><head><title>Ok</title>\
+             <meta name=\"viewport\" content=\"w\">\
+             <style>@font-face { font-family: X; src: url(x.woff2); }</style>\
+             </head><body><main><h1>t</h1></main></body></html>";
+        let joined = audit_rendered_html(bad_html).join("\n");
+        assert!(joined.contains("@font-face"), "{joined}");
+        assert!(joined.contains("font-display"), "{joined}");
+
+        // Project-CSS surface: the file scan names the offending stylesheet.
+        let dir = std::env::temp_dir().join(format!(
+            "design-fontface-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("src/styles")).expect("dirs");
+        std::fs::write(dir.join("src/styles/fonts.css"), bad_css).expect("css");
+        std::fs::write(
+            dir.join("src/styles/ok.css"),
+            "@font-face { font-family: Z; src: url(z.woff2); font-display: swap; }",
+        )
+        .expect("ok css");
+        let findings = audit_font_display(&dir);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("fonts.css"), "{findings:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn html_audit_warns_about_text_over_inline_gradients() {
+        let wrap = |body: &str| {
+            format!(
+                "<html lang=\"es\"><head><title>Ok</title>\
+                 <meta name=\"viewport\" content=\"w\"></head><body><main><h1>t</h1>{body}</main></body></html>"
+            )
+        };
+        // Positive: direct text on linear- and radial-gradient backgrounds.
+        let bad = wrap(
+            "<div style=\"background: linear-gradient(#fff, #000)\">Oferta especial</div>\
+             <p style=\"background-image: radial-gradient(red, blue)\">Texto</p>",
+        );
+        let joined = audit_rendered_html(&bad).join("\n");
+        assert!(joined.contains("2 element(s)"), "{joined}");
+        assert!(joined.contains("verify it manually"), "{joined}");
+
+        // Negative: gradient without direct text (child element carries it,
+        // presumably on its own surface) and gradients inside <style> rules.
+        let good = wrap(
+            "<div style=\"background: linear-gradient(#fff, #000)\">\
+             <span class=\"card\">En su propia tarjeta</span></div>\
+             <style>.hero { background: linear-gradient(#fff, #000); }</style>",
+        );
+        assert!(
+            audit_rendered_html(&good).is_empty(),
+            "{:?}",
+            audit_rendered_html(&good)
+        );
+    }
+
+    #[test]
+    fn heavy_font_audit_recommends_woff2_and_enforces_the_budget() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-fuentes-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("public/fonts")).expect("fonts dir");
+        // legacy.ttf has no woff2 sibling → recommendation.
+        std::fs::write(dir.join("public/fonts/legacy.ttf"), vec![0_u8; 1_000]).expect("ttf");
+        // paired.otf DOES have a same-stem woff2 next to it → no finding.
+        std::fs::write(dir.join("public/fonts/paired.otf"), vec![0_u8; 1_000]).expect("otf");
+        std::fs::write(dir.join("public/fonts/paired.woff2"), vec![0_u8; 500]).expect("woff2");
+        // big.woff2 is over the 3 KB test budget → weight finding.
+        std::fs::write(dir.join("public/fonts/big.woff2"), vec![0_u8; 5_000]).expect("big");
+        // Non-font files and fonts outside the asset dirs are ignored.
+        std::fs::write(dir.join("public/fonts/readme.txt"), vec![0_u8; 9_000]).expect("txt");
+        std::fs::write(dir.join("elsewhere.ttf"), vec![0_u8; 9_000]).expect("outside");
+
+        let findings = audit_heavy_fonts(&dir, 3);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(findings[0].contains("legacy.ttf"), "{findings:?}");
+        assert!(findings[0].contains("woff2"), "{findings:?}");
+        assert!(findings[1].contains("big.woff2"), "{findings:?}");
+        assert!(findings[1].contains("5 KB"), "{findings:?}");
+        assert!(findings[1].contains("budget 3 KB"), "{findings:?}");
+        assert!(
+            !findings.iter().any(|finding| finding.contains("paired")),
+            "a ttf/otf with its woff2 sibling must pass: {findings:?}"
+        );
+
+        // The cap holds for pathological font dumps.
+        for index in 0..12 {
+            std::fs::write(
+                dir.join(format!("public/fonts/pack-{index}.ttf")),
+                vec![0_u8; 5_000],
+            )
+            .expect("pack");
+        }
+        assert_eq!(audit_heavy_fonts(&dir, 3).len(), MAX_FONT_FINDINGS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn hardcoded_color_audit_respects_the_token_file() {
         let dir = std::env::temp_dir().join(format!(
             "design-discipline-{}",
@@ -1311,6 +1998,63 @@ mod tests {
         // No token stylesheet anywhere: greenfield complains, improve doesn't.
         assert!(!run_design_gate(&dir, &docs, true).is_empty());
         assert!(run_design_gate(&dir, &docs, false).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scoped_gate_limits_per_file_audits_to_the_changed_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "design-scoped-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let docs = dir.join("docs");
+        std::fs::create_dir_all(dir.join("src/styles")).expect("styles dir");
+        std::fs::create_dir_all(dir.join("public/img")).expect("img dir");
+        std::fs::create_dir_all(&docs).expect("docs");
+        // Two offending component stylesheets (hardcoded color + bare
+        // @font-face each), but only one of them is in the changed list.
+        let bad_css = ".btn { color: #ff0000; }\n@font-face { font-family: X; }\n";
+        std::fs::write(dir.join("src/styles/changed.css"), bad_css).expect("changed css");
+        std::fs::write(dir.join("src/styles/legacy.css"), bad_css).expect("legacy css");
+        // Two oversized images; only one is changed.
+        std::fs::write(dir.join("public/img/changed.png"), vec![0_u8; 900_000]).expect("png");
+        std::fs::write(dir.join("public/img/legacy.png"), vec![0_u8; 900_000]).expect("png");
+        // A broken token pair: the GLOBAL contrast audit must fire even when
+        // the token stylesheet is not in the changed list.
+        std::fs::write(
+            dir.join("src/styles/design-tokens.css"),
+            ":root {\n  --text-primary: #bbbbbb;\n  --surface-page: #cccccc;\n}\n",
+        )
+        .expect("tokens");
+
+        let changed = vec![
+            "src/styles/changed.css".to_string(),
+            "public/img/changed.png".to_string(),
+        ];
+        let findings = run_design_gate_scoped(&dir, &docs, true, Some(changed.as_slice()));
+        let joined = findings.join("\n");
+        // Per-file audits: only the changed files are reported.
+        assert!(joined.contains("changed.css"), "{joined}");
+        assert!(joined.contains("changed.png"), "{joined}");
+        assert!(!joined.contains("legacy.css"), "{joined}");
+        assert!(!joined.contains("legacy.png"), "{joined}");
+        // Global audit: the contrast failure survives the scoping.
+        assert!(joined.contains("[CONTRASTE]"), "{joined}");
+
+        // `None` (and the compat wrapper) audit everything.
+        let full = run_design_gate_scoped(&dir, &docs, true, None);
+        let full_joined = full.join("\n");
+        assert!(full_joined.contains("legacy.css"), "{full_joined}");
+        assert!(full_joined.contains("legacy.png"), "{full_joined}");
+        assert_eq!(run_design_gate(&dir, &docs, true), full);
+
+        // An EMPTY changed list means "nothing touched": per-file audits go
+        // quiet, global ones stay.
+        let none_changed = run_design_gate_scoped(&dir, &docs, true, Some(&[][..]));
+        assert!(none_changed.iter().all(|f| f.starts_with("[CONTRASTE]")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1367,6 +2111,20 @@ mod tests {
         let brief = designer_planning_brief(DesignArchetype::Ecommerce);
         assert!(brief.contains("ecommerce"));
         assert!(brief.contains("WCAG AA"));
+    }
+
+    #[test]
+    fn visual_qa_prompt_leads_with_unresolved_gate_findings() {
+        let findings = vec![
+            "[CONTRASTE] par roto".to_string(),
+            "[A11Y] falta lang".to_string(),
+        ];
+        let prompt = visual_qa_prompt_with(&findings);
+        assert!(prompt.contains("[CONTRASTE] par roto"));
+        assert!(prompt.contains("[A11Y] falta lang"));
+        assert!(prompt.contains("facts, not opinions"));
+        // Without findings, the rubric stays untouched.
+        assert_eq!(visual_qa_prompt_with(&[]), visual_qa_prompt());
     }
 
     #[test]

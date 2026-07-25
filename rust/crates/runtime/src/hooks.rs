@@ -742,8 +742,13 @@ fn format_hook_failure(command: &str, code: i32, stdout: Option<&str>, stderr: &
 fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(windows)]
     let command_builder = {
+        use std::os::windows::process::CommandExt as _;
         let mut command_builder = Command::new("cmd");
-        command_builder.arg("/C").arg(command);
+        // `/S /C "<command>"` makes cmd strip exactly this outer quote pair
+        // and run the content verbatim. Going through .arg() instead would
+        // backslash-escape any quotes inside the command (MSVC convention),
+        // which cmd does not understand.
+        command_builder.raw_arg(format!("/S /C \"{command}\""));
         CommandWithStdin::new(command_builder)
     };
 
@@ -992,11 +997,10 @@ mod tests {
     #[test]
     fn executes_hooks_in_configured_order() {
         // given
+        let first_command = shell_snippet("printf 'first'");
+        let second_command = shell_snippet("printf 'second'");
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![
-                shell_snippet("printf 'first'"),
-                shell_snippet("printf 'second'"),
-            ],
+            vec![first_command.clone(), second_command.clone()],
             Vec::new(),
             Vec::new(),
         ));
@@ -1022,7 +1026,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &first_command
         ));
         assert!(matches!(
             &reporter.events[1],
@@ -1030,7 +1034,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'first'"
+            } if command == &first_command
         ));
         assert!(matches!(
             &reporter.events[2],
@@ -1038,7 +1042,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &second_command
         ));
         assert!(matches!(
             &reporter.events[3],
@@ -1046,7 +1050,7 @@ mod tests {
                 event: HookEvent::PreToolUse,
                 command,
                 ..
-            } if command == "printf 'second'"
+            } if command == &second_command
         ));
     }
 
@@ -1076,10 +1080,10 @@ mod tests {
 
     #[test]
     fn malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews() {
+        let snippet =
+            shell_snippet("printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1");
         let runner = HookRunner::new(RuntimeHookConfig::new(
-            vec![shell_snippet(
-                "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1",
-            )],
+            vec![snippet.clone()],
             Vec::new(),
             Vec::new(),
         ));
@@ -1091,8 +1095,14 @@ mod tests {
         assert!(rendered.contains("hook_invalid_json:"));
         assert!(rendered.contains("phase=PreToolUse"));
         assert!(rendered.contains("tool=Edit"));
-        assert!(rendered.contains("command=printf '{not-json"));
-        assert!(rendered.contains("printf 'stderr warning' >&2; exit 1"));
+        // The diagnostic previews the command with newlines escaped, so the
+        // snippet's lines appear verbatim (sh form is two lines, cmd one).
+        let mut snippet_lines = snippet.lines();
+        let first_line = snippet_lines.next().expect("snippet first line");
+        assert!(rendered.contains(&format!("command={first_line}")));
+        if let Some(second_line) = snippet_lines.next() {
+            assert!(rendered.contains(second_line));
+        }
         assert!(rendered.contains("detail=key must be a string"));
         assert!(rendered.contains("stdout_preview={not-json"));
         assert!(rendered.contains("second line stderr_preview=stderr warning"));
@@ -1139,9 +1149,33 @@ mod tests {
         )));
     }
 
+    /// Translates the sh snippets these tests use into cmd equivalents on
+    /// Windows (`echo` + `exit /b`); the runner trims stdout, so echo's
+    /// trailing CRLF is harmless. Unknown snippets pass through untouched.
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        if script == "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1" {
+            return "(echo {not-json& echo second line)& echo stderr warning 1>&2& exit /b 1"
+                .to_string();
+        }
+        if let Some(json) = script
+            .strip_prefix("printf '%s' '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return format!("echo {json}");
+        }
+        let (body, exit_code) = match script.rsplit_once("; exit ") {
+            Some((body, code)) => (body, Some(code)),
+            None => (script, None),
+        };
+        let text = body
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''));
+        match (text, exit_code) {
+            (Some(text), Some(code)) => format!("echo {text}& exit /b {code}"),
+            (Some(text), None) => format!("echo {text}"),
+            _ => script.to_string(),
+        }
     }
 
     #[cfg(not(windows))]

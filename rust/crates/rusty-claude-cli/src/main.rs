@@ -519,7 +519,10 @@ fn classify_error_kind(message: &str) -> &'static str {
         "api_http_error"
     } else if message.contains("mcpServers") {
         "malformed_mcp_config"
-    } else if message.contains(".claw/settings.json") || message.contains(".claw.json") {
+    } else if message.contains(".claw/settings.json")
+        || message.contains(r".claw\settings.json")
+        || message.contains(".claw.json")
+    {
         // #763: config file JSON parse / validation errors (e.g. unterminated string, type mismatch)
         "config_parse_error"
     } else if message.starts_with("empty prompt") {
@@ -1151,10 +1154,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         },
-        CliAction::DesignReview { output_format } => {
-            let findings = collect_design_review_findings();
+        CliAction::DesignReview {
+            changed,
+            output_format,
+        } => {
+            let findings = collect_design_review_findings(changed);
             match output_format {
-                CliOutputFormat::Text => println!("{}", format_design_review_report()),
+                CliOutputFormat::Text => println!("{}", format_design_review_report(changed)),
                 CliOutputFormat::Json => println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1300,6 +1306,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     DesignReview {
+        changed: bool,
         output_format: CliOutputFormat,
     },
     Export {
@@ -2069,13 +2076,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         // contrast + HTML audit); exit code 1 on findings makes it usable
         // as a CI check.
         "design-review" => {
-            if rest.len() > 1 {
+            let changed = rest[1..]
+                .iter()
+                .any(|arg| arg == "--changed" || arg == "changed");
+            let extra: Vec<&String> = rest[1..]
+                .iter()
+                .filter(|arg| *arg != "--changed" && *arg != "changed")
+                .collect();
+            if !extra.is_empty() {
                 return Err(
-                    "Usage: claw design-review [--output-format json]\n  (sin argumentos; 'fix' solo existe dentro del REPL)"
+                    "Usage: claw design-review [--changed] [--output-format json]\n  ('fix' solo existe dentro del REPL)"
                         .to_string(),
                 );
             }
-            Ok(CliAction::DesignReview { output_format })
+            Ok(CliAction::DesignReview {
+                changed,
+                output_format,
+            })
         }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
@@ -2657,14 +2674,18 @@ fn parse_direct_slash_cli_action(
             path,
             output_format,
         }),
-        Ok(Some(SlashCommand::DesignReview { fix: false })) => {
-            Ok(CliAction::DesignReview { output_format })
-        }
-        Ok(Some(SlashCommand::DesignReview { fix: true })) => Err(
+        Ok(Some(SlashCommand::DesignReview {
+            fix: false,
+            changed,
+        })) => Ok(CliAction::DesignReview {
+            changed,
+            output_format,
+        }),
+        Ok(Some(SlashCommand::DesignReview { fix: true, .. })) => Err(
             "design-review fix necesita una sesión con modelo. Arranca `claw` y ejecuta /design-review fix en el REPL.".to_string(),
         ),
         Ok(Some(SlashCommand::Version)) => Ok(CliAction::Version { output_format }),
-        Ok(Some(SlashCommand::Doctor { online: _ })) => Ok(CliAction::Doctor {
+        Ok(Some(SlashCommand::Doctor { .. })) => Ok(CliAction::Doctor {
             output_format,
             permission_mode,
         }),
@@ -5160,7 +5181,14 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             if output_format == CliOutputFormat::Json {
                 // #77: classify session load errors for downstream consumers
                 let full_message = format!("failed to restore session: {error}");
-                let kind = classify_error_kind(&full_message);
+                // #787 on Windows opening a directory reports "Access is
+                // denied" rather than unix's "Is a directory (os error 21)"
+                // — classify from the filesystem when the path is a dir.
+                let kind = if session_path.is_dir() {
+                    "session_path_is_directory"
+                } else {
+                    classify_error_kind(&full_message)
+                };
                 let (short_reason, inline_hint) = split_error_hint(&full_message);
                 // #787: fall back to kind-derived hint when message has no \n delimiter
                 let hint =
@@ -6402,6 +6430,51 @@ fn format_context_report(
     )
 }
 
+/// `/context` companion: where the session's estimated tokens actually live
+/// (system prompt, user prompts, assistant text, tool traffic) — the total
+/// alone never says WHAT to trim.
+fn format_context_breakdown(session: &Session, system_prompt: &[String]) -> String {
+    let mut system_chars: usize = system_prompt.iter().map(String::len).sum();
+    let mut user_chars = 0usize;
+    let mut assistant_chars = 0usize;
+    let mut tool_chars = 0usize;
+    for message in &session.messages {
+        for block in &message.blocks {
+            match block {
+                ContentBlock::Text { text } => match message.role {
+                    MessageRole::System => system_chars += text.len(),
+                    MessageRole::User => user_chars += text.len(),
+                    MessageRole::Assistant | MessageRole::Tool => assistant_chars += text.len(),
+                },
+                // Vision pricing is flat per image, not per byte; count the
+                // same 1600-token estimate the runtime uses (×4 chars/token).
+                ContentBlock::Image { .. } => user_chars += 6_400,
+                ContentBlock::Thinking { .. } => {}
+                ContentBlock::ToolUse { input, .. } => {
+                    tool_chars += input.to_string().len();
+                }
+                ContentBlock::ToolResult { output, .. } => tool_chars += output.len(),
+            }
+        }
+    }
+    let total = (system_chars + user_chars + assistant_chars + tool_chars).max(1);
+    let row = |label: &str, chars: usize| {
+        let percent = u32::try_from(chars.saturating_mul(100) / total).unwrap_or(100);
+        format!(
+            "\n  {label:<16} ~{} tokens  {}",
+            chars / 4,
+            render_utilization_bar(percent)
+        )
+    };
+    format!(
+        "Breakdown (estimated){}{}{}{}",
+        row("System prompt", system_chars),
+        row("User prompts", user_chars),
+        row("Assistant", assistant_chars),
+        row("Tool I/O", tool_chars),
+    )
+}
+
 fn format_resume_report(session_path: &str, message_count: usize, turns: u32) -> String {
     format!(
         "Session resumed
@@ -6726,7 +6799,7 @@ fn run_resume_command(
                 serde_json::json!({ "kind": "help", "action": "help", "status": "ok", "message": render_repl_help() }),
             ),
         }),
-        SlashCommand::Compact => {
+        SlashCommand::Compact { preview } => {
             let result = runtime::trident::trident_compact_session(
                 session,
                 CompactionConfig {
@@ -6738,6 +6811,22 @@ fn run_resume_command(
             let removed = result.removed_message_count;
             let kept = result.compacted_session.messages.len();
             let skipped = removed == 0;
+            if *preview {
+                // Report only — the session on disk stays untouched.
+                return Ok(ResumeCommandOutcome {
+                    session: session.clone(),
+                    message: Some(format!(
+                        "Compact preview\n  Would remove     {removed} message(s)\n  Would keep       {kept} message(s)\n  Apply            /compact"
+                    )),
+                    json: Some(serde_json::json!({
+                        "kind": "compact",
+                        "action": "preview",
+                        "would_remove_messages": removed,
+                        "would_keep_messages": kept,
+                        "skipped": skipped,
+                    })),
+                });
+            }
             result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
                 session: result.compacted_session,
@@ -6913,7 +7002,12 @@ fn run_resume_command(
         }),
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
-            fs::write(&export_path, render_export_text(session))?;
+            // Same masking the on-disk session gets: an exported transcript
+            // travels (issues, chats) and must not carry live credentials.
+            fs::write(
+                &export_path,
+                runtime::redact_secrets(&render_export_text(session)),
+            )?;
             let msg_count = session.messages.len();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -7010,7 +7104,7 @@ fn run_resume_command(
                 json: Some(json),
             })
         }
-        SlashCommand::Doctor { online } => {
+        SlashCommand::Doctor { online, fix } => {
             let report = render_doctor_report(
                 ConfigWarningMode::EmitStderr,
                 permission_mode_provenance_for_current_dir(),
@@ -7019,6 +7113,10 @@ fn run_resume_command(
             if *online {
                 message.push('\n');
                 message.push_str(&doctor_online_section());
+            }
+            if *fix {
+                message.push('\n');
+                message.push_str(&doctor_apply_fixes());
             }
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
@@ -7167,7 +7265,40 @@ fn run_resume_command(
         | SlashCommand::OutputStyle { .. }
         | SlashCommand::AddDir { .. }
         | SlashCommand::Team { .. }
+        | SlashCommand::Pin { .. }
+        | SlashCommand::Unpin { .. }
+        | SlashCommand::Focus { .. }
+        | SlashCommand::Unfocus
+        | SlashCommand::Undo
+        | SlashCommand::Stop
         | SlashCommand::Setup => Err("unsupported resumed slash command".into()),
+        SlashCommand::Bookmarks => {
+            let pins = &session.pins;
+            let message = if pins.is_empty() {
+                "Bookmarks\n  Result           sin notas fijadas".to_string()
+            } else {
+                let mut out = format!("Bookmarks ({} nota(s))", pins.len());
+                for (i, pin) in pins.iter().enumerate() {
+                    out.push_str(&format!(
+                        "\n  {}. {}",
+                        i + 1,
+                        truncate_retry_error(&pin.text)
+                    ));
+                }
+                out
+            };
+            Ok(ResumeCommandOutcome {
+                session: session.clone(),
+                message: Some(message),
+                json: Some(serde_json::json!({
+                    "kind": "bookmarks",
+                    "action": "list",
+                    "status": "ok",
+                    "count": pins.len(),
+                    "pins": pins.iter().map(|p| p.text.clone()).collect::<Vec<_>>(),
+                })),
+            })
+        }
     }
 }
 
@@ -7587,14 +7718,47 @@ fn format_security_review_report() -> String {
 /// current project — WCAG contrast of any token stylesheet, accessibility
 /// audit of `docs/rendered-dom.html`/`index.html` if present, and token
 /// discipline. Deterministic, zero tokens.
-fn collect_design_review_findings() -> Vec<String> {
+/// Working-tree changes vs HEAD (modified + staged + untracked) — the file
+/// scope `--changed` narrows the design audit to.
+fn changed_files_in_cwd() -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for args in [
+        &["diff", "--name-only", "HEAD"][..],
+        &["ls-files", "--others", "--exclude-standard"][..],
+    ] {
+        if let Ok(output) = std::process::Command::new("git").args(args).output() {
+            files.extend(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+    }
+    files.sort_unstable();
+    files.dedup();
+    files
+}
+
+fn collect_design_review_findings(changed_only: bool) -> Vec<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut findings = claw_multiagent::design::run_design_gate(&cwd, &cwd.join("docs"), false);
+    let changed = changed_only.then(changed_files_in_cwd);
+    let mut findings = claw_multiagent::design::run_design_gate_scoped(
+        &cwd,
+        &cwd.join("docs"),
+        false,
+        changed.as_deref(),
+    );
     // Outside a multiagent build there is rarely a rendered DOM capture;
     // fall back to auditing the source index.html so the command is useful
     // on any web project.
     if !cwd.join("docs/rendered-dom.html").exists() {
         for candidate in ["index.html", "public/index.html", "src/index.html"] {
+            if changed
+                .as_ref()
+                .is_some_and(|files| !files.iter().any(|file| file == candidate))
+            {
+                continue;
+            }
             if let Ok(html) = std::fs::read_to_string(cwd.join(candidate)) {
                 for finding in claw_multiagent::design::audit_rendered_html(&html) {
                     findings.push(format!("[A11Y] {candidate}: {finding}"));
@@ -7603,7 +7767,16 @@ fn collect_design_review_findings() -> Vec<String> {
             }
         }
     }
+    // Token discipline runs here (the gate itself only enforces it when
+    // require_tokens is set); with --changed, keep only findings that name
+    // a changed file.
     for finding in claw_multiagent::design::audit_hardcoded_colors(&cwd) {
+        if changed
+            .as_ref()
+            .is_some_and(|files| !files.iter().any(|file| finding.contains(file.as_str())))
+        {
+            continue;
+        }
         findings.push(format!("[TOKENS] {finding}"));
     }
     findings
@@ -7626,17 +7799,23 @@ fn design_review_fix_prompt(findings: &[String]) -> String {
     prompt
 }
 
-fn format_design_review_report() -> String {
+fn format_design_review_report(changed_only: bool) -> String {
     use std::fmt::Write as _;
-    let findings = collect_design_review_findings();
+    let findings = collect_design_review_findings(changed_only);
+    let scope_note = if changed_only {
+        " — solo archivos cambiados (git)"
+    } else {
+        ""
+    };
     if findings.is_empty() {
-        return "Design review (checks deterministas, 0 tokens)\n  Result           ok — \
+        return format!(
+            "Design review (checks deterministas, 0 tokens{scope_note})\n  Result           ok — \
                 sin fallos de contraste WCAG, accesibilidad HTML ni disciplina de tokens\n  \
                 Nota             audita stylesheets de tokens, index.html/rendered-dom y CSS de componentes"
-            .to_string();
+        );
     }
     let mut out = format!(
-        "Design review (checks deterministas, 0 tokens)\n  Findings         {}\n",
+        "Design review (checks deterministas, 0 tokens{scope_note})\n  Findings         {}\n",
         findings.len()
     );
     for finding in findings.iter().take(25) {
@@ -7863,6 +8042,84 @@ fn failover_hint(error: &str) -> Option<String> {
     ))
 }
 
+/// `/doctor fix`: repairs what the doctor can fix mechanically — lax
+/// permissions on files that hold credentials/conversations, and the
+/// unconfigured git hooks path when the repo ships hooks. Typing `fix`
+/// is the consent; every action taken (or not needed) is reported.
+fn doctor_apply_fixes() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("Doctor fix");
+    let mut acted = false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let targets = [
+            (runtime::default_config_home().join("settings.json"), 0o600),
+            (
+                runtime::default_config_home().join("settings.local.json"),
+                0o600,
+            ),
+        ];
+        for (path, mode) in targets {
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if metadata.permissions().mode() & 0o077 == 0 {
+                continue;
+            }
+            acted = true;
+            match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+                Ok(()) => {
+                    let _ = write!(out, "\n  Reparado         {} → {mode:o}", path.display());
+                }
+                Err(error) => {
+                    let _ = write!(out, "\n  Error            {}: {error}", path.display());
+                }
+            }
+        }
+        if let Ok(dir) = sessions_dir() {
+            if let Ok(metadata) = std::fs::metadata(&dir) {
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    acted = true;
+                    match std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                        Ok(()) => {
+                            let _ = write!(out, "\n  Reparado         {} → 700", dir.display());
+                        }
+                        Err(error) => {
+                            let _ = write!(out, "\n  Error            {}: {error}", dir.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Repo ships hooks but git is not pointed at them.
+    if std::path::Path::new(".githooks").is_dir() {
+        let configured = std::process::Command::new("git")
+            .args(["config", "core.hooksPath"])
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty());
+        if configured.is_none() {
+            acted = true;
+            let result = std::process::Command::new("git")
+                .args(["config", "core.hooksPath", ".githooks"])
+                .status();
+            match result {
+                Ok(status) if status.success() => {
+                    out.push_str("\n  Reparado         core.hooksPath → .githooks");
+                }
+                _ => out.push_str("\n  Error            no se pudo configurar core.hooksPath"),
+            }
+        }
+    }
+    if !acted {
+        out.push_str("\n  Result           nada que reparar — permisos y hooks ya correctos");
+    }
+    out
+}
+
 /// `/doctor online`: the doctor report is static analysis; this appends one
 /// live 1-token probe of the active provider plus the credential env vars
 /// that are actually set.
@@ -7942,6 +8199,26 @@ fn run_repl(
     if let Some(warning) = provider_presets::jwt_expiry_warning() {
         println!("{warning}");
     }
+    // A recent session with no clean-shutdown stamp usually means a crash
+    // or a killed terminal — surface the resume path once.
+    if let Some(hint) = crashed_session_hint(&cli.session.id) {
+        println!("{hint}");
+    }
+    // Background agents finish while the user is typing; the external
+    // printer interjects the notice above the prompt without corrupting
+    // the edit line. Polling beats a channel here: the queue is tiny and
+    // the thread dies with the process.
+    if let Some(mut printer) = editor.external_printer() {
+        std::thread::spawn(move || {
+            use rustyline::ExternalPrinter as _;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                for notice in tools::take_agent_notices() {
+                    let _ = printer.print(notice);
+                }
+            }
+        });
+    }
 
     let mut exit_hint_shown = false;
     loop {
@@ -7961,6 +8238,7 @@ fn run_repl(
                     trimmed.as_str(),
                     "/exit" | "/quit" | "exit" | "quit" | "salir"
                 ) {
+                    cli.mark_session_closed();
                     cli.persist_session()?;
                     break;
                 }
@@ -8034,6 +8312,7 @@ fn run_repl(
                 }
             }
             input::ReadOutcome::Exit => {
+                cli.mark_session_closed();
                 cli.persist_session()?;
                 break;
             }
@@ -8080,6 +8359,12 @@ struct LiveCli {
     /// `/fast`: the model that was active before switching to the fast
     /// (subagent) model, so a second `/fast` switches back.
     fast_model_stash: Option<String>,
+    /// `/focus`: paths the user wants subsequent turns to prioritize;
+    /// prepended to every prompt until `/unfocus`.
+    focus_paths: Vec<String>,
+    /// `/undo`: how many trailing edit_file calls have already been
+    /// reversed, so consecutive undos walk further back.
+    undo_cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -8615,6 +8900,8 @@ impl LiveCli {
             reasoning_effort: None,
             plan_mode_once: std::cell::Cell::new(false),
             fast_model_stash: None,
+            focus_paths: Vec::new(),
+            undo_cursor: 0,
         };
         cli.persist_session()?;
         Ok(cli)
@@ -8775,6 +9062,19 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // `/focus`: steer every turn toward the chosen paths without the
+        // user retyping them. Shadow `input` so the rest of the turn
+        // (including compaction retries) sees the focused prompt.
+        let focused;
+        let input = if self.focus_paths.is_empty() {
+            input
+        } else {
+            focused = format!(
+                "[Foco de la sesión — prioriza estas rutas: {}]\n\n{input}",
+                self.focus_paths.join(", ")
+            );
+            &focused
+        };
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -9194,8 +9494,149 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Compact => {
-                self.compact()?;
+            SlashCommand::Compact { preview } => {
+                if preview {
+                    // Same computation /compact would run, session untouched.
+                    let result = self.runtime.compact(CompactionConfig::default());
+                    let removed = result.removed_message_count;
+                    let kept = result.compacted_session.messages.len();
+                    if removed == 0 {
+                        println!(
+                            "Compact preview\n  Result           nada que compactar — la sesión está bajo el umbral"
+                        );
+                    } else {
+                        println!(
+                            "Compact preview\n  Eliminaría       {removed} mensaje(s)\n  Conservaría      {kept} mensaje(s)\n  Aplicar          /compact"
+                        );
+                    }
+                } else {
+                    self.compact()?;
+                }
+                false
+            }
+            SlashCommand::Pin { text } => {
+                let note = text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+                let note = note.or_else(|| {
+                    self.runtime
+                        .session()
+                        .prompt_history
+                        .last()
+                        .map(|entry| entry.text.clone())
+                });
+                match note {
+                    Some(note) => {
+                        if let Err(error) = self.runtime.session_mut().add_pin(&note) {
+                            eprintln!("warning: la nota se fijó en memoria pero no se pudo persistir aún: {error}");
+                        }
+                        let total = self.runtime.session().pins.len();
+                        println!(
+                            "Pin\n  Guardado         {}\n  Total            {total} nota(s) — /bookmarks para verlas",
+                            truncate_retry_error(&note)
+                        );
+                        true
+                    }
+                    None => {
+                        eprintln!("Nada que fijar: escribe /pin <texto> o manda antes un prompt.");
+                        false
+                    }
+                }
+            }
+            SlashCommand::Unpin { index } => {
+                let pins = self.runtime.session().pins.len();
+                if pins == 0 {
+                    eprintln!("No hay notas fijadas.");
+                    false
+                } else {
+                    let target = match index.as_deref().map(str::parse::<usize>) {
+                        None => pins - 1,
+                        Some(Ok(n)) if n >= 1 && n <= pins => n - 1,
+                        _ => {
+                            eprintln!("Índice inválido — /bookmarks lista las notas (1..{pins}).");
+                            return Ok(false);
+                        }
+                    };
+                    match self.runtime.session_mut().remove_pin(target) {
+                        Some(pin) => {
+                            println!(
+                                "Unpin\n  Eliminada        {}",
+                                truncate_retry_error(&pin.text)
+                            );
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            }
+            SlashCommand::Bookmarks => {
+                let pins = &self.runtime.session().pins;
+                if pins.is_empty() {
+                    println!(
+                        "Bookmarks\n  Result           sin notas fijadas\n  Fijar            /pin [texto] (por defecto fija tu último prompt)"
+                    );
+                } else {
+                    println!("Bookmarks ({} nota(s), sobreviven a /compact)", pins.len());
+                    for (i, pin) in pins.iter().enumerate() {
+                        println!(
+                            "  {}. {}  {}",
+                            i + 1,
+                            format_history_timestamp(pin.timestamp_ms),
+                            truncate_retry_error(&pin.text)
+                        );
+                    }
+                }
+                false
+            }
+            SlashCommand::Focus { paths } => match paths {
+                Some(paths) => {
+                    self.focus_paths = paths.split_whitespace().map(str::to_string).collect();
+                    println!(
+                        "Focus\n  Activo           {}\n  Efecto           cada turno pedirá priorizar esas rutas (quitar con /unfocus)",
+                        self.focus_paths.join(", ")
+                    );
+                    false
+                }
+                None => {
+                    if self.focus_paths.is_empty() {
+                        println!("Focus\n  Activo           (ninguno)\n  Usage            /focus <ruta> [ruta...]");
+                    } else {
+                        println!("Focus\n  Activo           {}", self.focus_paths.join(", "));
+                    }
+                    false
+                }
+            },
+            SlashCommand::Unfocus => {
+                if self.focus_paths.is_empty() {
+                    println!("Unfocus\n  Result           no había foco activo");
+                } else {
+                    println!(
+                        "Unfocus\n  Retirado         {}",
+                        self.focus_paths.join(", ")
+                    );
+                    self.focus_paths.clear();
+                }
+                false
+            }
+            SlashCommand::Undo => {
+                println!("{}", self.undo_last_edit());
+                false
+            }
+            SlashCommand::Stop => {
+                let running: Vec<_> = tools::list_agent_jobs()
+                    .into_iter()
+                    .filter(|job| job.status == "running")
+                    .collect();
+                if running.is_empty() {
+                    println!(
+                        "Stop\n  Result           no hay agentes en background corriendo\n  Nota             el turno en curso se cancela con Ctrl+C"
+                    );
+                } else {
+                    for job in running {
+                        match tools::request_agent_stop(&job.id) {
+                            Ok(message) => println!("Stop {}: {message}", job.id),
+                            Err(error) => eprintln!("Stop {}: {error}", job.id),
+                        }
+                    }
+                }
                 false
             }
             SlashCommand::Model { model } => self.set_model(model)?,
@@ -9265,7 +9706,7 @@ impl LiveCli {
                 }
                 false
             }
-            SlashCommand::Doctor { online } => {
+            SlashCommand::Doctor { online, fix } => {
                 println!(
                     "{}",
                     render_doctor_report(
@@ -9276,6 +9717,9 @@ impl LiveCli {
                 );
                 if online {
                     println!("{}", doctor_online_section());
+                }
+                if fix {
+                    println!("{}", doctor_apply_fixes());
                 }
                 false
             }
@@ -9321,6 +9765,10 @@ impl LiveCli {
                         self.runtime.estimated_tokens(),
                         tracker.cumulative_usage().input_tokens,
                     )
+                );
+                println!(
+                    "{}",
+                    format_context_breakdown(self.runtime.session(), &self.system_prompt)
                 );
                 false
             }
@@ -9497,6 +9945,7 @@ impl LiveCli {
             SlashCommand::Exit => {
                 // Reached when /exit carries arguments or arrives via a
                 // dispatch path that skips the REPL's literal string match.
+                self.mark_session_closed();
                 self.persist_session()?;
                 println!("Session saved. Bye!");
                 std::process::exit(0);
@@ -9560,7 +10009,11 @@ impl LiveCli {
                         ),
                         None => eprintln!("No hay ningún job cuyo id empiece por '{id}'."),
                     },
-                    _ => eprintln!("Usage: /tasks [list|get <id>]"),
+                    ["stop", id] => match tools::request_agent_stop(id) {
+                        Ok(message) => println!("Tasks\n  Stop             {message}"),
+                        Err(error) => eprintln!("{error}"),
+                    },
+                    _ => eprintln!("Usage: /tasks [list|get <id>|stop <id>]"),
                 }
                 false
             }
@@ -9632,10 +10085,10 @@ impl LiveCli {
                 println!("{}", format_security_review_report());
                 false
             }
-            SlashCommand::DesignReview { fix } => {
-                println!("{}", format_design_review_report());
+            SlashCommand::DesignReview { fix, changed } => {
+                println!("{}", format_design_review_report(changed));
                 if fix {
-                    let findings = collect_design_review_findings();
+                    let findings = collect_design_review_findings(changed);
                     if findings.is_empty() {
                         println!("  Fix              nada que corregir — la auditoría está limpia");
                     } else {
@@ -10298,7 +10751,7 @@ impl LiveCli {
     }
 
     fn print_diff(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_diff_report(path)?);
+        println!("{}", render::colorize_diff(&render_diff_report(path)?));
         Ok(())
     }
 
@@ -10311,7 +10764,8 @@ impl LiveCli {
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        let rendered = render_export_text(self.runtime.session());
+        // Mirror the session-persistence masking: transcripts get shared.
+        let rendered = runtime::redact_secrets(&render_export_text(self.runtime.session()));
         let bytes = rendered.len();
         fs::write(&export_path, rendered)?;
         println!(
@@ -10501,6 +10955,87 @@ impl LiveCli {
         self.persist_session()
     }
 
+    /// Clean-shutdown stamp: its absence at the next startup is what
+    /// distinguishes a crash from a normal exit.
+    fn mark_session_closed(&mut self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        if let Err(error) = self.runtime.session_mut().mark_closed(now_ms) {
+            eprintln!("warning: could not stamp clean shutdown: {error}");
+        }
+    }
+
+    /// `/undo`: reverse the most recent `edit_file` tool call by applying
+    /// the swap backwards (new_string → old_string). Only safe when the
+    /// edited text is still present exactly as the tool left it; otherwise
+    /// report instead of guessing. `write_file` has no recorded prior
+    /// content, so it is explicitly not reversible.
+    fn undo_last_edit(&mut self) -> String {
+        let mut seen = 0usize;
+        for message in self.runtime.session().messages.iter().rev() {
+            for block in message.blocks.iter().rev() {
+                let ContentBlock::ToolUse { name, input, .. } = block else {
+                    continue;
+                };
+                if name != "edit_file" {
+                    continue;
+                }
+                if seen < self.undo_cursor {
+                    seen += 1;
+                    continue;
+                }
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(input) else {
+                    return "Undo\n  Error            la última edición registrada no tiene un input JSON válido".to_string();
+                };
+                let (Some(path), Some(old_string), Some(new_string)) = (
+                    parsed.get("path").and_then(|v| v.as_str()),
+                    parsed.get("old_string").and_then(|v| v.as_str()),
+                    parsed.get("new_string").and_then(|v| v.as_str()),
+                ) else {
+                    return "Undo\n  Error            la última edición registrada no tiene los campos esperados".to_string();
+                };
+                let replace_all = parsed
+                    .get("replace_all")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let Ok(contents) = std::fs::read_to_string(path) else {
+                    return format!("Undo\n  Error            no se pudo leer {path}");
+                };
+                if new_string.is_empty() || !contents.contains(new_string) {
+                    return format!(
+                        "Undo\n  Result           no reversible — el texto que dejó la edición ya no está en {path} (el archivo cambió después)"
+                    );
+                }
+                if !replace_all && contents.matches(new_string).count() != 1 {
+                    return format!(
+                        "Undo\n  Result           no reversible — el texto editado aparece varias veces en {path} y la edición fue única"
+                    );
+                }
+                let restored = if replace_all {
+                    contents.replace(new_string, old_string)
+                } else {
+                    contents.replacen(new_string, old_string, 1)
+                };
+                if let Err(error) = std::fs::write(path, restored) {
+                    return format!("Undo\n  Error            no se pudo escribir {path}: {error}");
+                }
+                self.undo_cursor += 1;
+                return format!(
+                    "Undo\n  Revertido        {path}\n  Detalle          la edición nº{} desde el final volvió a su contenido anterior\n  Otra vez         /undo revierte la edición previa",
+                    self.undo_cursor
+                );
+            }
+        }
+        if self.undo_cursor > 0 {
+            "Undo\n  Result           no quedan más ediciones que revertir en esta sesión"
+                .to_string()
+        } else {
+            "Undo\n  Result           esta sesión no tiene ediciones de archivos (edit_file) que revertir\n  Nota             write_file no es reversible (no hay contenido previo registrado)".to_string()
+        }
+    }
+
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
@@ -10659,6 +11194,32 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
     current_session_store()?
         .resolve_managed_path(session_id)
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// The most recent other session in this workspace, if it holds messages,
+/// was touched in the last 24h, and never got the clean-shutdown stamp —
+/// i.e. the process probably crashed or the terminal was killed.
+fn crashed_session_hint(current_session_id: &str) -> Option<String> {
+    let sessions = list_managed_sessions().ok()?;
+    let latest = sessions
+        .iter()
+        .filter(|session| session.id != current_session_id && session.message_count > 0)
+        .max_by_key(|session| session.modified_epoch_millis)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    if now_ms.saturating_sub(latest.modified_epoch_millis) > 24 * 60 * 60 * 1000 {
+        return None;
+    }
+    let session = Session::load_from_path(&latest.path).ok()?;
+    if session.closed_at_ms.is_some() {
+        return None;
+    }
+    Some(format!(
+        "⚠ la sesión anterior ({}) no se cerró limpiamente — retómala con claw --resume {} (o /resume {})",
+        latest.id, latest.id, latest.id
+    ))
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
@@ -13122,6 +13683,13 @@ fn render_export_text(session: &Session) -> String {
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text } => lines.push(text.clone()),
+                ContentBlock::Image {
+                    media_type,
+                    base64_data,
+                } => lines.push(runtime::image_placeholder_text(
+                    media_type,
+                    base64_data.len(),
+                )),
                 ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
                     lines.push(format!("[tool_use id={id} name={name}] {input}"));
@@ -13359,6 +13927,16 @@ fn render_session_markdown(session: &Session, session_id: &str, session_path: &P
                         lines.push(trimmed.to_string());
                         lines.push(String::new());
                     }
+                }
+                ContentBlock::Image {
+                    media_type,
+                    base64_data,
+                } => {
+                    lines.push(runtime::image_placeholder_text(
+                        media_type,
+                        base64_data.len(),
+                    ));
+                    lines.push(String::new());
                 }
                 ContentBlock::Thinking { .. } => {}
                 ContentBlock::ToolUse { id, name, input } => {
@@ -14747,51 +15325,38 @@ fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json
 /// Slash commands that are registered in the spec list but not yet implemented
 /// in this build. Used to filter both REPL completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
+/// Commands hidden from REPL completion/help and rejected in resume mode
+/// because they have NO working implementation in this build: either their
+/// live handler prints "not yet implemented", or their spec has no parse
+/// arm at all (typing them yields Unknown). Keep this list in sync when
+/// implementing one — a stale entry hides a working command from Tab
+/// completion, live /help AND resume mode (it did: /tasks, /plan, /review,
+/// /usage, /fast, /web and 20+ others were listed here long after they
+/// shipped).
 const STUB_COMMANDS: &[&str] = &[
+    // Live handler answers "not yet implemented in this build".
     "login",
     "logout",
     "vim",
-    "upgrade",
     "share",
     "feedback",
-    "files",
-    "fast",
-    "exit",
-    "summary",
     "desktop",
     "brief",
     "advisor",
     "stickers",
     "insights",
     "thinkback",
-    "release-notes",
-    "security-review",
-    "keybindings",
-    "privacy-settings",
-    "plan",
-    "review",
-    "tasks",
-    "theme",
     "voice",
-    "usage",
     "rename",
-    "copy",
-    "hooks",
-    "context",
-    "color",
-    "effort",
-    "branch",
-    "rewind",
     "ide",
     "tag",
     "output-style",
     "add-dir",
-    // Spec entries with no parse arm — produce circular "Did you mean" error
-    // without this guard. Adding here routes them to the proper unsupported
-    // message and excludes them from REPL completions / help.
+    "team",
+    // Spec entries with no parse arm — produce circular "Did you mean"
+    // errors without this guard.
     // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
     "allowed-tools",
-    "bookmarks",
     "workspace",
     "reasoning",
     "budget",
@@ -14800,10 +15365,6 @@ const STUB_COMMANDS: &[&str] = &[
     "diagnostics",
     "metrics",
     "tool-details",
-    "focus",
-    "unfocus",
-    "pin",
-    "unpin",
     "language",
     "profile",
     "max-tokens",
@@ -14816,9 +15377,6 @@ const STUB_COMMANDS: &[&str] = &[
     "terminal-setup",
     "api-key",
     "reset",
-    "undo",
-    "stop",
-    "retry",
     "paste",
     "screenshot",
     "image",
@@ -14835,7 +15393,6 @@ const STUB_COMMANDS: &[&str] = &[
     "blame",
     "log",
     "cron",
-    "team",
     "benchmark",
     "migrate",
     "templates",
@@ -14845,7 +15402,6 @@ const STUB_COMMANDS: &[&str] = &[
     "fix",
     "perf",
     "chat",
-    "web",
     "map",
     "symbols",
     "references",
@@ -14917,8 +15473,22 @@ fn slash_command_completion_candidates_with_sessions(
         "/agents help",
         "/mcp help",
         "/skills help",
+        "/provider show",
+        "/provider list",
+        "/provider models",
+        "/provider test",
+        "/provider clear",
+        "/compact preview",
+        "/design-review fix",
+        "/doctor online",
+        "/tasks list",
     ] {
         completions.insert(candidate.to_string());
+    }
+
+    // `/provider use <preset>` for every configured preset kind.
+    for preset in provider_presets::PROVIDER_PRESETS {
+        completions.insert(format!("/provider use {} ", preset.kind));
     }
 
     if !model.trim().is_empty() {
@@ -15653,6 +16223,13 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::Image {
+                        media_type,
+                        base64_data,
+                    } => InputContentBlock::from(api::ImageAttachment {
+                        media_type: media_type.clone(),
+                        base64_data: base64_data.clone(),
+                    }),
                     ContentBlock::Thinking {
                         thinking,
                         signature,
@@ -15906,6 +16483,19 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 #[cfg(test)]
 mod tests {
+
+    /// Best-effort workspace cleanup: Windows can hold transient locks on
+    /// freshly written files (antivirus, indexer, a just-exited child), so
+    /// retry briefly and give up quietly — the temp dir is disposable.
+    fn cleanup_dir(path: &std::path::Path) {
+        for _ in 0..5 {
+            if std::fs::remove_dir_all(path).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
@@ -16229,39 +16819,67 @@ mod tests {
         .expect("skill file should write");
     }
 
+    /// Extension for plugin fixture scripts: Windows runs plugin commands via
+    /// `cmd /C`, where a `.sh` file falls back to the shell association
+    /// (git-bash window) and hangs a headless CI session — write native
+    /// scripts per platform instead.
+    fn plugin_script_ext() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "sh"
+        }
+    }
+
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
+        let ext = plugin_script_ext();
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         if include_hooks {
             fs::create_dir_all(root.join("hooks")).expect("hooks dir");
-            fs::write(
-                root.join("hooks").join("pre.sh"),
-                "#!/bin/sh\nprintf 'plugin pre hook'\n",
-            )
-            .expect("write hook");
+            let hook_body = if cfg!(windows) {
+                "@echo off\r\necho plugin pre hook\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'plugin pre hook'\n"
+            };
+            fs::write(root.join("hooks").join(format!("pre.{ext}")), hook_body)
+                .expect("write hook");
         }
         if include_lifecycle {
             fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
+            let (init_body, shutdown_body) = if cfg!(windows) {
+                (
+                    "@echo off\r\n>>lifecycle.log echo init\r\n",
+                    "@echo off\r\n>>lifecycle.log echo shutdown\r\n",
+                )
+            } else {
+                (
+                    "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                    "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+                )
+            };
             fs::write(
-                root.join("lifecycle").join("init.sh"),
-                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                root.join("lifecycle").join(format!("init.{ext}")),
+                init_body,
             )
             .expect("write init lifecycle");
             fs::write(
-                root.join("lifecycle").join("shutdown.sh"),
-                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+                root.join("lifecycle").join(format!("shutdown.{ext}")),
+                shutdown_body,
             )
             .expect("write shutdown lifecycle");
         }
 
         let hooks = if include_hooks {
-            ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"]\n  }"
+            format!(",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.{ext}\"]\n  }}")
         } else {
-            ""
+            String::new()
         };
         let lifecycle = if include_lifecycle {
-            ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }"
+            format!(
+                ",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.{ext}\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.{ext}\"]\n  }}"
+            )
         } else {
-            ""
+            String::new()
         };
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
@@ -16317,7 +16935,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -16351,7 +16969,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
@@ -16392,7 +17010,7 @@ mod tests {
             Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
             None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
         }
-        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
+        cleanup_dir(&config_home);
 
         assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
     }
@@ -16709,7 +17327,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         // then
         assert_eq!(direct, "anthropic/claude-haiku-4-5-20251213");
@@ -16883,10 +17501,11 @@ mod tests {
     #[test]
     fn parses_system_prompt_options() {
         // given: system-prompt options for cwd and date
+        let temp = std::env::temp_dir();
         let args = vec![
             "system-prompt".to_string(),
             "--cwd".to_string(),
-            "/tmp".to_string(),
+            temp.to_string_lossy().into_owned(),
             "--date".to_string(),
             "2026-04-01".to_string(),
         ];
@@ -16898,7 +17517,7 @@ mod tests {
         assert_eq!(
             action,
             CliAction::PrintSystemPrompt {
-                cwd: PathBuf::from("/tmp"),
+                cwd: temp.clone(),
                 date: "2026-04-01".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
@@ -17535,7 +18154,10 @@ mod tests {
 
         // Phase 1 contract: workspace/git/sandbox fields are still populated
         // (independent of config parse). Sandbox falls back to defaults.
-        assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+        assert_eq!(
+            context.cwd.canonicalize().unwrap_or(context.cwd.clone()),
+            cwd.canonicalize().unwrap_or(cwd.clone())
+        );
         assert_eq!(
             context.loaded_config_files, 0,
             "loaded_config_files should be 0 when config parse fails"
@@ -18554,7 +19176,9 @@ mod tests {
     fn direct_slash_commands_surface_shared_validation_errors() {
         let compact_error = parse_args(&["/compact".to_string(), "now".to_string()])
             .expect_err("invalid /compact shape should be rejected");
-        assert!(compact_error.contains("Unexpected arguments for /compact."));
+        // /compact now accepts an optional `preview` argument; anything else
+        // is a usage error naming the accepted form.
+        assert!(compact_error.contains("Usage: /compact [preview]"));
         assert!(compact_error.contains("Usage            /compact"));
 
         let plugins_error = parse_args(&[
@@ -18909,7 +19533,7 @@ mod tests {
             .expect("known bare skill should dispatch");
         assert_eq!(prompt, "$caveman sharpen club");
 
-        fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -18924,7 +19548,7 @@ mod tests {
         );
         assert_eq!(try_resolve_bare_skill_prompt(&workspace, "/status"), None);
 
-        fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19005,7 +19629,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -19054,7 +19678,7 @@ mod tests {
 
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::remove_var("CLAW_CONFIG_HOME");
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -19073,7 +19697,7 @@ mod tests {
         assert_eq!(resolved, DEFAULT_MODEL);
 
         std::env::remove_var("CLAW_CONFIG_HOME");
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -19359,6 +19983,34 @@ mod tests {
     }
 
     #[test]
+    fn context_breakdown_buckets_by_role_and_tool_traffic() {
+        use crate::format_context_breakdown;
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("hola"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "respuesta".to_string(),
+            }]));
+        session.messages.push(ConversationMessage::assistant(vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                output: "x".repeat(400),
+                is_error: false,
+            },
+        ]));
+        let report = format_context_breakdown(&session, &["system".to_string()]);
+        assert!(report.contains("System prompt"));
+        assert!(report.contains("User prompts"));
+        assert!(report.contains("Tool I/O"));
+        // 400 chars of tool output ≈ 100 tokens dominates this tiny session.
+        assert!(report.contains("~100 tokens"));
+    }
+
+    #[test]
     fn large_paste_detection_uses_a_50_line_threshold() {
         use crate::large_paste_line_count;
         assert_eq!(large_paste_line_count("una línea"), None);
@@ -19566,7 +20218,7 @@ mod tests {
         assert!(lifecycle.workspace_dirty);
         assert!(lifecycle.abandoned);
 
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19598,7 +20250,7 @@ mod tests {
         assert!(report.contains("lifecycle=saved only · dirty worktree · abandoned?"));
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19825,7 +20477,7 @@ mod tests {
         assert!(json["required_binaries"]
             .as_array()
             .is_some_and(|items| { items.iter().any(|item| item["name"] == "git") }));
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19927,7 +20579,7 @@ mod tests {
         );
         assert_eq!(branch.as_deref(), Some("rcc/cli"));
         assert!(project_root.is_none());
-        fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+        cleanup_dir(&temp_root);
     }
 
     #[test]
@@ -19984,7 +20636,7 @@ UU conflicted.rs",
         let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20009,7 +20661,7 @@ UU conflicted.rs",
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20034,7 +20686,7 @@ UU conflicted.rs",
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20065,7 +20717,7 @@ UU conflicted.rs",
         let refused = render_diff_report_for(&root, Some("--cached")).expect("refused report");
         assert!(refused.contains("invalid path"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20094,7 +20746,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20214,7 +20866,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20303,7 +20955,7 @@ UU conflicted.rs",
         assert!(!saved.path.exists(), "saved session should be deleted");
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20346,7 +20998,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20356,6 +21008,10 @@ UU conflicted.rs",
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
         std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
+        // Canonical forms keep the assertion below comparable with the error
+        // message, which renders canonicalized store/session roots.
+        let workspace_a = workspace_a.canonicalize().expect("canonicalize a");
+        let workspace_b = workspace_b.canonicalize().expect("canonicalize b");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace_b).expect("switch cwd");
 
@@ -20392,8 +21048,8 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace_a).expect("workspace a should clean up");
-        std::fs::remove_dir_all(workspace_b).expect("workspace b should clean up");
+        cleanup_dir(&workspace_a);
+        cleanup_dir(&workspace_b);
     }
 
     #[test]
@@ -21015,8 +21671,9 @@ UU conflicted.rs",
             .expect("plugin state should load");
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
+        let expected_hook_suffix = format!("hooks/pre.{}", plugin_script_ext());
         assert!(
-            pre_hooks[0].ends_with("hooks/pre.sh"),
+            pre_hooks[0].ends_with(&expected_hook_suffix),
             "expected installed plugin hook path, got {pre_hooks:?}"
         );
 
@@ -21049,7 +21706,7 @@ UU conflicted.rs",
                     }}
                   }}
                 }}"#,
-                script_path.to_string_lossy()
+                script_path.to_string_lossy().replace('\\', "/")
             ),
         )
         .expect("write mcp settings");
@@ -21236,7 +21893,9 @@ UU conflicted.rs",
         .expect("runtime should build");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("init log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("init log should exist")
+                .replace("\r\n", "\n"),
             "init\n"
         );
 
@@ -21245,7 +21904,9 @@ UU conflicted.rs",
             .expect("plugin shutdown should succeed");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("shutdown log should exist")
+                .replace("\r\n", "\n"),
             "init\nshutdown\n"
         );
 

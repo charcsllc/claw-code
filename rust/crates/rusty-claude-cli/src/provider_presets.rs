@@ -210,6 +210,29 @@ pub(crate) fn handle_provider_command(args: Option<&str>) -> String {
     match tokens.next() {
         None | Some("show") => render_provider_show(),
         Some("list") => render_provider_list(),
+        Some("models") => match api::list_models_via_http() {
+            Ok(models) if models.is_empty() => {
+                "Provider models\n  Result           el endpoint respondió sin modelos".to_string()
+            }
+            Ok(models) => {
+                let mut out = format!(
+                    "Provider models ({} disponibles según el endpoint activo)",
+                    models.len()
+                );
+                for model in models.iter().take(40) {
+                    out.push_str("\n  ");
+                    out.push_str(model);
+                }
+                if models.len() > 40 {
+                    out.push_str(&format!("\n  … y {} más", models.len() - 40));
+                }
+                out.push_str("\n  Cambiar          /model <id>");
+                out
+            }
+            Err(error) => format!(
+                "Provider models\n  Error            {error}\n  Nota             requiere credenciales válidas (/provider test las verifica)"
+            ),
+        },
         Some("clear") => match runtime::clear_user_provider_settings() {
             Ok(()) => "Provider\n  Action           clear\n  Status           ok\n  Note             saved provider removed; env vars (if any) still apply".to_string(),
             Err(error) => format!("Provider\n  Error            {error}"),
@@ -291,7 +314,7 @@ fn provider_usage() -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!(
-        "  Usage            /provider [show|list]\n                   /provider use <{kinds}> <api-key> [model]\n                   /provider use ollama [base-url] [model]\n                   /provider test [model]   (live 1-token connectivity check)\n                   /provider clear"
+        "  Usage            /provider [show|list|models]\n                   /provider use <{kinds}> <api-key> [model]\n                   /provider use ollama [base-url] [model]\n                   /provider test [model]   (live 1-token connectivity check)\n                   /provider models         (query the endpoint's real model list)\n                   /provider clear"
     )
 }
 

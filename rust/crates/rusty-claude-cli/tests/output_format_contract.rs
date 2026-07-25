@@ -9,6 +9,19 @@ use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[test]
 fn help_emits_json_when_requested() {
     let root = unique_temp_dir("help-json");
@@ -516,7 +529,7 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
         "status JSON should retain workspace context with permission mode"
     );
 
-    fs::remove_dir_all(root).expect("cleanup temp dir");
+    cleanup_dir(&root);
 }
 
 #[test]
@@ -628,22 +641,28 @@ fn global_cwd_flag_routes_status_workspace_and_short_alias_429() {
     fs::create_dir_all(&launcher).expect("launcher dir should exist");
 
     let workspace_str = workspace.to_str().expect("utf8 workspace");
-    let expected_cwd = fs::canonicalize(&workspace)
-        .expect("workspace should canonicalize")
-        .display()
-        .to_string();
+    // Path forms differ between what claw reports and what the test built
+    // (8.3 short names, \\?\ verbatim); canonicalize both before comparing.
+    let canonical_cwd = |value: &serde_json::Value| {
+        fs::canonicalize(value.as_str().expect("cwd should be a string"))
+            .expect("reported cwd should canonicalize")
+    };
+    let expected_cwd = fs::canonicalize(&workspace).expect("workspace should canonicalize");
     let status = assert_json_command(
         &launcher,
         &["--cwd", workspace_str, "--output-format", "json", "status"],
     );
     assert_eq!(status["kind"], "status");
-    assert_eq!(status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(canonical_cwd(&status["workspace"]["cwd"]), expected_cwd);
 
     let short_status = assert_json_command(
         &launcher,
         &["-C", workspace_str, "status", "--output-format", "json"],
     );
-    assert_eq!(short_status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(
+        canonical_cwd(&short_status["workspace"]["cwd"]),
+        expected_cwd
+    );
 
     let directory_status = assert_json_command(
         &launcher,
@@ -654,7 +673,10 @@ fn global_cwd_flag_routes_status_workspace_and_short_alias_429() {
             "status",
         ],
     );
-    assert_eq!(directory_status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(
+        canonical_cwd(&directory_status["workspace"]["cwd"]),
+        expected_cwd
+    );
 }
 
 #[test]
@@ -1065,14 +1087,19 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("manifest dir should exist");
     fs::create_dir_all(plugin_root.join("lifecycle")).expect("lifecycle dir should exist");
+    // Windows runs lifecycle commands through `cmd /C`, where a `.sh` file
+    // falls back to the shell association and hangs headless CI — write a
+    // native script per platform.
+    let (init_name, shutdown_name, script_body) = if cfg!(windows) {
+        ("init.cmd", "shutdown.cmd", "@echo off\r\nexit /b 0\r\n")
+    } else {
+        ("init.sh", "shutdown.sh", "#!/bin/sh\nexit 0\n")
+    };
+    fs::write(plugin_root.join("lifecycle").join(init_name), script_body)
+        .expect("init lifecycle script should write");
     fs::write(
-        plugin_root.join("lifecycle").join("init.sh"),
-        "#!/bin/sh\nexit 0\n",
-    )
-    .expect("init lifecycle script should write");
-    fs::write(
-        plugin_root.join("lifecycle").join("shutdown.sh"),
-        "#!/bin/sh\nexit 0\n",
+        plugin_root.join("lifecycle").join(shutdown_name),
+        script_body,
     )
     .expect("shutdown lifecycle script should write");
     fs::write(
@@ -1082,10 +1109,12 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
   "version": "1.0.0",
   "description": "lifecycle JSON fixture",
   "lifecycle": {
-    "Init": ["./lifecycle/init.sh"],
-    "Shutdown": ["./lifecycle/shutdown.sh"]
+    "Init": ["./lifecycle/__INIT__"],
+    "Shutdown": ["./lifecycle/__SHUTDOWN__"]
   }
-}"#,
+}"#
+        .replace("__INIT__", init_name)
+        .replace("__SHUTDOWN__", shutdown_name),
     )
     .expect("plugin manifest should write");
 
@@ -2294,7 +2323,7 @@ fn config_json_attributes_precedence_and_shadowed_keys_425() {
             file["source"] == "project"
                 && file["path"]
                     .as_str()
-                    .is_some_and(|path| path.ends_with(".claw/settings.json"))
+                    .is_some_and(|path| path.replace('\\', "/").ends_with(".claw/settings.json"))
         })
         .expect("project .claw/settings.json entry");
 
@@ -5358,7 +5387,7 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
     assert_eq!(create_json["status"], "ok");
     assert_eq!(create_json["format"], "toml");
     assert_eq!(
-        reported_agent_path,
+        fs::canonicalize(&reported_agent_path).expect("canonical reported agent path"),
         fs::canonicalize(&agent_path).expect("canonical agent path")
     );
     assert!(agent_path.is_file());
@@ -5375,7 +5404,8 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
         .iter()
         .any(|agent| {
             agent["name"] == "my-agent"
-                && *agent["path"].as_str().expect("listed agent path")
+                && fs::canonicalize(agent["path"].as_str().expect("listed agent path"))
+                    .expect("canonical reported agent path")
                     == fs::canonicalize(&agent_path).expect("canonical listed agent path")
         }));
 }

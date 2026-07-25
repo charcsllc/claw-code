@@ -47,6 +47,64 @@ pub fn spawn_agent(
     prompt: &str,
     allowed_write_paths: &[String],
 ) -> Result<AgentHandle, String> {
+    spawn_agent_with_images(
+        name,
+        description,
+        model,
+        subagent_type,
+        system_context,
+        prompt,
+        allowed_write_paths,
+        &[],
+    )
+}
+
+/// An image attached to an agent's initial message (base64 payload). Used by
+/// the visual-QA phase to hand the agent the REAL screenshots.
+#[derive(Debug, Clone)]
+pub struct AgentImage {
+    pub media_type: String,
+    pub base64_data: String,
+}
+
+/// Standard base64 (RFC 4648, with padding). Hand-rolled: the workspace has
+/// no base64 dependency and 20 lines beat a new supply-chain entry.
+#[must_use]
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent_with_images(
+    name: &str,
+    description: &str,
+    model: &str,
+    subagent_type: &str,
+    system_context: &str,
+    prompt: &str,
+    allowed_write_paths: &[String],
+    images: &[AgentImage],
+) -> Result<AgentHandle, String> {
     let full_prompt = format!("{system_context}\n\n---\n\n{prompt}");
     let mut input = json!({
         "name": name,
@@ -57,6 +115,17 @@ pub fn spawn_agent(
     });
     if !allowed_write_paths.is_empty() {
         input["allowed_write_paths"] = json!(allowed_write_paths);
+    }
+    if !images.is_empty() {
+        input["images"] = json!(images
+            .iter()
+            .map(|image| {
+                json!({
+                    "media_type": image.media_type,
+                    "base64_data": image.base64_data,
+                })
+            })
+            .collect::<Vec<_>>());
     }
     let raw = tools::execute_tool("Agent", &input)?;
     let manifest: Value =
@@ -207,6 +276,20 @@ pub fn extract_json(text: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        // RFC 4648 §10 test vectors — every padding case.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // Binary bytes (PNG magic) survive.
+        assert_eq!(base64_encode(&[0x89, 0x50, 0x4E, 0x47]), "iVBORw==");
+    }
 
     #[test]
     fn extract_json_prefers_fenced_block() {

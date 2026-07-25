@@ -12,6 +12,66 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
+
+/// Bounds and default for `CLAW_MAX_SESSION_MB`, the advisory size ceiling
+/// for the persisted session JSONL. Crossing it emits a single warning per
+/// process (suggesting `/compact` or `/clear`) and never blocks writes.
+const MAX_SESSION_MB_DEFAULT: u64 = 50;
+const MAX_SESSION_MB_MIN: u64 = 1;
+const MAX_SESSION_MB_MAX: u64 = 1000;
+
+/// Parses a raw `CLAW_MAX_SESSION_MB` value into the advisory session-size
+/// limit in megabytes, clamped to `1..=1000`. Missing, empty, or
+/// unparseable values fall back to the default (50 MB).
+#[must_use]
+pub fn parse_max_session_mb(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(MAX_SESSION_MB_DEFAULT, |value| {
+            value.clamp(MAX_SESSION_MB_MIN, MAX_SESSION_MB_MAX)
+        })
+}
+
+/// Thin env wrapper over [`parse_max_session_mb`]: reads
+/// `CLAW_MAX_SESSION_MB` from the process environment.
+#[must_use]
+pub fn max_session_mb() -> u64 {
+    parse_max_session_mb(std::env::var("CLAW_MAX_SESSION_MB").ok().as_deref())
+}
+
+/// Pure threshold check backing the session-size warning: true when
+/// `size_bytes` exceeds `max_mb` megabytes.
+#[must_use]
+pub fn session_size_exceeds_limit(size_bytes: u64, max_mb: u64) -> bool {
+    size_bytes > max_mb.saturating_mul(1024 * 1024)
+}
+
+/// Ensures the oversized-session warning is printed at most once per
+/// process, not once per persisted line.
+static SESSION_SIZE_WARNING: std::sync::Once = std::sync::Once::new();
+
+/// Emits the one-shot oversized-session warning when the persisted JSONL at
+/// `path` exceeds the `CLAW_MAX_SESSION_MB` limit. Advisory only: callers
+/// invoke this after the write, so persistence is never blocked.
+fn warn_if_session_oversized(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let max_mb = max_session_mb();
+    if session_size_exceeds_limit(metadata.len(), max_mb) {
+        SESSION_SIZE_WARNING.call_once(|| {
+            eprintln!(
+                "warning: session file {} is {} bytes, above the CLAW_MAX_SESSION_MB limit \
+                 of {} MB; consider /compact to summarize the conversation or /clear to start \
+                 fresh (writes are never blocked)",
+                path.display(),
+                metadata.len(),
+                max_mb
+            );
+        });
+    }
+}
 const MAX_ROTATED_FILES: usize = 3;
 const MAX_JSONL_FIELD_CHARS: usize = 16 * 1024;
 const JSONL_TRUNCATION_MARKER: &str = "… [truncated for session JSONL]";
@@ -49,6 +109,25 @@ pub enum ContentBlock {
         output: String,
         is_error: bool,
     },
+    /// A base64-encoded image attached to a user message (multimodal input).
+    /// Compaction replaces these with a [`image_placeholder_text`] text block
+    /// so giant base64 payloads never outlive a compaction cycle.
+    Image {
+        /// MIME type of the encoded image, e.g. `image/png`.
+        media_type: String,
+        /// Raw base64 payload (no `data:` URL prefix).
+        base64_data: String,
+    },
+}
+
+/// Human-readable stand-in for an image block once the base64 payload is
+/// dropped (compaction, adapters that only forward the latest images):
+/// `[imagen adjunta: image/png, 42 KB]`. `base64_len` is the length of the
+/// base64 payload in bytes; partial kilobytes round up.
+#[must_use]
+pub fn image_placeholder_text(media_type: &str, base64_len: usize) -> String {
+    let kilobytes = base64_len.div_ceil(1024);
+    format!("[imagen adjunta: {media_type}, {kilobytes} KB]")
 }
 
 /// One conversation message with optional token-usage metadata.
@@ -77,6 +156,18 @@ pub struct SessionFork {
 /// A single user prompt recorded with a timestamp for history tracking.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPromptEntry {
+    pub timestamp_ms: u64,
+    pub text: String,
+}
+
+/// A user-pinned note attached to a session (e.g. "remember: deploy uses
+/// the staging bucket"). Serde-serializable for external consumers; session
+/// persistence itself goes through the custom JSON/JSONL codec below, where
+/// a missing `pins` field loads as an empty list so pre-pins session files
+/// stay readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPin {
+    #[serde(default)]
     pub timestamp_ms: u64,
     pub text: String,
 }
@@ -124,6 +215,13 @@ pub struct Session {
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
     pub prompt_history: Vec<SessionPromptEntry>,
+    /// User-pinned notes. Loads as empty for session files written before
+    /// the field existed (the codec treats it as `#[serde(default)]`).
+    pub pins: Vec<SessionPin>,
+    /// Wall-clock time of the last clean shutdown (`mark_closed`), or `None`
+    /// while the session is open / for files written before the field
+    /// existed.
+    pub closed_at_ms: Option<u64>,
     /// The model used in this session, persisted so resumed sessions can
     /// report which model was originally used.
     /// Timestamp of last successful health check (ROADMAP #38)
@@ -143,6 +241,8 @@ impl PartialEq for Session {
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
             && self.prompt_history == other.prompt_history
+            && self.pins == other.pins
+            && self.closed_at_ms == other.closed_at_ms
             && self.last_health_check_ms == other.last_health_check_ms
     }
 }
@@ -195,6 +295,8 @@ impl Session {
             fork: None,
             workspace_root: None,
             prompt_history: Vec::new(),
+            pins: Vec::new(),
+            closed_at_ms: None,
             last_health_check_ms: None,
             model: None,
             persistence: None,
@@ -257,6 +359,7 @@ impl Session {
             }
         })?;
         cleanup_rotated_logs(path)?;
+        warn_if_session_oversized(path);
         Ok(())
     }
 
@@ -351,9 +454,59 @@ impl Session {
             }),
             workspace_root: self.workspace_root.clone(),
             prompt_history: self.prompt_history.clone(),
+            pins: self.pins.clone(),
+            // A fork is a fresh, open session even if its parent was closed.
+            closed_at_ms: None,
             last_health_check_ms: self.last_health_check_ms,
             model: self.model.clone(),
             persistence: None,
+        }
+    }
+
+    /// Appends a pinned note with the current wall-clock timestamp. When a
+    /// persistence path is configured the pin is incrementally appended to
+    /// the JSONL session file, like messages and prompt history.
+    pub fn add_pin(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
+        self.touch();
+        let pin = SessionPin {
+            timestamp_ms: current_time_millis(),
+            text: text.into(),
+        };
+        self.pins.push(pin);
+        let pin_ref = self
+            .pins
+            .last()
+            .ok_or_else(|| SessionError::Format("pin was just pushed but missing".to_string()))?;
+        self.append_persisted_pin(pin_ref)
+    }
+
+    /// Removes and returns the pin at `index` (`None` when out of range).
+    /// When a persistence path is configured the snapshot is rewritten so
+    /// the removed pin disappears from disk; a failed rewrite is tolerated
+    /// (the in-memory state is authoritative and the next full save
+    /// converges the file).
+    pub fn remove_pin(&mut self, index: usize) -> Option<SessionPin> {
+        if index >= self.pins.len() {
+            return None;
+        }
+        self.touch();
+        let removed = self.pins.remove(index);
+        if let Some(path) = self.persistence_path().map(Path::to_path_buf) {
+            let _ = self.save_to_path(path);
+        }
+        Some(removed)
+    }
+
+    /// Records a clean shutdown at `now_ms` and, when a persistence path is
+    /// configured, rewrites the snapshot so `closed_at_ms` lands in the
+    /// persisted `session_meta` record. Intended to be called by the REPL
+    /// on clean exit.
+    pub fn mark_closed(&mut self, now_ms: u64) -> Result<(), SessionError> {
+        self.closed_at_ms = Some(now_ms);
+        self.touch();
+        match self.persistence_path().map(Path::to_path_buf) {
+            Some(path) => self.save_to_path(path),
+            None => Ok(()),
         }
     }
 
@@ -405,6 +558,18 @@ impl Session {
                         .map(SessionPromptEntry::to_jsonl_record)
                         .collect(),
                 ),
+            );
+        }
+        if !self.pins.is_empty() {
+            object.insert(
+                "pins".to_string(),
+                JsonValue::Array(self.pins.iter().map(SessionPin::to_json).collect()),
+            );
+        }
+        if let Some(closed_at_ms) = self.closed_at_ms {
+            object.insert(
+                "closed_at_ms".to_string(),
+                JsonValue::Number(i64_from_u64(closed_at_ms, "closed_at_ms")?),
             );
         }
         Ok(JsonValue::Object(object))
@@ -462,6 +627,22 @@ impl Session {
                     .collect()
             })
             .unwrap_or_default();
+        // Backwards compatible: sessions persisted before pins/closed_at_ms
+        // existed simply lack the keys and load with the defaults.
+        let pins = object
+            .get("pins")
+            .and_then(JsonValue::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(SessionPin::from_json_opt)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let closed_at_ms = object
+            .get("closed_at_ms")
+            .map(|value| required_u64_from_value(value, "closed_at_ms"))
+            .transpose()?;
         let model = object
             .get("model")
             .and_then(JsonValue::as_str)
@@ -476,6 +657,8 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            pins,
+            closed_at_ms,
             last_health_check_ms: None,
             model,
             persistence: None,
@@ -493,6 +676,8 @@ impl Session {
         let mut workspace_root = None;
         let mut model = None;
         let mut prompt_history = Vec::new();
+        let mut pins = Vec::new();
+        let mut closed_at_ms = None;
 
         for (line_number, raw_line) in contents.lines().enumerate() {
             let line = raw_line.trim();
@@ -538,6 +723,11 @@ impl Session {
                         .get("model")
                         .and_then(JsonValue::as_str)
                         .map(String::from);
+                    // Absent in files written before the field existed.
+                    closed_at_ms = object
+                        .get("closed_at_ms")
+                        .map(|value| required_u64_from_value(value, "closed_at_ms"))
+                        .transpose()?;
                 }
                 "message" => {
                     let message_value = object.get("message").ok_or_else(|| {
@@ -558,6 +748,12 @@ impl Session {
                         SessionPromptEntry::from_json_opt(&JsonValue::Object(object.clone()))
                     {
                         prompt_history.push(entry);
+                    }
+                }
+                "pin" => {
+                    if let Some(pin) = SessionPin::from_json_opt(&JsonValue::Object(object.clone()))
+                    {
+                        pins.push(pin);
                     }
                 }
                 other => {
@@ -584,6 +780,8 @@ impl Session {
             fork,
             workspace_root,
             prompt_history,
+            pins,
+            closed_at_ms,
             last_health_check_ms: None,
             model,
             persistence: None,
@@ -623,6 +821,7 @@ impl Session {
                 .iter()
                 .map(|entry| entry.to_jsonl_record().render()),
         );
+        lines.extend(self.pins.iter().map(|pin| pin.to_jsonl_record().render()));
         lines.extend(
             self.messages
                 .iter()
@@ -646,6 +845,7 @@ impl Session {
 
         let mut file = OpenOptions::new().append(true).open(path)?;
         writeln!(file, "{}", message_record(message).render())?;
+        warn_if_session_oversized(path);
         Ok(())
     }
 
@@ -665,6 +865,24 @@ impl Session {
 
         let mut file = OpenOptions::new().append(true).open(path)?;
         writeln!(file, "{}", entry.to_jsonl_record().render())?;
+        warn_if_session_oversized(path);
+        Ok(())
+    }
+
+    fn append_persisted_pin(&self, pin: &SessionPin) -> Result<(), SessionError> {
+        let Some(path) = self.persistence_path() else {
+            return Ok(());
+        };
+
+        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+        if needs_bootstrap {
+            self.save_to_path(path)?;
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new().append(true).open(path)?;
+        writeln!(file, "{}", pin.to_jsonl_record().render())?;
+        warn_if_session_oversized(path);
         Ok(())
     }
 
@@ -701,6 +919,12 @@ impl Session {
         }
         if let Some(model) = &self.model {
             object.insert("model".to_string(), JsonValue::String(model.clone()));
+        }
+        if let Some(closed_at_ms) = self.closed_at_ms {
+            object.insert(
+                "closed_at_ms".to_string(),
+                JsonValue::Number(i64_from_u64(closed_at_ms, "closed_at_ms")?),
+            );
         }
         Ok(JsonValue::Object(object))
     }
@@ -878,6 +1102,20 @@ impl ContentBlock {
                 object.insert("output".to_string(), JsonValue::String(output.clone()));
                 object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
             }
+            Self::Image {
+                media_type,
+                base64_data,
+            } => {
+                object.insert("type".to_string(), JsonValue::String("image".to_string()));
+                object.insert(
+                    "media_type".to_string(),
+                    JsonValue::String(media_type.clone()),
+                );
+                object.insert(
+                    "base64_data".to_string(),
+                    JsonValue::String(base64_data.clone()),
+                );
+            }
         }
         JsonValue::Object(object)
     }
@@ -914,6 +1152,10 @@ impl ContentBlock {
                     .get("is_error")
                     .and_then(JsonValue::as_bool)
                     .ok_or_else(|| SessionError::Format("missing is_error".to_string()))?,
+            }),
+            "image" => Ok(Self::Image {
+                media_type: required_string(object, "media_type")?,
+                base64_data: required_string(object, "base64_data")?,
             }),
             other => Err(SessionError::Format(format!(
                 "unsupported block type: {other}"
@@ -1040,6 +1282,44 @@ impl SessionPromptEntry {
     }
 }
 
+impl SessionPin {
+    /// Field-only JSON object used inside the single-object session format.
+    #[must_use]
+    pub fn to_json(&self) -> JsonValue {
+        let mut object = BTreeMap::new();
+        object.insert(
+            "timestamp_ms".to_string(),
+            JsonValue::Number(i64::try_from(self.timestamp_ms).unwrap_or(i64::MAX)),
+        );
+        object.insert(
+            "text".to_string(),
+            JsonValue::String(sanitize_jsonl_field(&self.text)),
+        );
+        JsonValue::Object(object)
+    }
+
+    /// JSONL record (`{"type":"pin",...}`) used in the session JSONL format.
+    #[must_use]
+    pub fn to_jsonl_record(&self) -> JsonValue {
+        let JsonValue::Object(mut object) = self.to_json() else {
+            unreachable!("to_json always returns an object");
+        };
+        object.insert("type".to_string(), JsonValue::String("pin".to_string()));
+        JsonValue::Object(object)
+    }
+
+    fn from_json_opt(value: &JsonValue) -> Option<Self> {
+        let object = value.as_object()?;
+        let timestamp_ms = object
+            .get("timestamp_ms")
+            .and_then(JsonValue::as_i64)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default();
+        let text = object.get("text").and_then(JsonValue::as_str)?.to_string();
+        Some(Self { timestamp_ms, text })
+    }
+}
+
 fn message_record(message: &ConversationMessage) -> JsonValue {
     let mut object = BTreeMap::new();
     object.insert("type".to_string(), JsonValue::String("message".to_string()));
@@ -1138,6 +1418,26 @@ fn persisted_block_json(block: &ContentBlock) -> JsonValue {
                 JsonValue::String(sanitize_jsonl_field(output)),
             );
             object.insert("is_error".to_string(), JsonValue::Bool(*is_error));
+        }
+        ContentBlock::Image {
+            media_type,
+            base64_data,
+        } => {
+            object.insert("type".to_string(), JsonValue::String("image".to_string()));
+            object.insert(
+                "media_type".to_string(),
+                JsonValue::String(media_type.clone()),
+            );
+            // Deliberately NOT sanitize_jsonl_field: the 16 KiB field
+            // truncation would corrupt any real image, and the secret
+            // scanner can false-positive on base64 runs (e.g. an embedded
+            // `npm_…`/`AKIA…` substring), also corrupting the payload.
+            // Base64 image data carries no shell/env text, and compaction
+            // guarantees the payload does not persist forever.
+            object.insert(
+                "base64_data".to_string(),
+                JsonValue::String(base64_data.clone()),
+            );
         }
     }
     JsonValue::Object(object)
@@ -1523,8 +1823,8 @@ fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
 mod tests {
     use super::{
         cleanup_rotated_logs, current_time_millis, parse_created_at_ms_from_session_id,
-        rotate_session_file_if_needed, ContentBlock, ConversationMessage, MessageRole, Session,
-        SessionFork,
+        parse_max_session_mb, rotate_session_file_if_needed, session_size_exceeds_limit,
+        ContentBlock, ConversationMessage, MessageRole, Session, SessionFork, SessionPin,
     };
     use crate::json::JsonValue;
     use crate::usage::TokenUsage;
@@ -1540,6 +1840,89 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    /// Image blocks must round-trip through the JSONL codec byte-for-byte,
+    /// even when the base64 payload exceeds the 16 KiB text-field truncation
+    /// threshold (image data is exempt from `sanitize_jsonl_field`).
+    #[test]
+    fn image_blocks_round_trip_through_session_jsonl() {
+        let base64_payload = "QUJDRA==".repeat(4 * 1024); // 32 KiB > MAX_JSONL_FIELD_CHARS
+        let mut session = Session::new();
+        session
+            .push_message(ConversationMessage {
+                role: MessageRole::User,
+                blocks: vec![
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: base64_payload.clone(),
+                    },
+                    ContentBlock::Text {
+                        text: "what does this show?".to_string(),
+                    },
+                ],
+                usage: None,
+            })
+            .expect("user message with image should append");
+
+        let path = temp_session_path("jsonl-image");
+        session.save_to_path(&path).expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored, session);
+        let ContentBlock::Image {
+            media_type,
+            base64_data,
+        } = &restored.messages[0].blocks[0]
+        else {
+            panic!("first restored block should be an image");
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(
+            base64_data, &base64_payload,
+            "payload must not be truncated"
+        );
+    }
+
+    /// Backwards compatibility: session files written before the image
+    /// variant existed (only text/thinking/tool blocks) keep loading.
+    #[test]
+    fn pre_image_session_jsonl_still_loads() {
+        let path = write_temp_session_file(
+            "pre-image-compat",
+            concat!(
+                r#"{"type":"session_meta","version":1,"session_id":"sess-old","updated_at_ms":42}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"hi"}]}}"#,
+            ),
+        );
+        let restored = Session::load_from_path(&path).expect("old session should load");
+        fs::remove_file(&path).expect("temp file should be removable");
+
+        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(
+            restored.messages[0].blocks[0],
+            ContentBlock::Text {
+                text: "hi".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn image_placeholder_text_reports_media_type_and_rounded_kilobytes() {
+        assert_eq!(
+            super::image_placeholder_text("image/png", 42 * 1024),
+            "[imagen adjunta: image/png, 42 KB]"
+        );
+        assert_eq!(
+            super::image_placeholder_text("image/jpeg", 1025),
+            "[imagen adjunta: image/jpeg, 2 KB]"
+        );
+        assert_eq!(
+            super::image_placeholder_text("image/webp", 0),
+            "[imagen adjunta: image/webp, 0 KB]"
+        );
     }
 
     #[test]
@@ -1586,6 +1969,141 @@ mod tests {
             17
         );
         assert_eq!(restored.session_id, session.session_id);
+    }
+
+    #[test]
+    fn parse_max_session_mb_defaults_when_missing_or_invalid() {
+        assert_eq!(parse_max_session_mb(None), 50);
+        assert_eq!(parse_max_session_mb(Some("")), 50);
+        assert_eq!(parse_max_session_mb(Some("   ")), 50);
+        assert_eq!(parse_max_session_mb(Some("plenty")), 50);
+        assert_eq!(parse_max_session_mb(Some("-3")), 50);
+        assert_eq!(parse_max_session_mb(Some("12.5")), 50);
+    }
+
+    #[test]
+    fn parse_max_session_mb_accepts_and_clamps_values() {
+        assert_eq!(parse_max_session_mb(Some("100")), 100);
+        assert_eq!(parse_max_session_mb(Some(" 25 ")), 25);
+        assert_eq!(parse_max_session_mb(Some("0")), 1);
+        assert_eq!(parse_max_session_mb(Some("99999")), 1000);
+        assert_eq!(parse_max_session_mb(Some("1")), 1);
+        assert_eq!(parse_max_session_mb(Some("1000")), 1000);
+    }
+
+    #[test]
+    fn session_size_limit_detection_uses_exclusive_megabyte_threshold() {
+        let one_mb = 1024 * 1024;
+        assert!(!session_size_exceeds_limit(0, 1));
+        assert!(!session_size_exceeds_limit(one_mb, 1));
+        assert!(session_size_exceeds_limit(one_mb + 1, 1));
+        assert!(!session_size_exceeds_limit(50 * one_mb, 50));
+        assert!(session_size_exceeds_limit(50 * one_mb + 1, 50));
+    }
+
+    #[test]
+    fn session_pin_serde_roundtrip() {
+        let pin = SessionPin {
+            timestamp_ms: 1_234,
+            text: "remember the staging bucket".to_string(),
+        };
+        let json = serde_json::to_string(&pin).expect("pin serializes");
+        let restored: SessionPin = serde_json::from_str(&json).expect("pin deserializes");
+        assert_eq!(restored, pin);
+        // timestamp_ms is #[serde(default)]: minimal payloads still load.
+        let minimal: SessionPin =
+            serde_json::from_str(r#"{"text":"just text"}"#).expect("defaulted pin loads");
+        assert_eq!(minimal.timestamp_ms, 0);
+        assert_eq!(minimal.text, "just text");
+    }
+
+    #[test]
+    fn pins_and_closed_at_roundtrip_through_jsonl_persistence() {
+        let mut session = Session::new();
+        session.push_user_text("hello").expect("message appends");
+        session.add_pin("first pin").expect("pin appends");
+        session.add_pin("second pin").expect("pin appends");
+        session.mark_closed(9_999).expect("mark_closed succeeds");
+
+        let path = temp_session_path("pins-closed-roundtrip");
+        session.save_to_path(&path).expect("session saves");
+        let restored = Session::load_from_path(&path).expect("session loads");
+        fs::remove_file(&path).expect("temp file removable");
+
+        assert_eq!(restored.pins.len(), 2);
+        assert_eq!(restored.pins[0].text, "first pin");
+        assert_eq!(restored.pins[1].text, "second pin");
+        assert_eq!(restored.closed_at_ms, Some(9_999));
+        assert_eq!(restored, session);
+    }
+
+    #[test]
+    fn pins_and_closed_at_roundtrip_through_single_object_json() {
+        let mut session = Session::new();
+        session.add_pin("object-format pin").expect("pin appends");
+        session.mark_closed(4_242).expect("mark_closed succeeds");
+
+        let json = session.to_json().expect("session renders");
+        let restored = Session::from_json(&json).expect("session parses");
+
+        assert_eq!(restored.pins, session.pins);
+        assert_eq!(restored.closed_at_ms, Some(4_242));
+    }
+
+    #[test]
+    fn sessions_without_pins_or_closed_at_load_backwards_compatibly() {
+        // Old single-object format: no pins, no closed_at_ms keys.
+        let old_json = JsonValue::parse(
+            r#"{"version":1,"session_id":"session-1-0","created_at_ms":1,"updated_at_ms":2,"messages":[]}"#,
+        )
+        .expect("old JSON parses");
+        let session = Session::from_json(&old_json).expect("old session loads");
+        assert!(session.pins.is_empty());
+        assert_eq!(session.closed_at_ms, None);
+
+        // Old JSONL format: meta record without closed_at_ms, no pin records.
+        let old_jsonl = concat!(
+            r#"{"type":"session_meta","version":1,"session_id":"session-1-0","created_at_ms":1,"updated_at_ms":2}"#,
+            "\n",
+            r#"{"type":"message","message":{"role":"user","blocks":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+        );
+        let path = write_temp_session_file("old-format-compat", old_jsonl);
+        let session = Session::load_from_path(&path).expect("old JSONL loads");
+        fs::remove_file(&path).expect("temp file removable");
+        assert!(session.pins.is_empty());
+        assert_eq!(session.closed_at_ms, None);
+        assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn add_and_remove_pin_manage_the_list_and_persist() {
+        let path = temp_session_path("pin-add-remove");
+        let mut session = Session::new().with_persistence_path(&path);
+        session.add_pin("keep me").expect("pin appends");
+        session.add_pin("drop me").expect("pin appends");
+
+        let removed = session.remove_pin(1).expect("index 1 exists");
+        assert_eq!(removed.text, "drop me");
+        assert_eq!(session.remove_pin(5), None, "out of range returns None");
+        assert_eq!(session.pins.len(), 1);
+
+        // The rewrite triggered by remove_pin converges the on-disk state.
+        let restored = Session::load_from_path(&path).expect("session loads");
+        fs::remove_file(&path).expect("temp file removable");
+        assert_eq!(restored.pins.len(), 1);
+        assert_eq!(restored.pins[0].text, "keep me");
+    }
+
+    #[test]
+    fn forked_sessions_inherit_pins_but_reset_closed_at() {
+        let mut session = Session::new();
+        session.add_pin("inherited").expect("pin appends");
+        session.mark_closed(7_777).expect("mark_closed succeeds");
+
+        let fork = session.fork(None);
+        assert_eq!(fork.pins, session.pins);
+        assert_eq!(fork.closed_at_ms, None);
     }
 
     #[test]
@@ -2176,5 +2694,113 @@ mod workspace_sessions_dir_tests {
             session.heartbeat_at(1_000, 500, false).liveness,
             SessionLiveness::TransportDead
         );
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::{parse_max_session_mb, redact_secrets};
+    use proptest::prelude::*;
+
+    /// The known credential prefixes, rebuilt at runtime with `format!` so
+    /// no secret-shaped literal ever lands in the source tree (GitHub push
+    /// protection rejects them).
+    fn known_secret_prefixes() -> Vec<String> {
+        vec![
+            format!("sk-{}-", "ant"),
+            format!("sk{}", "-"),
+            format!("gh{}_", "p"),
+            format!("github_{}_", "pat"),
+            format!("gl{}-", "pat"),
+            format!("xox{}-", "b"),
+            format!("xox{}-", "p"),
+            format!("np{}_", "m"),
+            format!("AK{}", "IA"),
+        ]
+    }
+
+    /// True when `input` could plausibly trigger redaction: it embeds a
+    /// known prefix or the (case-sensitive) `Bearer` keyword.
+    fn has_secret_markers(input: &str) -> bool {
+        known_secret_prefixes()
+            .iter()
+            .any(|prefix| input.contains(prefix.as_str()))
+            || input.contains("Bearer")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Redaction is idempotent: a second pass never rewrites the first
+        /// pass's output (masked stubs stay below the length floors).
+        #[test]
+        fn redact_secrets_is_idempotent(input in "\\PC{0,128}") {
+            let once = redact_secrets(&input);
+            let twice = redact_secrets(&once);
+            prop_assert_eq!(twice, once);
+        }
+
+        /// Inputs with no secret markers pass through untouched — in
+        /// particular, redaction never lengthens them.
+        #[test]
+        fn redact_secrets_leaves_secret_free_input_unchanged(input in "\\PC{0,128}") {
+            prop_assume!(!has_secret_markers(&input));
+            let redacted = redact_secrets(&input);
+            prop_assert!(redacted.len() <= input.len());
+            prop_assert_eq!(redacted, input);
+        }
+
+        /// A token carrying a known prefix (and meeting the length floor)
+        /// never survives whole in the output, and redacting the redacted
+        /// text is still a fixed point.
+        #[test]
+        fn redact_secrets_never_leaks_full_known_prefix_tokens(
+            prefix_index in 0usize..9,
+            suffix in "[A-Za-z0-9_\\-]{26,48}",
+            lead in "[a-z ]{0,12}",
+            trail in "[a-z ]{0,12}",
+        ) {
+            let token = format!("{}{}", known_secret_prefixes()[prefix_index], suffix);
+            let input = format!("{lead} {token} {trail}");
+
+            let redacted = redact_secrets(&input);
+
+            prop_assert!(
+                !redacted.contains(&token),
+                "full token survived redaction: {redacted}"
+            );
+            let again = redact_secrets(&redacted);
+            prop_assert_eq!(again, redacted);
+        }
+
+        /// Long `Bearer` tokens are always masked as well.
+        #[test]
+        fn redact_secrets_never_leaks_long_bearer_tokens(
+            suffix in "[A-Za-z0-9_\\-]{30,60}",
+        ) {
+            let input = format!("Authorization: Bearer {suffix}");
+            let redacted = redact_secrets(&input);
+            prop_assert!(
+                !redacted.contains(&suffix),
+                "bearer token survived redaction: {redacted}"
+            );
+        }
+
+        /// `CLAW_MAX_SESSION_MB` parsing never leaves its 1..=1000 clamp.
+        #[test]
+        fn parse_max_session_mb_stays_within_clamp(
+            raw in proptest::option::of("\\PC{0,24}"),
+        ) {
+            let value = parse_max_session_mb(raw.as_deref());
+            prop_assert!((1..=1000).contains(&value));
+        }
+
+        /// Numeric strings — the parseable subset — are clamped, not passed
+        /// through.
+        #[test]
+        fn parse_max_session_mb_clamps_all_numeric_inputs(value in any::<u64>()) {
+            let parsed = parse_max_session_mb(Some(&value.to_string()));
+            prop_assert!((1..=1000).contains(&parsed));
+        }
     }
 }

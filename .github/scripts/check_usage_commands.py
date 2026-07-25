@@ -25,22 +25,22 @@ USAGE = ROOT / 'USAGE.md'
 # here: document it in USAGE.md instead. The check fails only on regressions
 # beyond this set.
 ALLOW_UNDOCUMENTED = [
-    "add-dir", "advisor", "agent", "agents", "alias", "allowed-tools",
-    "api-key", "approve", "autofix", "benchmark", "blame", "bookmarks",
-    "brief", "budget", "build", "cache", "changelog", "chat", "clear",
+    "add-dir", "advisor", "agent", "alias", "allowed-tools",
+    "api-key", "approve", "autofix", "benchmark", "blame",
+    "brief", "budget", "build", "changelog", "chat",
     "commit", "cron", "debug-tool-call", "definition", "deny", "desktop",
     "diagnostics", "docs", "env", "exit", "explain", "feedback", "fix",
-    "focus", "format", "git", "hover", "ide", "image", "init", "insights",
+    "format", "git", "hover", "ide", "image", "insights",
     "issue", "language", "lint", "listen", "log", "macro", "map",
-    "max-tokens", "memory", "metrics", "migrate", "multi", "notifications",
-    "output-style", "parallel", "paste", "perf", "pin", "plugin", "pr",
+    "max-tokens", "metrics", "migrate", "multi", "notifications",
+    "output-style", "parallel", "paste", "perf", "plugin", "pr",
     "profile", "project", "providers", "rate-limit", "reasoning", "refactor",
-    "references", "rename", "reset", "resume", "run", "sandbox",
-    "screenshot", "search", "share", "speak", "stash", "stats", "stickers",
-    "stop", "subagent", "symbols", "system-prompt", "tag", "team",
+    "references", "rename", "reset", "run",
+    "screenshot", "search", "share", "speak", "stash", "stickers",
+    "subagent", "symbols", "system-prompt", "tag", "team",
     "telemetry", "temperature", "templates", "terminal-setup", "test",
-    "thinkback", "tokens", "tool-details", "undo", "unfocus", "unpin",
-    "version", "vim", "voice", "workspace",
+    "thinkback", "tool-details",
+    "vim", "voice", "workspace",
 ]
 
 

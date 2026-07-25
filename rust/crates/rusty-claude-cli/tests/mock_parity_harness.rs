@@ -12,6 +12,19 @@ use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios() {
@@ -179,7 +192,7 @@ fn clean_env_cli_reaches_mock_anthropic_service_across_scripted_parity_scenarios
             &run.response,
         ));
 
-        fs::remove_dir_all(&workspace.root).expect("workspace cleanup should succeed");
+        cleanup_dir(&workspace.root);
     }
 
     let captured = runtime.block_on(server.captured_requests());
@@ -307,6 +320,18 @@ struct ScenarioReport {
     final_message: String,
 }
 
+/// `env_clear()` on Windows also drops SystemRoot, without which the child
+/// process cannot initialize Winsock and every loopback request fails.
+fn restore_windows_system_env(command: &mut Command) {
+    if cfg!(windows) {
+        for key in ["SystemRoot", "SystemDrive", "windir", "PATH", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
 fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) -> ScenarioRun {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command
@@ -329,6 +354,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     if let Some(allowed_tools) = case.allowed_tools {
         command.args(["--allowedTools", allowed_tools]);
     }
+    restore_windows_system_env(&mut command);
     if let Some((key, value)) = case.extra_env {
         command.env(key, value);
     }
@@ -420,12 +446,21 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::create_dir_all(&tool_dir).expect("plugin tools dir");
     fs::create_dir_all(&manifest_dir).expect("plugin manifest dir");
 
-    let script_path = tool_dir.join("echo-json.sh");
-    fs::write(
-        &script_path,
-        "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
-    )
-    .expect("plugin script should write");
+    // cmd cannot read piped stdin reliably, so the Windows script takes the
+    // input from CLAWD_TOOL_INPUT (the tool executor provides both).
+    let (script_name, script_body) = if cfg!(windows) {
+        (
+            "echo-json.cmd",
+            "@echo off\r\necho {\"plugin\":\"%CLAWD_PLUGIN_ID%\",\"tool\":\"%CLAWD_TOOL_NAME%\",\"input\":%CLAWD_TOOL_INPUT%}\r\n",
+        )
+    } else {
+        (
+            "echo-json.sh",
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        )
+    };
+    let script_path = tool_dir.join(script_name);
+    fs::write(&script_path, script_body).expect("plugin script should write");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -454,11 +489,12 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
         "required": ["message"],
         "additionalProperties": false
       },
-      "command": "./tools/echo-json.sh",
+      "command": "./tools/__PLUGIN_SCRIPT__",
       "requiredPermission": "workspace-write"
     }
   ]
-}"#,
+}"#
+        .replace("__PLUGIN_SCRIPT__", script_name),
     )
     .expect("plugin manifest should write");
 
@@ -504,7 +540,20 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
+    // read_file reports the canonicalized path without the Windows \\?\
+    // verbatim prefix; the tool output embeds it inside serialized JSON, so
+    // on Windows the backslashes appear escaped — accept either form.
+    let fixture = workspace.root.join("fixture.txt");
+    let canonical = fixture.canonicalize().unwrap_or(fixture);
+    let mut expected = canonical.display().to_string();
+    if let Some(rest) = expected.strip_prefix(r"\\?\") {
+        expected = rest.to_string();
+    }
+    let expected_json_escaped = expected.replace('\\', "\\\\");
+    assert!(
+        output.contains(&expected) || output.contains(&expected_json_escaped),
+        "tool output should reference the fixture path: {output}"
+    );
     assert!(output.contains("alpha parity line"));
 }
 
@@ -536,10 +585,13 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("generated/output.txt"));
+    // The mock echoes the path the tool reported, which uses backslashes on
+    // Windows.
+    let message = run.response["message"].as_str().expect("message text");
+    assert!(
+        message.contains("generated/output.txt") || message.contains(r"generated\output.txt"),
+        "message should reference the generated file: {message}"
+    );
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");

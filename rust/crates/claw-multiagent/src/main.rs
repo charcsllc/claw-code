@@ -78,9 +78,10 @@ struct CommonArgs {
 
     /// Cost ceiling in USD. DISABLED by default (subscription accounts
     /// don't bill per token); pass a value to enable enforcement — the
-    /// build aborts cleanly between waves when spend exceeds it.
+    /// build warns once at 80% and cuts at the next checkpoint (or between
+    /// waves) when spend exceeds it, resumable with --resume.
     /// Requires telemetry (--dashboard or CLAW_DASHBOARD_EVENTS).
-    #[arg(long)]
+    #[arg(long, alias = "max-cost")]
     max_cost_usd: Option<f64>,
 
     /// Build-gate command run after each wave (auto-detected from
@@ -237,11 +238,32 @@ fn main() {
     }
 }
 
+/// `canonicalize()` on Windows returns `\\?\C:\…` verbatim paths, and
+/// verbatim mode does not treat `/` as a separator — joining the
+/// forward-slash relative paths used across the pipeline (task specs,
+/// contracts) onto such a root breaks every file write. Return a plain
+/// drive path instead.
+fn simplify_canonical(path: std::path::PathBuf) -> std::path::PathBuf {
+    if cfg!(windows) {
+        let simplified = {
+            let text = path.to_string_lossy();
+            text.strip_prefix(r"\\?\")
+                .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+                .map(str::to_owned)
+        };
+        if let Some(rest) = simplified {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn execute(kind: ProjectKind, mode: BuildMode, common: CommonArgs) -> Result<(), String> {
     std::fs::create_dir_all(&common.output).map_err(|error| error.to_string())?;
     let project_dir = common
         .output
         .canonicalize()
+        .map(simplify_canonical)
         .map_err(|error| error.to_string())?;
 
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;

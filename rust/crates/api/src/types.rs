@@ -51,6 +51,32 @@ impl MessageRequest {
     }
 }
 
+/// A base64-encoded image attached to a user message.
+///
+/// This is the transport-agnostic carrier used by callers (runtime adapter,
+/// sub-agent tool) to hand images to the API layer. Each provider protocol
+/// renders it into its own wire shape:
+/// - Anthropic: `{"type":"image","source":{"type":"base64","media_type":…,"data":…}}`
+/// - OpenAI-compat: `{"type":"image_url","image_url":{"url":"data:<media_type>;base64,<data>"}}`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// MIME type of the encoded image, e.g. `image/png` or `image/jpeg`.
+    pub media_type: String,
+    /// Raw base64 payload (no `data:` URL prefix).
+    pub base64_data: String,
+}
+
+/// Wire-format source of an [`InputContentBlock::Image`], matching the
+/// Anthropic Messages API shape: `{"type":"base64","media_type":…,"data":…}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSource {
+    /// Source encoding discriminator; always `"base64"` for attachments.
+    #[serde(rename = "type")]
+    pub source_type: String,
+    pub media_type: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputMessage {
     pub role: String,
@@ -63,6 +89,20 @@ impl InputMessage {
         Self {
             role: "user".to_string(),
             content: vec![InputContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    /// Builds a user message carrying `images` followed by a trailing text
+    /// block. Image blocks are placed before the text block, mirroring the
+    /// ordering the Anthropic vision docs recommend for image+question turns.
+    #[must_use]
+    pub fn user_text_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        let mut content: Vec<InputContentBlock> =
+            images.into_iter().map(InputContentBlock::from).collect();
+        content.push(InputContentBlock::Text { text: text.into() });
+        Self {
+            role: "user".to_string(),
+            content,
         }
     }
 
@@ -107,6 +147,25 @@ pub enum InputContentBlock {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
+    /// A base64 image content block. The serde representation matches the
+    /// Anthropic Messages wire format
+    /// (`{"type":"image","source":{"type":"base64",…}}`); the OpenAI-compat
+    /// translator rewrites it into an `image_url` data-URL part.
+    Image {
+        source: ImageSource,
+    },
+}
+
+impl From<ImageAttachment> for InputContentBlock {
+    fn from(image: ImageAttachment) -> Self {
+        Self::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type: image.media_type,
+                data: image.base64_data,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,7 +344,7 @@ mod tests {
     use runtime::format_usd;
     use serde_json::json;
 
-    use super::{InputContentBlock, MessageResponse, Usage};
+    use super::{ImageAttachment, InputContentBlock, InputMessage, MessageResponse, Usage};
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {
@@ -322,6 +381,75 @@ mod tests {
         let cost = response.usage.estimated_cost_usd(&response.model);
         assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
+    }
+
+    #[test]
+    fn user_text_with_images_serializes_anthropic_image_blocks_before_text() {
+        // given
+        let message = InputMessage::user_text_with_images(
+            "what is in this screenshot?",
+            vec![
+                ImageAttachment {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                ImageAttachment {
+                    media_type: "image/jpeg".to_string(),
+                    base64_data: "d29ybGQ=".to_string(),
+                },
+            ],
+        );
+
+        // when: the Anthropic protocol serializes InputMessage via serde
+        let serialized = serde_json::to_value(&message).unwrap();
+
+        // then
+        assert_eq!(
+            serialized,
+            json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "aGVsbG8="
+                        }
+                    },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": "d29ybGQ="
+                        }
+                    },
+                    { "type": "text", "text": "what is in this screenshot?" }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn image_input_content_block_round_trips_through_serde() {
+        let block = InputContentBlock::from(ImageAttachment {
+            media_type: "image/webp".to_string(),
+            base64_data: "Zm9v".to_string(),
+        });
+
+        let value = serde_json::to_value(&block).unwrap();
+        let restored: InputContentBlock = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored, block);
+    }
+
+    #[test]
+    fn user_text_with_images_without_images_matches_user_text() {
+        assert_eq!(
+            InputMessage::user_text_with_images("hola", Vec::new()),
+            InputMessage::user_text("hola")
+        );
     }
 
     #[test]

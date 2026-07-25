@@ -8,6 +8,19 @@ use runtime::Session;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[test]
 fn status_command_applies_model_and_permission_mode_flags() {
     // given
@@ -34,7 +47,7 @@ fn status_command_applies_model_and_permission_mode_flags() {
     assert!(stdout.contains("Model            anthropic/claude-sonnet-4-6"));
     assert!(stdout.contains("Permission mode  read-only"));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -63,7 +76,7 @@ fn resume_flag_loads_a_saved_session_and_dispatches_status() {
     assert!(stdout.contains("Session          "));
     assert!(stdout.contains(session_path.to_str().expect("utf8 path")));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -101,7 +114,7 @@ fn slash_command_names_match_known_commands_and_suggest_nearby_unknown_ones() {
     assert!(stderr.contains("Did you mean"));
     assert!(stderr.contains("/status"));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -126,7 +139,7 @@ fn omc_namespaced_slash_commands_surface_a_targeted_compatibility_hint() {
     assert!(stderr.contains("Claude Code/OMC plugin command"));
     assert!(stderr.contains("does not yet load plugin slash commands"));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -182,7 +195,7 @@ fn config_command_loads_defaults_from_standard_config_locations() {
             .expect("utf8 path")
     ));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -212,7 +225,7 @@ fn doctor_command_runs_as_a_local_shell_entrypoint() {
     assert!(stdout.contains("Sandbox"));
     assert!(!stdout.contains("Thinking"));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -254,7 +267,7 @@ fn local_smoke_commands_do_not_require_live_credentials() {
         );
     }
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 #[test]
@@ -297,7 +310,7 @@ fn local_subcommand_help_does_not_fall_through_to_runtime_or_provider_calls() {
     assert!(!doctor_stderr.contains("auth_unavailable"));
     assert!(!status_stderr.contains("auth_unavailable"));
 
-    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    cleanup_dir(&temp_dir);
 }
 
 fn offline_command_in(cwd: &Path, config_home: &Path) -> Command {

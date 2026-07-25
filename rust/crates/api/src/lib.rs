@@ -6,6 +6,7 @@
 mod client;
 mod error;
 mod http_client;
+mod models;
 mod prompt_cache;
 mod providers;
 mod sse;
@@ -20,6 +21,7 @@ pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with,
     build_http_client_with_opts, net_timeout_ms, parse_net_timeout_ms, ProxyConfig, TimeoutConfig,
 };
+pub use models::{list_models_via_http, parse_models_response};
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
     PromptCacheStats,
@@ -34,15 +36,16 @@ pub use providers::openai_compat::{
 pub use providers::{
     detect_provider_kind, jwt_expiry_unix, max_tokens_for_model,
     max_tokens_for_model_with_override, model_family_identity_for, model_family_identity_for_kind,
-    model_token_limit, provider_diagnostics_for_model, resolve_model_alias, resolve_model_fuzzy,
-    set_retry_notifier, ModelTokenLimit, ProviderDiagnostics, ProviderKind, RetryNotice,
+    model_token_limit, parse_retry_after, provider_diagnostics_for_model, resolve_model_alias,
+    resolve_model_fuzzy, set_retry_notifier, ModelTokenLimit, ProviderDiagnostics, ProviderKind,
+    RetryNotice,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
-    InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    ImageAttachment, ImageSource, InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent,
+    MessageRequest, MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock,
+    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 pub use telemetry::{

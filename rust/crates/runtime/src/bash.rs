@@ -541,3 +541,60 @@ mod truncation_tests {
         assert!(result.contains("[output truncated"));
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    use super::{max_output_bytes, parse_max_output_bytes, truncate_output};
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `CLAW_BASH_MAX_OUTPUT_BYTES` parsing never leaves its
+        /// 4 KiB..=1 MiB clamp, whatever the raw value.
+        #[test]
+        fn parse_max_output_bytes_stays_within_clamp(
+            raw in proptest::option::of("\\PC{0,24}"),
+        ) {
+            let value = parse_max_output_bytes(raw.as_deref());
+            prop_assert!((4_096..=1_048_576).contains(&value));
+        }
+
+        /// Numeric strings — the parseable subset — are clamped, not passed
+        /// through.
+        #[test]
+        fn parse_max_output_bytes_clamps_all_numeric_inputs(value in any::<usize>()) {
+            let parsed = parse_max_output_bytes(Some(&value.to_string()));
+            prop_assert!((4_096..=1_048_576).contains(&parsed));
+        }
+
+        /// Truncation never yields more bytes than the limit plus the
+        /// truncation marker, stays on UTF-8 boundaries, and leaves
+        /// under-limit output untouched. `pad` steers inputs across the
+        /// boundary without generating megabytes per case.
+        #[test]
+        fn truncate_output_never_exceeds_limit_plus_marker(
+            input in "\\PC{0,2000}",
+            pad in 0usize..20_000,
+        ) {
+            let padded = format!("{}{input}", "x".repeat(pad));
+            let limit = max_output_bytes();
+            let marker_len =
+                format!("\n\n[output truncated — exceeded {limit} bytes]").len();
+
+            let output = truncate_output(&padded);
+
+            prop_assert!(
+                output.len() <= limit + marker_len,
+                "{} bytes escaped the {limit}+{marker_len} bound",
+                output.len()
+            );
+            if padded.len() <= limit {
+                prop_assert_eq!(output, padded);
+            } else {
+                let marker_suffix = format!("exceeded {limit} bytes]");
+                prop_assert!(output.ends_with(&marker_suffix));
+            }
+        }
+    }
+}

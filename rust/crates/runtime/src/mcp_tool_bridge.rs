@@ -312,18 +312,26 @@ impl McpToolRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::BTreeMap;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    #[cfg(unix)]
     use crate::config::{
         ConfigSource, McpServerConfig, McpStdioServerConfig, ScopedMcpServerConfig,
     };
 
+    #[cfg(unix)]
     fn temp_dir() -> PathBuf {
         static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
@@ -334,12 +342,14 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-mcp-tool-bridge-{nanos}-{unique_id}"))
     }
 
+    #[cfg(unix)]
     fn cleanup_script(script_path: &Path) {
         if let Some(root) = script_path.parent() {
             let _ = fs::remove_dir_all(root);
         }
     }
 
+    #[cfg(unix)]
     fn write_bridge_mcp_server_script() -> PathBuf {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("temp dir");
@@ -436,6 +446,7 @@ mod tests {
         script_path
     }
 
+    #[cfg(unix)]
     fn manager_server_config(
         script_path: &Path,
         server_name: &str,
@@ -570,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn given_connected_server_with_manager_when_calling_tool_then_it_returns_live_result() {
         let script_path = write_bridge_mcp_server_script();
         let root = script_path.parent().expect("script parent");
@@ -813,6 +825,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn call_tool_payload_structure() {
         let script_path = write_bridge_mcp_server_script();
         let root = script_path.parent().expect("script parent");

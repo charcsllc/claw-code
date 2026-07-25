@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use telemetry::SessionTracer;
@@ -12,11 +14,16 @@ use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRun
 use crate::permissions::{
     PermissionContext, PermissionOutcome, PermissionPolicy, PermissionPrompter,
 };
-use crate::session::{ContentBlock, ConversationMessage, Session};
+use crate::session::{image_placeholder_text, ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
+
+/// Error message used when a turn is aborted by a cancellation flag, so
+/// callers can recognise cooperative cancellation without a dedicated error
+/// variant.
+pub const TURN_CANCELLED_MESSAGE: &str = "conversation turn cancelled by cancellation request";
 
 /// Fully assembled request payload sent to the upstream model client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +147,7 @@ pub struct ConversationRuntime<C, T> {
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
+    cancellation_flag: Option<Arc<AtomicBool>>,
 }
 
 impl<C, T> ConversationRuntime<C, T>
@@ -189,6 +197,7 @@ where
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
+            cancellation_flag: None,
         }
     }
 
@@ -230,6 +239,22 @@ where
     pub fn with_session_tracer(mut self, session_tracer: SessionTracer) -> Self {
         self.session_tracer = Some(session_tracer);
         self
+    }
+
+    /// Installs a shared cancellation flag. `run_turn` checks it between
+    /// loop iterations and between tool calls and aborts cooperatively
+    /// (with [`TURN_CANCELLED_MESSAGE`]) when it is set; an in-flight API
+    /// request or tool call always finishes first.
+    #[must_use]
+    pub fn with_cancellation_flag(mut self, cancellation_flag: Arc<AtomicBool>) -> Self {
+        self.cancellation_flag = Some(cancellation_flag);
+        self
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancellation_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
     fn run_pre_tool_use_hook(&mut self, tool_name: &str, input: &str) -> HookRunResult {
@@ -321,14 +346,23 @@ where
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn run_turn(
         &mut self,
         user_input: impl Into<String>,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        self.run_turn_message(ConversationMessage::user_text(user_input), prompter)
+    }
+
+    /// Variant of [`Self::run_turn`] that accepts a fully-formed user
+    /// message, so callers can open a turn with multimodal content (e.g.
+    /// [`ContentBlock::Image`] attachments alongside the prompt text).
+    #[allow(clippy::too_many_lines)]
+    pub fn run_turn_message(
+        &mut self,
+        user_message: ConversationMessage,
         mut prompter: Option<&mut dyn PermissionPrompter>,
     ) -> Result<TurnSummary, RuntimeError> {
-        let user_input = user_input.into();
-
         // ROADMAP #38: Session-health canary - probe if context was compacted
         if self.session.compaction.is_some() {
             if let Err(error) = self.run_session_health_probe() {
@@ -340,9 +374,9 @@ where
             }
         }
 
-        self.record_turn_started(&user_input);
+        self.record_turn_started(&describe_user_message(&user_message));
         self.session
-            .push_user_text(user_input)
+            .push_message(user_message)
             .map_err(|error| RuntimeError::new(error.to_string()))?;
 
         let mut assistant_messages = Vec::new();
@@ -353,6 +387,11 @@ where
 
         loop {
             iterations += 1;
+            if self.cancellation_requested() {
+                let error = RuntimeError::new(TURN_CANCELLED_MESSAGE);
+                self.record_turn_failed(iterations, &error);
+                return Err(error);
+            }
             if iterations > self.max_iterations {
                 let error = RuntimeError::new(
                     "conversation loop exceeded the maximum number of iterations",
@@ -416,6 +455,13 @@ where
             }
 
             for (tool_use_id, tool_name, input) in pending_tool_uses {
+                // Cooperative cancellation between tool calls: pending tools
+                // that have not started yet are skipped when the flag flips.
+                if self.cancellation_requested() {
+                    let error = RuntimeError::new(TURN_CANCELLED_MESSAGE);
+                    self.record_turn_failed(iterations, &error);
+                    return Err(error);
+                }
                 let pre_hook_result = self.run_pre_tool_use_hook(&tool_name, &input);
                 let effective_input = pre_hook_result
                     .updated_input()
@@ -786,6 +832,28 @@ fn flush_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
     }
 }
 
+/// Telemetry-facing description of an outgoing user message: text blocks
+/// verbatim (matching the string [`ConversationRuntime::run_turn`] has
+/// always recorded), image blocks as their size placeholder, other blocks
+/// omitted. Multiple parts are joined with newlines.
+fn describe_user_message(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Image {
+                media_type,
+                base64_data,
+            } => Some(image_placeholder_text(media_type, base64_data.len())),
+            ContentBlock::Thinking { .. }
+            | ContentBlock::ToolUse { .. }
+            | ContentBlock::ToolResult { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_hook_message(result: &HookRunResult, fallback: &str) -> String {
     if result.messages().is_empty() {
         fallback.to_string()
@@ -851,6 +919,7 @@ mod tests {
         build_assistant_message, parse_auto_compaction_threshold, ApiClient, ApiRequest,
         AssistantEvent, AutoCompactionEvent, ConversationRuntime, PromptCacheEvent, RuntimeError,
         StaticToolExecutor, ToolExecutor, DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD,
+        TURN_CANCELLED_MESSAGE,
     };
     use crate::compact::CompactionConfig;
     use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
@@ -937,6 +1006,33 @@ mod tests {
         }
     }
 
+    /// API client that must never be reached (cancellation aborts first).
+    struct UnreachableApiClient;
+
+    impl ApiClient for UnreachableApiClient {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            panic!("cancelled turn must not call the API");
+        }
+    }
+
+    #[test]
+    fn run_turn_aborts_between_iterations_when_cancellation_flag_is_set() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            UnreachableApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec![String::from("system prompt")],
+        )
+        .with_cancellation_flag(Arc::clone(&flag));
+
+        let error = runtime
+            .run_turn("do things", None)
+            .expect_err("pre-set cancellation flag must abort the turn");
+        assert_eq!(error.to_string(), TURN_CANCELLED_MESSAGE);
+    }
+
     #[test]
     fn runs_user_to_tool_to_result_loop_end_to_end_and_tracks_usage() {
         let api_client = ScriptedApiClient { call_count: 0 };
@@ -989,6 +1085,90 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// `run_turn_message` must forward multimodal user messages (image +
+    /// text blocks) verbatim to the API client and persist them in the
+    /// session, while `turn_started` telemetry carries the image placeholder
+    /// instead of the base64 payload.
+    #[test]
+    fn run_turn_message_forwards_image_blocks_to_api_and_session() {
+        struct AssertImageApiClient;
+        impl ApiClient for AssertImageApiClient {
+            fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                let user_message = request
+                    .messages
+                    .iter()
+                    .find(|message| message.role == MessageRole::User)
+                    .expect("user message should be present");
+                assert_eq!(
+                    user_message.blocks[0],
+                    ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: "aGVsbG8=".to_string(),
+                    }
+                );
+                assert_eq!(
+                    user_message.blocks[1],
+                    ContentBlock::Text {
+                        text: "what is in this screenshot?".to_string(),
+                    }
+                );
+                Ok(vec![
+                    AssistantEvent::TextDelta("A hello banner.".to_string()),
+                    AssistantEvent::MessageStop,
+                ])
+            }
+        }
+
+        let sink = Arc::new(MemoryTelemetrySink::default());
+        let tracer = SessionTracer::new("session-image", sink.clone());
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            AssertImageApiClient,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .with_session_tracer(tracer);
+
+        let user_message = crate::session::ConversationMessage {
+            role: MessageRole::User,
+            blocks: vec![
+                ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "what is in this screenshot?".to_string(),
+                },
+            ],
+            usage: None,
+        };
+        let summary = runtime
+            .run_turn_message(user_message.clone(), None)
+            .expect("multimodal turn should succeed");
+
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(runtime.session().messages[0], user_message);
+
+        let turn_started_input = sink
+            .events()
+            .iter()
+            .find_map(|event| match event {
+                TelemetryEvent::SessionTrace(trace) if trace.name == "turn_started" => trace
+                    .attributes
+                    .get("user_input")
+                    .and_then(|value| value.as_str())
+                    .map(ToOwned::to_owned),
+                _ => None,
+            })
+            .expect("turn_started trace should be recorded");
+        assert_eq!(
+            turn_started_input,
+            "[imagen adjunta: image/png, 1 KB]\nwhat is in this screenshot?"
+        );
+        assert!(!turn_started_input.contains("aGVsbG8="));
     }
 
     #[test]
@@ -1518,9 +1698,23 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
     }
 
+    /// Translates the `printf '<text>'[; exit N]` sh snippets these tests
+    /// use into cmd equivalents on Windows (`echo` + `exit /b`); the hook
+    /// runner trims stdout, so echo's trailing CRLF is harmless.
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        let (body, exit_code) = match script.rsplit_once("; exit ") {
+            Some((body, code)) => (body, Some(code)),
+            None => (script, None),
+        };
+        let text = body
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''));
+        match (text, exit_code) {
+            (Some(text), Some(code)) => format!("echo {text}& exit /b {code}"),
+            (Some(text), None) => format!("echo {text}"),
+            _ => script.to_string(),
+        }
     }
 
     #[cfg(not(windows))]

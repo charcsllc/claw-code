@@ -1,0 +1,78 @@
+# cargo-deny configuration for the rust/ workspace.
+# Run by the `cargo-deny` job in .github/workflows/rust-ci.yml via
+# EmbarkStudios/cargo-deny-action@v2. Docs:
+# https://embarkstudios.github.io/cargo-deny/
+#
+# HONESTY NOTE: cargo-deny has not been executed against this workspace yet
+# (it cannot run in the environment this file was authored in). The lists
+# below come from a manual review of rust/Cargo.lock plus the license
+# metadata of the locked crate versions, so they are intentionally generous.
+# Adjust (prune or extend) after the first CI run; until that run is green
+# the CI job stays continue-on-error.
+
+[advisories]
+# Intent: deny vulnerabilities, warn on unmaintained.
+#
+# - Vulnerabilities: current cargo-deny removed the old
+#   `vulnerability = "deny"` severity key; security advisories are now
+#   ALWAYS errors, which is exactly the behavior we want.
+# - Unmaintained: the old `unmaintained = "warn"` severity was removed too.
+#   The field now selects WHICH crates can fail the check. "workspace"
+#   means only direct dependencies of workspace members fail; unmaintained
+#   *transitive* crates (e.g. yaml-rust pulled in via syntect,
+#   RUSTSEC-2024-0320) are surfaced without blocking -- the closest current
+#   equivalent of the old warn behavior.
+unmaintained = "workspace"
+# Yanked crate versions are reported but do not fail the check.
+yanked = "warn"
+# Park RUSTSEC exceptions here, always with a reason, e.g.:
+#   ignore = [{ id = "RUSTSEC-0000-0000", reason = "why it is acceptable" }]
+ignore = []
+
+[licenses]
+# Only licenses on this SPDX allow-list are accepted; anything else fails.
+# Base allow-list plus additions required by crates actually pinned in
+# rust/Cargo.lock (verified by hand against the locked versions). Adjust
+# after the first cargo-deny run in CI.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  # --- additions required by crates present in rust/Cargo.lock ---
+  # icu_* / zerovec / zerotrie / tinystr (ICU4X) and unicode-ident 1.0.24
+  # ("(MIT OR Apache-2.0) AND Unicode-3.0").
+  "Unicode-3.0",
+  # webpki-roots 1.0.x (Mozilla CA bundle data).
+  "CDLA-Permissive-2.0",
+  # clipboard-win / error-code (Windows-target deps of rustyline) are
+  # BSL-1.0-only; ryu is "Apache-2.0 OR BSL-1.0".
+  "BSL-1.0",
+  # aho-corasick / memchr / globset / walkdir family ("Unlicense OR MIT").
+  "Unlicense",
+  # adler2 ("0BSD OR MIT OR Apache-2.0").
+  "0BSD",
+  # constant_time_eq ("CC0-1.0 OR MIT-0 OR Apache-2.0").
+  "MIT-0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# The tree currently carries duplicate major/minor versions (e.g. the
+# windows-sys 0.52/0.59/0.60/0.61 fan-out), so start as a warning; tighten
+# selectively with [[bans.deny]] / skip lists once the report is visible.
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# rust/Cargo.lock has zero `source = "git+..."` entries today (verified by
+# grep), so no git allow-list is needed. If a git dependency is ever added,
+# extend with e.g.:
+#   allow-git = ["https://github.com/org/repo"]

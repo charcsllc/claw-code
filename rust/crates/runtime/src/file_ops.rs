@@ -1,20 +1,101 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 use glob::Pattern;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::{DirEntry, WalkDir};
 
-/// Maximum file size that can be read (10 MB).
-const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+/// Bounds and default for `CLAW_READ_FILE_MAX_BYTES`, the largest file
+/// `read_file` will load whole. Files above the limit must be read in
+/// windows via `offset`/`limit` (streamed, never fully loaded) or rejected
+/// with a clear error.
+const READ_FILE_MAX_BYTES_DEFAULT: u64 = 2_000_000;
+const READ_FILE_MAX_BYTES_MIN: u64 = 64 * 1024;
+const READ_FILE_MAX_BYTES_MAX: u64 = 50 * 1024 * 1024;
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Parses a raw `CLAW_READ_FILE_MAX_BYTES` value into the whole-file read
+/// limit in bytes, clamped to `65_536..=52_428_800` (64 KB..=50 MB).
+/// Missing, empty, or unparseable values fall back to the default
+/// (2 000 000 bytes).
+#[must_use]
+pub fn parse_read_file_max_bytes(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(READ_FILE_MAX_BYTES_DEFAULT, |value| {
+            value.clamp(READ_FILE_MAX_BYTES_MIN, READ_FILE_MAX_BYTES_MAX)
+        })
+}
+
+/// Thin env wrapper over [`parse_read_file_max_bytes`]: reads
+/// `CLAW_READ_FILE_MAX_BYTES` from the process environment.
+#[must_use]
+pub fn read_file_max_bytes() -> u64 {
+    parse_read_file_max_bytes(std::env::var("CLAW_READ_FILE_MAX_BYTES").ok().as_deref())
+}
+
+/// In-process registry of the on-disk mtime observed at each file's last
+/// successful `read_file`/`write_file`/`edit_file`, used by `edit_file` to
+/// warn when the file changed on disk (editor, formatter, another agent)
+/// since this process last saw it.
+static FILE_MTIME_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SystemTime>>> = OnceLock::new();
+
+fn file_mtime_registry() -> &'static Mutex<HashMap<PathBuf, SystemTime>> {
+    FILE_MTIME_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Records `path`'s current on-disk mtime in the registry (best effort:
+/// filesystems without mtime support simply record nothing).
+fn record_file_mtime(path: &Path) {
+    if let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) {
+        record_file_mtime_as(path, modified);
+    }
+}
+
+fn record_file_mtime_as(path: &Path, mtime: SystemTime) {
+    file_mtime_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), mtime);
+}
+
+fn recorded_file_mtime(path: &Path) -> Option<SystemTime> {
+    file_mtime_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+}
+
+/// Pure decision core of the external-modification guard: given the mtime
+/// recorded at the last read/write and the current on-disk mtime, returns
+/// the warning to attach to an edit result. `None` when the file was never
+/// tracked (first touch in this process) or has not changed — a warning,
+/// never an error, so legitimate flows keep working.
+#[must_use]
+pub fn external_modification_warning(
+    recorded_mtime: Option<SystemTime>,
+    current_mtime: Option<SystemTime>,
+) -> Option<String> {
+    let recorded = recorded_mtime?;
+    let current = current_mtime?;
+    (recorded != current).then(|| {
+        String::from(
+            "WARNING: the file changed on disk since it was last read in this session; \
+             the edit was applied on top of the current on-disk content — re-read the \
+             file to verify the result",
+        )
+    })
+}
 
 const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     ".git",
@@ -124,6 +205,15 @@ pub struct EditFileOutput {
     pub replace_all: bool,
     #[serde(rename = "gitDiff")]
     pub git_diff: Option<serde_json::Value>,
+    /// Set when the file's on-disk mtime changed since this process last
+    /// read or wrote it (see [`external_modification_warning`]). Advisory
+    /// only — the edit is still applied.
+    #[serde(
+        rename = "externalModificationWarning",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub external_modification_warning: Option<String>,
 }
 
 /// Result of a glob-based filename search.
@@ -182,25 +272,29 @@ pub struct GrepSearchOutput {
 }
 
 /// Reads a text file and returns a line-windowed payload.
+///
+/// Files larger than `CLAW_READ_FILE_MAX_BYTES` (default 2 000 000 bytes,
+/// clamped to 64 KB..=50 MB) are never loaded whole: with `offset`/`limit`
+/// the requested window is streamed line by line instead, and without them
+/// the call fails with the actual size and a suggestion to pass
+/// `offset`/`limit`.
 pub fn read_file(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    read_file_with_max_bytes(path, offset, limit, read_file_max_bytes())
+}
 
-    // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
-    if metadata.len() > MAX_READ_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "file is too large ({} bytes, max {} bytes)",
-                metadata.len(),
-                MAX_READ_SIZE
-            ),
-        ));
-    }
+/// Limit-injected core of [`read_file`], so tests can exercise the
+/// oversized-file paths without multi-megabyte fixtures or env mutation.
+fn read_file_with_max_bytes(
+    path: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    max_bytes: u64,
+) -> io::Result<ReadFileOutput> {
+    let absolute_path = normalize_path(path)?;
 
     // Detect binary files
     if is_binary_file(&absolute_path)? {
@@ -210,6 +304,19 @@ pub fn read_file(
         ));
     }
 
+    // Check file size before loading it whole.
+    let metadata = fs::metadata(&absolute_path)?;
+    if metadata.len() > max_bytes {
+        if offset.is_none() && limit.is_none() {
+            return Err(read_file_too_large_error(metadata.len(), max_bytes));
+        }
+        // A window was requested: stream just that window instead of
+        // loading the whole file into memory.
+        let output = read_file_window_streaming(&absolute_path, offset.unwrap_or(0), limit)?;
+        record_file_mtime(&absolute_path);
+        return Ok(output);
+    }
+
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
@@ -217,6 +324,7 @@ pub fn read_file(
         start_index.saturating_add(limit).min(lines.len())
     });
     let selected = lines[start_index..end_index].join("\n");
+    record_file_mtime(&absolute_path);
 
     Ok(ReadFileOutput {
         kind: String::from("text"),
@@ -226,6 +334,56 @@ pub fn read_file(
             num_lines: end_index.saturating_sub(start_index),
             start_line: start_index.saturating_add(1),
             total_lines: lines.len(),
+        },
+    })
+}
+
+/// Error returned when a file exceeds the whole-file read limit and no
+/// window was requested.
+fn read_file_too_large_error(actual_bytes: u64, max_bytes: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "file is too large to read whole ({actual_bytes} bytes, limit {max_bytes} bytes \
+             from CLAW_READ_FILE_MAX_BYTES); pass offset/limit to read a window of lines \
+             instead, or raise CLAW_READ_FILE_MAX_BYTES"
+        ),
+    )
+}
+
+/// Streams a line window out of a file that is too large to load whole.
+/// Only the selected window is kept in memory; the rest of the file is
+/// scanned to report `total_lines`.
+fn read_file_window_streaming(
+    absolute_path: &Path,
+    start_index: usize,
+    limit: Option<usize>,
+) -> io::Result<ReadFileOutput> {
+    use std::io::BufRead as _;
+
+    let file = fs::File::open(absolute_path)?;
+    let reader = io::BufReader::new(file);
+    let mut selected: Vec<String> = Vec::new();
+    let mut total_lines = 0_usize;
+    for line in reader.lines() {
+        // Invalid UTF-8 fails here, matching the read_to_string behaviour
+        // of the whole-file path.
+        let line = line?;
+        if total_lines >= start_index && limit.is_none_or(|limit| selected.len() < limit) {
+            selected.push(line);
+        }
+        total_lines += 1;
+    }
+    let start_index = start_index.min(total_lines);
+
+    Ok(ReadFileOutput {
+        kind: String::from("text"),
+        file: TextFilePayload {
+            file_path: absolute_path.to_string_lossy().into_owned(),
+            num_lines: selected.len(),
+            content: selected.join("\n"),
+            start_line: start_index.saturating_add(1),
+            total_lines,
         },
     })
 }
@@ -253,6 +411,7 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&absolute_path, content)?;
+    record_file_mtime(&absolute_path);
 
     Ok(WriteFileOutput {
         kind: if existed_before {
@@ -323,12 +482,24 @@ pub fn edit_file(
         ));
     }
 
+    // External-modification guard: compare the mtime recorded at the last
+    // read/write in this process against the current on-disk mtime. A
+    // mismatch means the file changed underneath us (editor, formatter,
+    // another agent) — warn, but never fail, so legitimate flows keep
+    // working.
+    let current_mtime = fs::metadata(&absolute_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let external_warning =
+        external_modification_warning(recorded_file_mtime(&absolute_path), current_mtime);
+
     let updated = if replace_all {
         original_file.replace(old_string, new_string)
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
     fs::write(&absolute_path, &updated)?;
+    record_file_mtime(&absolute_path);
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -336,9 +507,10 @@ pub fn edit_file(
         new_string: new_string.to_owned(),
         original_file: original_file.clone(),
         structured_patch: make_patch(&original_file, &updated),
-        user_modified: false,
+        user_modified: external_warning.is_some(),
         replace_all,
         git_diff: None,
+        external_modification_warning: external_warning,
     })
 }
 
@@ -353,10 +525,16 @@ fn glob_search_impl(
     workspace_root: Option<&Path>,
 ) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
-    let base_dir = path
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_dir = match path {
+        Some(path) => normalize_path(path)?,
+        None => {
+            // The raw cwd may be in 8.3 short form on Windows; normalize it
+            // the same way explicit paths are so boundary checks compare
+            // canonical forms.
+            let cwd = std::env::current_dir()?;
+            cwd.canonicalize().map(simplify_canonical).unwrap_or(cwd)
+        }
+    };
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
         validate_workspace_boundary(&base_dir, root)?;
@@ -366,6 +544,10 @@ fn glob_search_impl(
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
+    // glob::Pattern treats `\` as an escape character, so Windows paths must
+    // be compiled and matched in forward-slash form.
+    #[cfg(windows)]
+    let search_pattern = search_pattern.replace('\\', "/");
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
@@ -381,6 +563,7 @@ fn glob_search_impl(
         if let Some(root) = canonical_root.as_deref() {
             let canonical_walk_root = walk_root
                 .canonicalize()
+                .map(simplify_canonical)
                 .unwrap_or_else(|_| walk_root.clone());
             validate_workspace_boundary(&canonical_walk_root, root)?;
         }
@@ -389,12 +572,15 @@ fn glob_search_impl(
             .filter_entry(|entry| !should_skip_glob_dir(entry));
         for entry in entries.flatten() {
             let candidate = entry.path();
+            let candidate_text = candidate.to_string_lossy();
+            #[cfg(windows)]
+            let candidate_text = candidate_text.replace('\\', "/");
             if entry.file_type().is_file()
-                && compiled.matches_path(candidate)
+                && compiled.matches(&candidate_text)
                 && seen.insert(candidate.to_path_buf())
             {
                 if let Some(root) = canonical_root.as_deref() {
-                    let canonical_candidate = candidate.canonicalize()?;
+                    let canonical_candidate = simplify_canonical(candidate.canonicalize()?);
                     validate_workspace_boundary(&canonical_candidate, root)?;
                 }
                 matches.push(candidate.to_path_buf());
@@ -433,12 +619,13 @@ fn grep_search_impl(
     input: &GrepSearchInput,
     workspace_root: Option<&Path>,
 ) -> io::Result<GrepSearchOutput> {
-    let base_path = input
-        .path
-        .as_deref()
-        .map(normalize_path)
-        .transpose()?
-        .unwrap_or(std::env::current_dir()?);
+    let base_path = match input.path.as_deref() {
+        Some(path) => normalize_path(path)?,
+        None => {
+            let cwd = std::env::current_dir()?;
+            cwd.canonicalize().map(simplify_canonical).unwrap_or(cwd)
+        }
+    };
     let canonical_root = workspace_root.map(canonicalize_workspace_root);
     if let Some(root) = canonical_root.as_deref() {
         validate_workspace_boundary(&base_path, root)?;
@@ -469,7 +656,7 @@ fn grep_search_impl(
 
     for file_path in collect_search_files(&base_path)? {
         if let Some(root) = canonical_root.as_deref() {
-            let canonical_file = file_path.canonicalize()?;
+            let canonical_file = simplify_canonical(file_path.canonicalize()?);
             validate_workspace_boundary(&canonical_file, root)?;
         }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
@@ -566,6 +753,7 @@ fn build_grep_content_output(
 fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
     workspace_root
         .canonicalize()
+        .map(simplify_canonical)
         .unwrap_or_else(|_| workspace_root.to_path_buf())
 }
 
@@ -624,6 +812,10 @@ fn matches_optional_filters(
 ) -> bool {
     if let Some(glob_filter) = glob_filter {
         let path_string = path.to_string_lossy();
+        // glob::Pattern treats `\` as an escape character, so Windows paths
+        // must be matched in forward-slash form.
+        #[cfg(windows)]
+        let path_string = path_string.replace('\\', "/");
         if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
             return false;
         }
@@ -778,13 +970,31 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
+/// `canonicalize()` on Windows returns `\\?\C:\…` verbatim paths. The prefix
+/// defeats glob matching (`?` is a glob metacharacter) and any comparison
+/// against non-verbatim paths, so every canonicalized path in this module is
+/// simplified back to a plain drive path.
+#[cfg(windows)]
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    path
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
         std::env::current_dir()?.join(path)
     };
-    candidate.canonicalize()
+    candidate.canonicalize().map(simplify_canonical)
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
@@ -795,16 +1005,36 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     };
 
     if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
+        return Ok(simplify_canonical(canonical));
     }
 
-    if let Some(parent) = candidate.parent() {
-        let canonical_parent = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        if let Some(name) = candidate.file_name() {
-            return Ok(canonical_parent.join(name));
+    // The file — possibly part of its directory chain — does not exist yet:
+    // canonicalize the deepest existing ancestor and rejoin the missing
+    // suffix (resolving `.`/`..` lexically), so the result stays comparable
+    // with canonicalized workspace roots. Falling back to the raw candidate
+    // instead breaks that comparison on Windows, where the raw path may use
+    // 8.3 short names (RUNNER~1) while the root is in long form.
+    let mut existing = candidate.as_path();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            missing.push(name.to_os_string());
         }
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            let mut resolved = simplify_canonical(canonical_parent);
+            for part in missing.iter().rev() {
+                if part == "." {
+                    continue;
+                }
+                if part == ".." {
+                    resolved.pop();
+                    continue;
+                }
+                resolved.push(part);
+            }
+            return Ok(resolved);
+        }
+        existing = parent;
     }
 
     Ok(candidate)
@@ -878,9 +1108,10 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     if !metadata.is_symlink() {
         return Ok(false);
     }
-    let resolved = path.canonicalize()?;
+    let resolved = simplify_canonical(path.canonicalize()?);
     let canonical_root = workspace_root
         .canonicalize()
+        .map(simplify_canonical)
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     Ok(!resolved.starts_with(&canonical_root))
 }
@@ -912,11 +1143,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use super::write_file_in_workspace;
     use super::{
         closest_match_diff, component_contains_glob, derive_glob_walk_root, edit_file,
-        expand_braces, glob_search, grep_search, is_symlink_escape, read_file,
-        read_file_in_workspace, write_file, write_file_in_workspace, GrepSearchInput,
-        MAX_WRITE_SIZE,
+        expand_braces, external_modification_warning, glob_search, grep_search, is_symlink_escape,
+        parse_read_file_max_bytes, read_file, read_file_in_workspace, read_file_with_max_bytes,
+        record_file_mtime_as, write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        READ_FILE_MAX_BYTES_DEFAULT, READ_FILE_MAX_BYTES_MAX, READ_FILE_MAX_BYTES_MIN,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -925,6 +1159,149 @@ mod tests {
             .expect("time should move forward")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-native-{name}-{unique}"))
+    }
+
+    #[test]
+    fn parse_read_file_max_bytes_defaults_when_missing_or_invalid() {
+        assert_eq!(parse_read_file_max_bytes(None), READ_FILE_MAX_BYTES_DEFAULT);
+        assert_eq!(
+            parse_read_file_max_bytes(Some("")),
+            READ_FILE_MAX_BYTES_DEFAULT
+        );
+        assert_eq!(
+            parse_read_file_max_bytes(Some("  ")),
+            READ_FILE_MAX_BYTES_DEFAULT
+        );
+        assert_eq!(
+            parse_read_file_max_bytes(Some("lots")),
+            READ_FILE_MAX_BYTES_DEFAULT
+        );
+        assert_eq!(
+            parse_read_file_max_bytes(Some("-1")),
+            READ_FILE_MAX_BYTES_DEFAULT
+        );
+    }
+
+    #[test]
+    fn parse_read_file_max_bytes_accepts_and_clamps_values() {
+        assert_eq!(parse_read_file_max_bytes(Some("1000000")), 1_000_000);
+        assert_eq!(parse_read_file_max_bytes(Some(" 5000000 ")), 5_000_000);
+        assert_eq!(
+            parse_read_file_max_bytes(Some("1")),
+            READ_FILE_MAX_BYTES_MIN
+        );
+        assert_eq!(
+            parse_read_file_max_bytes(Some("999999999999")),
+            READ_FILE_MAX_BYTES_MAX
+        );
+    }
+
+    #[test]
+    fn oversized_read_without_window_reports_size_and_suggests_offset_limit() {
+        let path = temp_path("oversize-read.txt");
+        std::fs::write(&path, "line one\nline two\nline three\n").expect("seed file");
+        // Inject a tiny limit so the fixture stays small.
+        let result = read_file_with_max_bytes(path.to_string_lossy().as_ref(), None, None, 10);
+        let error = result.expect_err("oversized whole-file read must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let message = error.to_string();
+        assert!(
+            message.contains("29 bytes"),
+            "actual size in error: {message}"
+        );
+        assert!(
+            message.contains("limit 10 bytes"),
+            "limit in error: {message}"
+        );
+        assert!(
+            message.contains("offset/limit"),
+            "suggestion in error: {message}"
+        );
+        assert!(
+            message.contains("CLAW_READ_FILE_MAX_BYTES"),
+            "env knob in error: {message}"
+        );
+    }
+
+    #[test]
+    fn oversized_read_with_window_streams_the_requested_lines() {
+        let path = temp_path("oversize-window.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").expect("seed file");
+        let output =
+            read_file_with_max_bytes(path.to_string_lossy().as_ref(), Some(1), Some(2), 10)
+                .expect("windowed read of oversized file must stream");
+        assert_eq!(output.file.content, "beta\ngamma");
+        assert_eq!(output.file.num_lines, 2);
+        assert_eq!(output.file.start_line, 2);
+        assert_eq!(output.file.total_lines, 4);
+    }
+
+    #[test]
+    fn oversized_read_window_clamps_offset_past_end() {
+        let path = temp_path("oversize-window-past-end.txt");
+        std::fs::write(&path, "alpha\nbeta\n").expect("seed file");
+        let output =
+            read_file_with_max_bytes(path.to_string_lossy().as_ref(), Some(10), Some(2), 5)
+                .expect("window past end yields empty content");
+        assert_eq!(output.file.content, "");
+        assert_eq!(output.file.num_lines, 0);
+        assert_eq!(output.file.total_lines, 2);
+    }
+
+    #[test]
+    fn external_modification_warning_is_none_without_history_or_change() {
+        let now = SystemTime::now();
+        assert_eq!(external_modification_warning(None, Some(now)), None);
+        assert_eq!(external_modification_warning(Some(now), None), None);
+        assert_eq!(external_modification_warning(Some(now), Some(now)), None);
+    }
+
+    #[test]
+    fn external_modification_warning_fires_when_mtimes_differ() {
+        let warning = external_modification_warning(Some(UNIX_EPOCH), Some(SystemTime::now()))
+            .expect("differing mtimes must warn");
+        assert!(warning.contains("changed on disk"));
+    }
+
+    #[test]
+    fn edit_after_read_carries_no_external_modification_warning() {
+        let path = temp_path("guard-clean-edit.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha beta gamma").expect("seed");
+        read_file(path.to_string_lossy().as_ref(), None, None).expect("read records mtime");
+        let output = edit_file(path.to_string_lossy().as_ref(), "beta", "BETA", false)
+            .expect("edit succeeds");
+        assert_eq!(output.external_modification_warning, None);
+        assert!(!output.user_modified);
+    }
+
+    #[test]
+    fn edit_warns_when_file_changed_on_disk_since_last_read() {
+        let path = temp_path("guard-external-change.txt");
+        write_file(path.to_string_lossy().as_ref(), "alpha beta gamma").expect("seed");
+        // Simulate "read long ago, file rewritten since": force the recorded
+        // mtime to a value that cannot match the current on-disk mtime. The
+        // registry key must be the same path form edit_file resolves
+        // (normalize_path), not a raw canonicalize — on Windows they differ.
+        let absolute =
+            super::normalize_path(path.to_string_lossy().as_ref()).expect("normalize path");
+        record_file_mtime_as(&absolute, UNIX_EPOCH);
+        let output = edit_file(path.to_string_lossy().as_ref(), "beta", "BETA", false)
+            .expect("edit still succeeds despite the warning");
+        let warning = output
+            .external_modification_warning
+            .expect("edit must warn about the external change");
+        assert!(warning.contains("changed on disk"));
+        assert!(output.user_modified);
+        // The edit itself still landed.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "alpha BETA gamma"
+        );
+
+        // The registry was refreshed by the edit: a follow-up edit is clean.
+        let second = edit_file(path.to_string_lossy().as_ref(), "BETA", "beta2", false)
+            .expect("second edit succeeds");
+        assert_eq!(second.external_modification_warning, None);
     }
 
     #[test]
@@ -1130,9 +1507,9 @@ mod tests {
         let outside = temp_path("symlink-target.txt");
         std::fs::write(&outside, "target content").expect("target should write");
 
-        let link_path = workspace.join("escape-link.txt");
         #[cfg(unix)]
         {
+            let link_path = workspace.join("escape-link.txt");
             std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
             assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
         }
@@ -1309,11 +1686,11 @@ mod tests {
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("src/AGENTS.md")));
+            .any(|path| path.replace('\\', "/").ends_with("src/AGENTS.md")));
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("docs/AGENTS.md")));
+            .any(|path| path.replace('\\', "/").ends_with("docs/AGENTS.md")));
         assert!(!result
             .filenames
             .iter()
@@ -1331,5 +1708,33 @@ mod tests {
         assert!(component_contains_glob("**"));
         assert!(component_contains_glob("*.rs"));
         assert!(!component_contains_glob("src"));
+    }
+}
+
+#[cfg(test)]
+mod read_limit_property_tests {
+    use super::parse_read_file_max_bytes;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `CLAW_READ_FILE_MAX_BYTES` parsing never leaves its
+        /// 64 KiB..=50 MiB clamp, whatever the raw value.
+        #[test]
+        fn parse_read_file_max_bytes_stays_within_clamp(
+            raw in proptest::option::of("\\PC{0,24}"),
+        ) {
+            let value = parse_read_file_max_bytes(raw.as_deref());
+            prop_assert!((65_536..=52_428_800).contains(&value));
+        }
+
+        /// Numeric strings — the parseable subset — are clamped, not passed
+        /// through.
+        #[test]
+        fn parse_read_file_max_bytes_clamps_all_numeric_inputs(value in any::<u64>()) {
+            let parsed = parse_read_file_max_bytes(Some(&value.to_string()));
+            prop_assert!((65_536..=52_428_800).contains(&parsed));
+        }
     }
 }

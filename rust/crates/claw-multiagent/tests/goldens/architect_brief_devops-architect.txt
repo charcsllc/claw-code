@@ -1,0 +1,9 @@
+
+
+Your design document MUST contain these sections, each with concrete values:
+1. Environment matrix: dev/staging/prod × every env var (name, purpose, secret or not, default).
+2. Local dev: the exact commands to install, run and test from a fresh clone.
+3. CI stages: what runs on every push (lint, test, build) with the commands.
+4. Deploy: target platform, build artifact, how a rollback works.
+5. Observability: what gets logged where, and the one health-check endpoint.
+6. Secrets handling: where secrets live per environment; .env.example contract.

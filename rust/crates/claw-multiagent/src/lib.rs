@@ -26,10 +26,11 @@ pub mod agents;
 pub mod catalog;
 pub mod contracts;
 pub mod design;
+pub mod lessons;
 pub mod orchestrator;
 pub mod roles;
 
 pub use catalog::ModelCatalog;
 pub use contracts::{BuildMode, ProjectKind, TaskSpec};
 pub use design::{parse_archetype, DesignArchetype};
-pub use orchestrator::{run, RunOptions, RunSummary};
+pub use orchestrator::{pending_resume_phase, run, RunOptions, RunSummary};

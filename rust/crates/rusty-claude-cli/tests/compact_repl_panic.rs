@@ -1,3 +1,7 @@
+//! REPL PTY tests are unix-only: they drive claw through python's `pty`
+//! module, which does not exist on Windows.
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -6,6 +10,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
 
 #[test]
 fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
@@ -46,7 +63,7 @@ fn compact_slash_command_in_repl_does_not_start_nested_tokio_runtime() {
         "stdout should contain compact report output ({stdout:?})"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 fn run_claw_repl(

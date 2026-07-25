@@ -1069,9 +1069,52 @@ fn strip_ansi(input: &str) -> String {
     output
 }
 
+/// Paints unified-diff output: additions green, deletions red, hunk headers
+/// cyan, file headers bold. No-op when colors are off (piped, NO_COLOR,
+/// `/color off`).
+pub(crate) fn colorize_diff(text: &str) -> String {
+    colorize_diff_with(text, color_output_enabled())
+}
+
+fn colorize_diff_with(text: &str, enabled: bool) -> String {
+    if !enabled {
+        return text.to_string();
+    }
+    text.lines()
+        .map(|line| {
+            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff --git")
+            {
+                format!("\x1b[1m{line}\x1b[0m")
+            } else if line.starts_with('+') {
+                format!("\x1b[32m{line}\x1b[0m")
+            } else if line.starts_with('-') {
+                format!("\x1b[31m{line}\x1b[0m")
+            } else if line.starts_with("@@") {
+                format!("\x1b[36m{line}\x1b[0m")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+    use super::{colorize_diff_with, strip_ansi, MarkdownStreamState, Spinner, TerminalRenderer};
+
+    #[test]
+    fn diff_colorizer_paints_by_line_kind_and_respects_disable() {
+        let diff = "diff --git a/x b/x\n+++ b/x\n@@ -1,2 +1,2 @@\n+añadida\n-borrada\n contexto";
+        let painted = colorize_diff_with(diff, true);
+        assert!(painted.contains("\x1b[32m+añadida\x1b[0m"));
+        assert!(painted.contains("\x1b[31m-borrada\x1b[0m"));
+        assert!(painted.contains("\x1b[36m@@ -1,2 +1,2 @@\x1b[0m"));
+        // File headers are bold, never red/green despite the +/- prefix.
+        assert!(painted.contains("\x1b[1m+++ b/x\x1b[0m"));
+        assert!(painted.contains(" contexto"));
+        assert_eq!(colorize_diff_with(diff, false), diff);
+    }
 
     #[test]
     fn renders_markdown_with_styling_and_lists() {

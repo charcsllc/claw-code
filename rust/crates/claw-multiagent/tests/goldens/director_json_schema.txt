@@ -1,0 +1,16 @@
+Respond with a single ```json fenced object:
+{
+  "vision": "...", "scope": ["..."],
+  "non_goals": ["what this build deliberately does NOT include"],
+  "stack": {"kind": "simple|fullstack", "frontend": [], "backend": [], "database": [],
+             "orm": [], "auth": [], "platforms": [], "framework": [], "deploy": [],
+             "justification": "..."},
+  "epics": [{"name": "...", "stories": [{"as_a": "...", "i_want": "...", "so_that": "...",
+             "acceptance_criteria": ["..."]}]}],
+  "page_content": [{"page": "/", "headline": "real copy, not placeholder",
+             "subheadline": "...", "ctas": ["primary CTA label"]}],
+  "milestones": ["..."], "risks": ["..."], "open_questions": ["..."]
+}
+Write REAL, publishable copy in page_content for every page the scope implies —
+downstream agents use it verbatim; placeholder text there becomes lorem ipsum in
+the product. non_goals is binding: nothing listed there gets built.

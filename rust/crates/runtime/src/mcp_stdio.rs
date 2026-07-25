@@ -1425,7 +1425,7 @@ fn default_initialize_params() -> McpInitializeParams {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
@@ -1439,17 +1439,16 @@ mod tests {
     use tokio::runtime::Builder;
 
     use crate::config::{
-        ConfigSource, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-        McpStdioServerConfig, McpWebSocketServerConfig, ScopedMcpServerConfig,
+        ConfigSource, McpServerConfig, McpStdioServerConfig, ScopedMcpServerConfig,
     };
     use crate::mcp::mcp_tool_name;
     use crate::mcp_client::McpClientBootstrap;
 
     use super::{
-        spawn_mcp_stdio_process, unsupported_server_failed_server, JsonRpcId, JsonRpcRequest,
-        JsonRpcResponse, McpInitializeClientInfo, McpInitializeParams, McpInitializeResult,
-        McpInitializeServerInfo, McpListToolsResult, McpReadResourceParams, McpReadResourceResult,
-        McpServerManager, McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
+        spawn_mcp_stdio_process, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
+        McpInitializeClientInfo, McpInitializeParams, McpInitializeResult, McpInitializeServerInfo,
+        McpListToolsResult, McpReadResourceParams, McpReadResourceResult, McpServerManager,
+        McpServerManagerError, McpStdioProcess, McpTool, McpToolCallParams,
     };
     use crate::McpLifecyclePhase;
 
@@ -1891,20 +1890,6 @@ mod tests {
 
             cleanup_script(&script_path);
         });
-    }
-
-    #[test]
-    fn rejects_non_stdio_bootstrap() {
-        let config = ScopedMcpServerConfig {
-            required: false,
-            scope: ConfigSource::Local,
-            config: McpServerConfig::Sdk(crate::config::McpSdkServerConfig {
-                name: "sdk-server".to_string(),
-            }),
-        };
-        let bootstrap = McpClientBootstrap::from_scoped_config("sdk server", &config);
-        let error = spawn_mcp_stdio_process(&bootstrap).expect_err("non-stdio should fail");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -2825,62 +2810,6 @@ mod tests {
     }
 
     #[test]
-    fn manager_records_unsupported_non_stdio_servers_without_panicking() {
-        let servers = BTreeMap::from([
-            (
-                "http".to_string(),
-                ScopedMcpServerConfig {
-                    required: true,
-                    scope: ConfigSource::Local,
-                    config: McpServerConfig::Http(McpRemoteServerConfig {
-                        url: "https://example.test/mcp".to_string(),
-                        headers: BTreeMap::new(),
-                        headers_helper: None,
-                        oauth: None,
-                    }),
-                },
-            ),
-            (
-                "sdk".to_string(),
-                ScopedMcpServerConfig {
-                    required: false,
-                    scope: ConfigSource::Local,
-                    config: McpServerConfig::Sdk(McpSdkServerConfig {
-                        name: "sdk-server".to_string(),
-                    }),
-                },
-            ),
-            (
-                "ws".to_string(),
-                ScopedMcpServerConfig {
-                    required: false,
-                    scope: ConfigSource::Local,
-                    config: McpServerConfig::Ws(McpWebSocketServerConfig {
-                        url: "wss://example.test/mcp".to_string(),
-                        headers: BTreeMap::new(),
-                        headers_helper: None,
-                    }),
-                },
-            ),
-        ]);
-
-        let manager = McpServerManager::from_servers(&servers);
-        let unsupported = manager.unsupported_servers();
-
-        assert_eq!(unsupported.len(), 3);
-        assert_eq!(unsupported[0].server_name, "http");
-        assert!(unsupported[0].required);
-        assert_eq!(unsupported[1].server_name, "sdk");
-        assert_eq!(unsupported[2].server_name, "ws");
-        let failed = unsupported_server_failed_server(&unsupported[0]);
-        assert_eq!(failed.phase, McpLifecyclePhase::ServerRegistration);
-        assert_eq!(
-            failed.error.context.get("required").map(String::as_str),
-            Some("true")
-        );
-    }
-
-    #[test]
     fn manager_shutdown_terminates_spawned_children_and_is_idempotent() {
         let runtime = Builder::new_current_thread()
             .enable_all()
@@ -2983,5 +2912,90 @@ mod tests {
 
             cleanup_script(&script_path);
         });
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+
+    use crate::config::{
+        ConfigSource, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
+        McpWebSocketServerConfig, ScopedMcpServerConfig,
+    };
+    use crate::mcp_client::McpClientBootstrap;
+    use crate::McpLifecyclePhase;
+
+    use super::{spawn_mcp_stdio_process, unsupported_server_failed_server, McpServerManager};
+
+    #[test]
+    fn rejects_non_stdio_bootstrap() {
+        let config = ScopedMcpServerConfig {
+            required: false,
+            scope: ConfigSource::Local,
+            config: McpServerConfig::Sdk(McpSdkServerConfig {
+                name: "sdk-server".to_string(),
+            }),
+        };
+        let bootstrap = McpClientBootstrap::from_scoped_config("sdk server", &config);
+        let error = spawn_mcp_stdio_process(&bootstrap).expect_err("non-stdio should fail");
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn manager_records_unsupported_non_stdio_servers_without_panicking() {
+        let servers = BTreeMap::from([
+            (
+                "http".to_string(),
+                ScopedMcpServerConfig {
+                    required: true,
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Http(McpRemoteServerConfig {
+                        url: "https://example.test/mcp".to_string(),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                        oauth: None,
+                    }),
+                },
+            ),
+            (
+                "sdk".to_string(),
+                ScopedMcpServerConfig {
+                    required: false,
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Sdk(McpSdkServerConfig {
+                        name: "sdk-server".to_string(),
+                    }),
+                },
+            ),
+            (
+                "ws".to_string(),
+                ScopedMcpServerConfig {
+                    required: false,
+                    scope: ConfigSource::Local,
+                    config: McpServerConfig::Ws(McpWebSocketServerConfig {
+                        url: "wss://example.test/mcp".to_string(),
+                        headers: BTreeMap::new(),
+                        headers_helper: None,
+                    }),
+                },
+            ),
+        ]);
+
+        let manager = McpServerManager::from_servers(&servers);
+        let unsupported = manager.unsupported_servers();
+
+        assert_eq!(unsupported.len(), 3);
+        assert_eq!(unsupported[0].server_name, "http");
+        assert!(unsupported[0].required);
+        assert_eq!(unsupported[1].server_name, "sdk");
+        assert_eq!(unsupported[2].server_name, "ws");
+        let failed = unsupported_server_failed_server(&unsupported[0]);
+        assert_eq!(failed.phase, McpLifecyclePhase::ServerRegistration);
+        assert_eq!(
+            failed.error.context.get("required").map(String::as_str),
+            Some("true")
+        );
     }
 }

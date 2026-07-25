@@ -85,48 +85,49 @@ impl Role {
     pub const fn responsibility(self) -> &'static str {
         match self {
             Self::Director => {
-                "Interpreta el prompt, completa requisitos, define visión, alcance, \
-                 roadmap, épicas, historias, criterios de aceptación, riesgos y stack."
+                "Interprets the prompt, completes requirements, and defines vision, \
+                 scope, roadmap, epics, stories, acceptance criteria, risks and stack."
             }
             Self::Subdirector => {
-                "Convierte el plan en tareas ejecutables: módulos, bounded contexts, \
-                 dependencias, complejidad, paralelización y modelo de IA por tarea."
+                "Turns the plan into executable tasks: modules, bounded contexts, \
+                 dependencies, complexity, parallelization and AI model per task."
             }
             Self::SoftwareArchitect => {
-                "Diseña capas, interfaces, casos de uso, entidades, eventos e \
-                 inyección de dependencias, justificando cada decisión."
+                "Designs layers, interfaces, use cases, entities, events and \
+                 dependency injection, justifying every decision."
             }
             Self::FrontendArchitect => {
-                "Define UX/UI, design system, componentes, props, estados, rutas, \
-                 accesibilidad, SEO y performance."
+                "Defines UX/UI, design system, components, props, states, routes, \
+                 accessibility, SEO and performance."
             }
             Self::BackendArchitect => {
-                "Diseña API, contratos, endpoints, DTO, validaciones, seguridad, \
-                 colas, cache y observabilidad (OpenAPI incluido)."
+                "Designs API, contracts, endpoints, DTOs, validations, security, \
+                 queues, cache and observability (OpenAPI included)."
             }
-            Self::DevOpsArchitect => "Diseña Docker, CI/CD, entornos, secrets y monitoring.",
+            Self::DevOpsArchitect => "Designs Docker, CI/CD, environments, secrets and monitoring.",
             Self::UxUiDesigner => {
-                "Autoridad de diseño gráfico: dirección de arte por arquetipo de \
-                 producto, sistema de tokens (superficies, tinta, marca, estados, \
-                 slots de datos CVD-safe), jerarquía tipográfica, layout y grid, \
-                 componentes con todos sus estados (hover/focus-visible/disabled/\
-                 loading/error/empty), dark mode, movimiento y accesibilidad \
-                 WCAG AA — todo con valores concretos, nunca adjetivos."
+                "Graphic design authority: art direction per product archetype, \
+                 token system (surfaces, ink, brand, status, CVD-safe data slots), \
+                 typographic hierarchy, layout and grid, components with all their \
+                 states (hover/focus-visible/disabled/loading/error/empty), dark \
+                 mode, motion and WCAG AA accessibility — always concrete values, \
+                 never adjectives."
             }
             Self::Developer => {
-                "Implementa exactamente su TaskSpec dentro de su módulo, sin tocar \
-                 archivos de otros módulos."
+                "Implements exactly its TaskSpec inside its module, never touching \
+                 files owned by other modules."
             }
             Self::Supervisor => {
-                "Revisa cada entrega al terminar: calidad, arquitectura, duplicidad, \
-                 seguridad. Registra bugs/fixes en SUPERVISION.md y deriva al Técnico."
+                "Reviews every delivery on completion: quality, architecture, \
+                 duplication, security. Records bugs/fixes in SUPERVISION.md and \
+                 dispatches the Fixer."
             }
-            Self::Fixer => "Aplica las correcciones reportadas por el Supervisor.",
+            Self::Fixer => "Applies the corrections reported by the Supervisor.",
             Self::Qa => {
-                "Genera y ejecuta unit/integration/E2E/smoke tests y valida \
-                 cobertura, errores y accesibilidad."
+                "Generates and runs unit/integration/E2E/smoke tests and validates \
+                 coverage, error handling and accessibility."
             }
-            Self::Docs => "Mantiene README, arquitectura, ADRs, changelog y guías al día.",
+            Self::Docs => "Keeps README, architecture docs, ADRs, changelog and guides current.",
         }
     }
 }
@@ -134,6 +135,77 @@ impl Role {
 const QUALITY_RULES: &str = "Quality rules (mandatory): SOLID, DRY, KISS, YAGNI, Clean \
 Architecture, high cohesion / low coupling, strict typing, security by default, tests, \
 and documented decisions. Architecture quality beats implementation speed.";
+
+/// Structured brief per architect: mandatory sections their design document
+/// must cover. The generic "deliver your design document" left every
+/// architect except the designer rudderless — a checklist of concrete
+/// deliverables is what turns a plan into implementable specs.
+#[must_use]
+pub fn architect_planning_brief(role: Role) -> &'static str {
+    match role {
+        Role::SoftwareArchitect => {
+            "\n\nYour design document MUST contain these sections, each with \
+             concrete values (names, paths, signatures — never adjectives):\n\
+             1. Module map: every module with its directory, single responsibility \
+             and owned files.\n\
+             2. Boundaries: which module may import which (a dependency diagram in \
+             text form); forbidden imports called out explicitly.\n\
+             3. Shared contracts: the exact types/interfaces shared across modules, \
+             with the file that owns each one.\n\
+             4. Data flow: how a request travels through the system for the two \
+             most important user stories, step by step.\n\
+             5. Error strategy: error types, where they are caught, what the user \
+             sees, what gets logged.\n\
+             6. Non-functional budgets: bundle size, response time targets, and \
+             what to measure."
+        }
+        Role::FrontendArchitect => {
+            "\n\nYour design document MUST contain these sections, each with \
+             concrete values:\n\
+             1. Route tree: every route, its page component file, and whether it is \
+             static, server-rendered or client-only.\n\
+             2. Data fetching per route: which data, from which endpoint, fetched \
+             where (loader/server/client), with loading and error states named.\n\
+             3. State management: what lives in URL, what in local state, what in a \
+             store (and WHICH store) — justify anything global.\n\
+             4. Component hierarchy for the 3 most complex pages (tree of component \
+             names mapped to files).\n\
+             5. Forms: validation library, error display pattern, submit states.\n\
+             6. Performance plan: code-splitting points, image strategy, what gets \
+             lazy-loaded."
+        }
+        Role::BackendArchitect => {
+            "\n\nYour design document MUST contain these sections, each with \
+             concrete values:\n\
+             1. Endpoint table: method, path, auth requirement, request DTO, \
+             response DTO, error codes — one row per endpoint, NO exceptions.\n\
+             2. Data model: every entity with fields, types, relations and indexes \
+             (text ERD).\n\
+             3. Validation: which layer validates what, with the library named.\n\
+             4. AuthN/AuthZ: token/session mechanism, where checks happen, role \
+             model if any.\n\
+             5. Error contract: the exact JSON error envelope every endpoint \
+             returns.\n\
+             6. Migrations & seed strategy: tool, naming, how dev data is seeded."
+        }
+        Role::DevOpsArchitect => {
+            "\n\nYour design document MUST contain these sections, each with \
+             concrete values:\n\
+             1. Environment matrix: dev/staging/prod × every env var (name, \
+             purpose, secret or not, default).\n\
+             2. Local dev: the exact commands to install, run and test from a \
+             fresh clone.\n\
+             3. CI stages: what runs on every push (lint, test, build) with the \
+             commands.\n\
+             4. Deploy: target platform, build artifact, how a rollback works.\n\
+             5. Observability: what gets logged where, and the one health-check \
+             endpoint.\n\
+             6. Secrets handling: where secrets live per environment; .env.example \
+             contract."
+        }
+        _ => "",
+    }
+}
 
 /// System prompt for a role, in the context of a WEB or APP build.
 #[must_use]
@@ -155,7 +227,10 @@ pub fn system_prompt(role: Role, kind: ProjectKind) -> String {
     };
     format!(
         "You are the {title} in an autonomous multi-agent software platform.\n\
-         Responsibility: {responsibility}\n\n{aplicativo}\n\n{QUALITY_RULES}",
+         Responsibility: {responsibility}\n\n{aplicativo}\n\n{QUALITY_RULES}\n\n\
+         Language: write all USER-FACING text (page copy, README, docs/, UI \
+         strings, commit-visible summaries) in the language of the user's \
+         original prompt; keep code identifiers and comments in English.",
         title = role.title(),
         responsibility = role.responsibility(),
     )
@@ -323,7 +398,34 @@ mod tests {
         let web = system_prompt(Role::Director, ProjectKind::Web);
         assert!(web.contains("WEB project"));
         assert!(web.contains("SOLID"));
+        // User-facing output follows the user's language; code stays English.
+        assert!(web.contains("language of the user's original prompt"));
         let app = system_prompt(Role::Developer, ProjectKind::App);
         assert!(app.contains("Electron, Tauri, Flutter"));
+    }
+
+    #[test]
+    fn every_planning_architect_gets_a_structured_brief() {
+        for role in [
+            Role::SoftwareArchitect,
+            Role::FrontendArchitect,
+            Role::BackendArchitect,
+            Role::DevOpsArchitect,
+        ] {
+            let brief = architect_planning_brief(role);
+            assert!(
+                brief.contains("MUST contain these sections"),
+                "{role:?} has a mandatory-sections brief"
+            );
+            assert!(brief.contains("6."), "{role:?} brief has 6 sections");
+        }
+        // Each brief is role-specific, not a copy.
+        assert!(architect_planning_brief(Role::BackendArchitect).contains("Endpoint table"));
+        assert!(architect_planning_brief(Role::FrontendArchitect).contains("Route tree"));
+        assert!(architect_planning_brief(Role::SoftwareArchitect).contains("Module map"));
+        assert!(architect_planning_brief(Role::DevOpsArchitect).contains("Environment matrix"));
+        // Non-architect roles get nothing extra (the designer has its own).
+        assert!(architect_planning_brief(Role::Developer).is_empty());
+        assert!(architect_planning_brief(Role::UxUiDesigner).is_empty());
     }
 }

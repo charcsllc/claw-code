@@ -8,8 +8,8 @@ use aspect_std::LoggingAspect;
 
 use api::{
     max_tokens_for_model, model_family_identity_for, resolve_model_alias, AnalyticsEvent, ApiError,
-    ContentBlockDelta, InputContentBlock, InputMessage, JsonlTelemetrySink, MessageRequest,
-    MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
+    ContentBlockDelta, ImageAttachment, InputContentBlock, InputMessage, JsonlTelemetrySink,
+    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient, SessionTracer,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -677,7 +677,21 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "prompt": { "type": "string" },
                     "subagent_type": { "type": "string" },
                     "name": { "type": "string" },
-                    "model": { "type": "string" }
+                    "model": { "type": "string" },
+                    "images": {
+                        "type": "array",
+                        "description": "Base64 images attached to the agent's initial message (max 4, max 1.5 MB base64 each).",
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "media_type": { "type": "string" },
+                                "base64_data": { "type": "string" }
+                            },
+                            "required": ["media_type", "base64_data"],
+                            "additionalProperties": false
+                        }
+                    }
                 },
                 "required": ["description", "prompt"],
                 "additionalProperties": false
@@ -2244,7 +2258,23 @@ fn has_dangerous_paths(command: &str) -> bool {
         }
 
         if looks_like_windows_absolute_path(token) {
-            return true;
+            // On unix a drive-letter token is out of place — treat it as
+            // outside. On Windows it is an ordinary absolute path: deny only
+            // when it resolves outside the workspace (mirroring the unix
+            // absolute-path branch below).
+            if !cfg!(windows) {
+                return true;
+            }
+            match cwd.as_ref() {
+                Some(cwd) => {
+                    let resolved = canonicalize_allow_missing(Path::new(token));
+                    if !resolved.starts_with(cwd) {
+                        return true;
+                    }
+                }
+                None => return true,
+            }
+            continue;
         }
 
         // Check for absolute paths
@@ -2282,6 +2312,31 @@ fn has_dangerous_paths(command: &str) -> bool {
     }
 
     false
+}
+
+/// Canonicalizes `path`, falling back to canonicalizing the deepest existing
+/// ancestor and rejoining the missing suffix — keeps not-yet-created paths
+/// comparable with canonicalized roots (Windows 8.3 short vs long forms).
+fn canonicalize_allow_missing(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut existing = path;
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(canonical) = parent.canonicalize() {
+            let mut resolved = canonical;
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        existing = parent;
+    }
+    path.to_path_buf()
 }
 
 fn looks_like_windows_absolute_path(token: &str) -> bool {
@@ -2599,7 +2654,7 @@ fn path_within_current_workspace(path: &str, allow_missing: bool) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -2695,7 +2750,7 @@ fn is_within_workspace(path: &str) -> bool {
             '"' | '\'' | '`' | ',' | ';' | ')' | '(' | '[' | ']' | '{' | '}'
         )
     });
-    if looks_like_windows_absolute_path(trimmed) {
+    if !cfg!(windows) && looks_like_windows_absolute_path(trimmed) {
         return false;
     }
 
@@ -2837,6 +2892,52 @@ struct AgentInput {
     model: Option<String>,
     /// Module isolation: restrict file-writing tools to these path prefixes.
     allowed_write_paths: Option<Vec<String>>,
+    /// Base64 images attached to the agent's initial user message (visual
+    /// QA hand-off). Capped by [`validate_agent_images`].
+    images: Option<Vec<AgentImageInput>>,
+}
+
+/// One base64 image handed to a sub-agent through the `Agent` tool input.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct AgentImageInput {
+    media_type: String,
+    base64_data: String,
+}
+
+/// Defensive caps for `Agent` tool image attachments: more images or bigger
+/// payloads than this and the sub-agent request would blow provider body
+/// limits long before producing value.
+const MAX_AGENT_IMAGES: usize = 4;
+const MAX_AGENT_IMAGE_BASE64_BYTES: usize = 3 * 512 * 1024; // 1.5 MB
+
+/// Validates `Agent` tool image attachments against the defensive caps,
+/// returning a clear, field-indexed error message on the first violation.
+fn validate_agent_images(images: &[AgentImageInput]) -> Result<(), String> {
+    if images.len() > MAX_AGENT_IMAGES {
+        return Err(format!(
+            "images: at most {MAX_AGENT_IMAGES} images are allowed per agent, got {}",
+            images.len()
+        ));
+    }
+    for (index, image) in images.iter().enumerate() {
+        if !image.media_type.starts_with("image/") {
+            return Err(format!(
+                "images[{index}]: media_type must be an image/* MIME type, got `{}`",
+                image.media_type
+            ));
+        }
+        if image.base64_data.trim().is_empty() {
+            return Err(format!("images[{index}]: base64_data must not be empty"));
+        }
+        if image.base64_data.len() > MAX_AGENT_IMAGE_BASE64_BYTES {
+            return Err(format!(
+                "images[{index}]: base64 payload is {} bytes, above the \
+                 {MAX_AGENT_IMAGE_BASE64_BYTES}-byte (1.5 MB) per-image limit",
+                image.base64_data.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3223,6 +3324,8 @@ struct AgentOutput {
 struct AgentJob {
     manifest: AgentOutput,
     prompt: String,
+    /// Validated image attachments for the job's opening user message.
+    images: Vec<AgentImageInput>,
     system_prompt: Vec<String>,
     allowed_tools: BTreeSet<String>,
     allowed_write_paths: Vec<PathBuf>,
@@ -4105,6 +4208,10 @@ where
     if input.prompt.trim().is_empty() {
         return Err(String::from("prompt must not be empty"));
     }
+    // Enforce image caps before any disk state is created so an oversized
+    // request leaves no half-written manifest behind.
+    let images = input.images.unwrap_or_default();
+    validate_agent_images(&images)?;
 
     let agent_id = make_agent_id();
     let output_dir = agent_store_dir()?;
@@ -4170,6 +4277,7 @@ where
     let job = AgentJob {
         manifest: manifest_for_spawn,
         prompt: input.prompt,
+        images,
         system_prompt,
         allowed_tools,
         allowed_write_paths: input
@@ -4188,18 +4296,133 @@ where
     Ok(manifest)
 }
 
+/// Process-wide queue of one-line notices emitted when a background agent
+/// job reaches a terminal state (`completed`/`failed`/`cancelled`). The REPL
+/// drains it between prompts via [`take_agent_notices`] to print
+/// "agent finished" lines without polling manifests.
+static AGENT_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Agent ids that already produced their terminal notice. Terminal
+/// persistence can legitimately run twice for one job (e.g. an explicit stop
+/// races the job thread's own failure path); only the first transition
+/// should notify.
+static NOTIFIED_TERMINAL_AGENT_IDS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Oldest notices are discarded once the queue holds this many entries, so
+/// an unattended REPL session cannot accumulate unbounded strings.
+const AGENT_NOTICES_CAP: usize = 50;
+
+/// Shortened form of `agent-<nanos>` ids for terminal notices: the
+/// `agent-` prefix is dropped and the remainder is capped at 8 characters
+/// (respecting UTF-8 boundaries for externally-produced ids).
+fn short_agent_id(agent_id: &str) -> &str {
+    let bare = agent_id.strip_prefix("agent-").unwrap_or(agent_id);
+    match bare.char_indices().nth(8) {
+        Some((byte_index, _)) => &bare[..byte_index],
+        None => bare,
+    }
+}
+
+/// Queues the terminal notice for one agent job, deduplicated per agent id
+/// and capped at [`AGENT_NOTICES_CAP`] entries (oldest dropped first).
+fn push_agent_notice(agent_id: &str, name: &str, status: &str) {
+    let mut notified = NOTIFIED_TERMINAL_AGENT_IDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !notified.insert(agent_id.to_string()) {
+        return;
+    }
+    let symbol = if status == "completed" { "✔" } else { "✘" };
+    let notice = format!(
+        "{symbol} agente {} ({name}) → {status}",
+        short_agent_id(agent_id)
+    );
+    let mut notices = AGENT_NOTICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    notices.push(notice);
+    if notices.len() > AGENT_NOTICES_CAP {
+        let excess = notices.len() - AGENT_NOTICES_CAP;
+        notices.drain(..excess);
+    }
+}
+
+/// Drains and returns all queued terminal notices for background agent
+/// jobs, oldest first. Intended for the interactive REPL loop, which prints
+/// them between prompts.
+#[must_use]
+pub fn take_agent_notices() -> Vec<String> {
+    std::mem::take(
+        &mut *AGENT_NOTICES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Process-global registry of cooperative cancellation flags for running
+/// agent job threads, keyed by agent id. [`request_agent_stop`] sets a flag;
+/// the job's conversation loop checks it between iterations/tool calls.
+fn agent_cancel_registry() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        >,
+    > = OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Registers (or returns the existing) cancellation flag for an agent id.
+fn register_agent_cancel_flag(agent_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(agent_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .clone()
+}
+
+fn unregister_agent_cancel_flag(agent_id: &str) {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(agent_id);
+}
+
+fn registered_agent_cancel_flag(
+    agent_id: &str,
+) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    agent_cancel_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(agent_id)
+        .cloned()
+}
+
 fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
     let thread_name = format!("clawd-agent-{}", job.manifest.agent_id);
+    let cancel_flag = register_agent_cancel_flag(&job.manifest.agent_id);
     std::thread::Builder::new()
         .name(thread_name)
         .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_agent_job(&job)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_agent_job(&job, &cancel_flag)
+            }));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    let _ =
-                        persist_agent_terminal_state(&job.manifest, "failed", None, Some(error));
+                    // A cancellation request surfaces as a turn error; keep
+                    // the terminal state honest by persisting "cancelled"
+                    // instead of "failed" when the flag is set.
+                    let status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let _ = persist_agent_terminal_state(&job.manifest, status, None, Some(error));
                 }
                 Err(_) => {
                     let _ = persist_agent_terminal_state(
@@ -4210,18 +4433,44 @@ fn spawn_agent_job(job: AgentJob) -> Result<(), String> {
                     );
                 }
             }
+            unregister_agent_cancel_flag(&job.manifest.agent_id);
         })
         .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
-fn run_agent_job(job: &AgentJob) -> Result<(), String> {
-    let mut runtime = build_agent_runtime(job)?.with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS);
+fn run_agent_job(
+    job: &AgentJob,
+    cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let mut runtime = build_agent_runtime(job)?
+        .with_max_iterations(DEFAULT_AGENT_MAX_ITERATIONS)
+        .with_cancellation_flag(std::sync::Arc::clone(cancel_flag));
     let summary = runtime
-        .run_turn(job.prompt.clone(), None)
+        .run_turn_message(agent_initial_message(&job.prompt, &job.images), None)
         .map_err(|error| error.to_string())?;
     let final_text = final_assistant_text(&summary);
     persist_agent_terminal_state(&job.manifest, "completed", Some(final_text.as_str()), None)
+}
+
+/// Builds the sub-agent's opening user message: image attachments first
+/// (matching the provider serialization order), then the prompt text.
+fn agent_initial_message(prompt: &str, images: &[AgentImageInput]) -> ConversationMessage {
+    let mut blocks: Vec<ContentBlock> = images
+        .iter()
+        .map(|image| ContentBlock::Image {
+            media_type: image.media_type.clone(),
+            base64_data: image.base64_data.clone(),
+        })
+        .collect();
+    blocks.push(ContentBlock::Text {
+        text: prompt.to_string(),
+    });
+    ConversationMessage {
+        role: MessageRole::User,
+        blocks,
+        usage: None,
+    }
 }
 
 fn build_agent_runtime(
@@ -4383,6 +4632,9 @@ fn persist_agent_terminal_state(
     result: Option<&str>,
     error: Option<String>,
 ) -> Result<(), String> {
+    // Notify before touching disk so the REPL learns about the terminal
+    // transition even when manifest/output persistence fails below.
+    push_agent_notice(&manifest.agent_id, &manifest.name, status);
     if let Some(tracer) = dashboard_agent_tracer(&manifest.agent_id) {
         let event = if status == "completed" {
             AnalyticsEvent::agent_finished(&manifest.agent_id)
@@ -5547,13 +5799,22 @@ fn tool_specs_for_allowed_tools(allowed_tools: Option<&BTreeSet<String>>) -> Vec
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+    // Only the most recent user turn re-sends real image payloads: that is
+    // the turn the model is being asked about, and re-uploading megabytes of
+    // base64 for every older message would balloon each request. Earlier
+    // image blocks degrade to their size placeholder.
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role == MessageRole::User);
     messages
         .iter()
-        .filter_map(|message| {
+        .enumerate()
+        .filter_map(|(index, message)| {
             let role = match message.role {
                 MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
                 MessageRole::Assistant => "assistant",
             };
+            let images_travel = last_user_index == Some(index);
             let content = message
                 .blocks
                 .iter()
@@ -5584,6 +5845,24 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
+                    ContentBlock::Image {
+                        media_type,
+                        base64_data,
+                    } => {
+                        if images_travel {
+                            InputContentBlock::from(ImageAttachment {
+                                media_type: media_type.clone(),
+                                base64_data: base64_data.clone(),
+                            })
+                        } else {
+                            InputContentBlock::Text {
+                                text: runtime::image_placeholder_text(
+                                    media_type,
+                                    base64_data.len(),
+                                ),
+                            }
+                        }
+                    }
                 })
                 .filter(
                     |block| !matches!(block, InputContentBlock::Text { text } if text.is_empty()),
@@ -5920,6 +6199,105 @@ fn normalize_agent_job_status(status: &str) -> String {
         "completed" => String::from("done"),
         other => other.to_string(),
     }
+}
+
+/// Requests cooperative cancellation of a background agent job identified by
+/// a (unique) id prefix.
+///
+/// The job's conversation loop checks the shared flag between iterations and
+/// between tool calls, so cancellation lands "between steps": an in-flight
+/// API request or tool call always finishes first, then the job aborts
+/// cleanly and its manifest is persisted as `cancelled`. Jobs whose manifest
+/// says `running` but whose thread does not live in this process (stale
+/// manifests from a previous run) are marked `cancelled` directly.
+///
+/// Returns a human-readable status message, or an error when the prefix is
+/// empty, matches no job, or is ambiguous.
+pub fn request_agent_stop(id_prefix: &str) -> Result<String, String> {
+    let dir = agent_store_dir()?;
+    request_agent_stop_in(&dir, id_prefix)
+}
+
+/// Directory-injected core of [`request_agent_stop`] so tests can drive it
+/// against a temp store without mutating the process environment.
+fn request_agent_stop_in(dir: &Path, id_prefix: &str) -> Result<String, String> {
+    let prefix = id_prefix.trim();
+    if prefix.is_empty() {
+        return Err(String::from("agent id prefix must not be empty"));
+    }
+
+    let mut matches: Vec<AgentOutput> = agent_manifests_in(dir)
+        .into_iter()
+        .filter(|manifest| manifest.agent_id.starts_with(prefix))
+        .collect();
+    matches.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    if matches.is_empty() {
+        return Err(format!("no agent job matches id prefix `{prefix}`"));
+    }
+    if matches.len() > 1 {
+        let ids: Vec<&str> = matches
+            .iter()
+            .map(|manifest| manifest.agent_id.as_str())
+            .collect();
+        return Err(format!(
+            "agent id prefix `{prefix}` is ambiguous; matches: {}",
+            ids.join(", ")
+        ));
+    }
+    let manifest = matches.remove(0);
+
+    if manifest.status != "running" {
+        return Ok(format!(
+            "agent job {} is already {} — nothing to cancel",
+            manifest.agent_id,
+            normalize_agent_job_status(&manifest.status)
+        ));
+    }
+
+    if let Some(flag) = registered_agent_cancel_flag(&manifest.agent_id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        return Ok(format!(
+            "cancellation requested for agent job {}; it stops between steps (an in-flight \
+             tool call or API request finishes first)",
+            manifest.agent_id
+        ));
+    }
+
+    // The manifest claims "running" but no thread in this process owns it:
+    // a stale entry from a previous run. Mark it cancelled directly so the
+    // store stops listing it as live.
+    persist_agent_terminal_state(
+        &manifest,
+        "cancelled",
+        None,
+        Some(String::from(
+            "cancelled via request_agent_stop; job was not running in this process",
+        )),
+    )?;
+    Ok(format!(
+        "agent job {} was not running in this process; manifest marked cancelled",
+        manifest.agent_id
+    ))
+}
+
+/// Reads every parseable agent manifest under `dir`.
+fn agent_manifests_in(dir: &Path) -> Vec<AgentOutput> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|entry| {
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            serde_json::from_str::<AgentOutput>(&contents).ok()
+        })
+        .collect()
 }
 
 /// Builds a telemetry tracer for a sub-agent when `CLAW_DASHBOARD_EVENTS`
@@ -7119,8 +7497,10 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, extract_recovery_outcome,
         final_assistant_text, global_cron_registry, maybe_commit_provenance, mvp_tool_specs,
         permission_mode_from_plugin, persist_agent_terminal_state, push_output_block,
-        run_task_packet, AgentInput, AgentJob, GlobalToolRegistry, LaneEventName, LaneFailureClass,
-        ProviderRuntimeClient, SubagentToolExecutor,
+        register_agent_cancel_flag, registered_agent_cancel_flag, request_agent_stop_in,
+        run_task_packet, unregister_agent_cancel_flag, AgentInput, AgentJob, AgentOutput,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::ProviderFallbackConfig;
@@ -7184,6 +7564,355 @@ mod tests {
                  tool: nested agents would allow unbounded recursion"
             );
         }
+    }
+
+    #[test]
+    fn agent_input_parses_optional_images_field() {
+        let input: AgentInput = serde_json::from_value(json!({
+            "description": "Visual QA",
+            "prompt": "Compare the screenshot against the spec.",
+            "images": [
+                { "media_type": "image/png", "base64_data": "aGVsbG8=" },
+                { "media_type": "image/jpeg", "base64_data": "d29ybGQ=" }
+            ]
+        }))
+        .expect("images payload should deserialize");
+
+        let images = input.images.expect("images should be present");
+        assert_eq!(
+            images,
+            vec![
+                super::AgentImageInput {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                super::AgentImageInput {
+                    media_type: "image/jpeg".to_string(),
+                    base64_data: "d29ybGQ=".to_string(),
+                },
+            ]
+        );
+
+        // Legacy payloads without the field keep parsing.
+        let legacy: AgentInput = serde_json::from_value(json!({
+            "description": "No images",
+            "prompt": "text only"
+        }))
+        .expect("legacy payload should deserialize");
+        assert!(legacy.images.is_none());
+
+        // The advertised tool schema exposes the new field with its cap.
+        let specs = mvp_tool_specs();
+        let agent_spec = specs
+            .iter()
+            .find(|spec| spec.name == "Agent")
+            .expect("Agent tool spec exists");
+        assert_eq!(
+            agent_spec.input_schema["properties"]["images"]["maxItems"],
+            json!(4)
+        );
+    }
+
+    #[test]
+    fn validate_agent_images_enforces_defensive_caps() {
+        let ok_image = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "aGVsbG8=".to_string(),
+        };
+        assert_eq!(
+            super::validate_agent_images(std::slice::from_ref(&ok_image)),
+            Ok(())
+        );
+
+        let five = vec![ok_image.clone(); 5];
+        let error = super::validate_agent_images(&five).expect_err("five images exceed the cap");
+        assert!(
+            error.contains("at most 4 images") && error.contains("got 5"),
+            "count error should be self-explanatory: {error}"
+        );
+
+        let oversized = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "A".repeat(super::MAX_AGENT_IMAGE_BASE64_BYTES + 1),
+        };
+        let error = super::validate_agent_images(&[ok_image.clone(), oversized])
+            .expect_err("oversized payload must be rejected");
+        assert!(
+            error.contains("images[1]") && error.contains("1.5 MB"),
+            "size error should point at the offending image: {error}"
+        );
+
+        let not_an_image = super::AgentImageInput {
+            media_type: "application/pdf".to_string(),
+            base64_data: "aGVsbG8=".to_string(),
+        };
+        let error = super::validate_agent_images(&[not_an_image])
+            .expect_err("non-image MIME types must be rejected");
+        assert!(error.contains("image/*"), "media type error: {error}");
+
+        let empty = super::AgentImageInput {
+            media_type: "image/png".to_string(),
+            base64_data: "   ".to_string(),
+        };
+        let error =
+            super::validate_agent_images(&[empty]).expect_err("blank payloads must be rejected");
+        assert!(error.contains("must not be empty"), "empty error: {error}");
+    }
+
+    /// Cap violations must be rejected before any store IO, so no agent id,
+    /// manifest, or output file is minted for an invalid request (this also
+    /// lets the test run without a CLAWD_AGENT_STORE override).
+    #[test]
+    fn execute_agent_rejects_over_cap_images_before_creating_state() {
+        let images: Vec<super::AgentImageInput> = (0..5)
+            .map(|index| super::AgentImageInput {
+                media_type: "image/png".to_string(),
+                base64_data: format!("cGF5bG9hZC0{index}"),
+            })
+            .collect();
+        let error = execute_agent_with_spawn(
+            AgentInput {
+                description: "Visual QA".to_string(),
+                prompt: "look at these".to_string(),
+                subagent_type: None,
+                name: None,
+                model: None,
+                allowed_write_paths: None,
+                images: Some(images),
+            },
+            |_job| panic!("spawn must not be reached when validation fails"),
+        )
+        .expect_err("five images must be rejected");
+        assert!(error.contains("at most 4 images"), "error: {error}");
+    }
+
+    /// The job's opening user message carries image blocks first, then the
+    /// prompt text, matching the provider serialization order.
+    #[test]
+    fn agent_initial_message_orders_images_before_prompt_text() {
+        let message = super::agent_initial_message(
+            "compare against the mock",
+            &[super::AgentImageInput {
+                media_type: "image/png".to_string(),
+                base64_data: "aGVsbG8=".to_string(),
+            }],
+        );
+
+        assert_eq!(message.role, runtime::MessageRole::User);
+        assert_eq!(
+            message.blocks,
+            vec![
+                runtime::ContentBlock::Image {
+                    media_type: "image/png".to_string(),
+                    base64_data: "aGVsbG8=".to_string(),
+                },
+                runtime::ContentBlock::Text {
+                    text: "compare against the mock".to_string(),
+                },
+            ]
+        );
+
+        // Without images the message is exactly the classic text-only turn.
+        let text_only = super::agent_initial_message("just text", &[]);
+        assert_eq!(
+            text_only,
+            runtime::ConversationMessage::user_text("just text")
+        );
+    }
+
+    /// Adapter contract: only the most recent user message re-sends real
+    /// image attachments; older image blocks degrade to size placeholders.
+    #[test]
+    fn convert_messages_forwards_only_last_user_images_as_attachments() {
+        use api::InputContentBlock;
+
+        let old_payload = "b2xk".repeat(512); // 2 KiB
+        let messages = vec![
+            runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![
+                    runtime::ContentBlock::Image {
+                        media_type: "image/png".to_string(),
+                        base64_data: old_payload.clone(),
+                    },
+                    runtime::ContentBlock::Text {
+                        text: "first screenshot".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+            runtime::ConversationMessage::assistant(vec![runtime::ContentBlock::Text {
+                text: "looks fine".to_string(),
+            }]),
+            runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![
+                    runtime::ContentBlock::Image {
+                        media_type: "image/jpeg".to_string(),
+                        base64_data: "bmV3".to_string(),
+                    },
+                    runtime::ContentBlock::Text {
+                        text: "second screenshot".to_string(),
+                    },
+                ],
+                usage: None,
+            },
+        ];
+
+        let converted = super::convert_messages(&messages);
+        assert_eq!(converted.len(), 3);
+
+        // Older user message: image degraded to its placeholder text.
+        assert_eq!(
+            converted[0].content[0],
+            InputContentBlock::Text {
+                text: "[imagen adjunta: image/png, 2 KB]".to_string(),
+            }
+        );
+        // Latest user message: image travels as a real attachment block.
+        assert_eq!(
+            converted[2].content[0],
+            InputContentBlock::from(api::ImageAttachment {
+                media_type: "image/jpeg".to_string(),
+                base64_data: "bmV3".to_string(),
+            })
+        );
+        assert_eq!(
+            converted[2].content[1],
+            InputContentBlock::Text {
+                text: "second screenshot".to_string(),
+            }
+        );
+    }
+
+    fn notice_manifest_fixture(label: &str) -> AgentOutput {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = temp_path(&format!("notices-{label}"));
+        fs::create_dir_all(&dir).expect("fixture dir");
+        let output_file = dir.join("out.md");
+        fs::write(&output_file, "# agent output\n").expect("fixture output file");
+        AgentOutput {
+            agent_id: format!("agent-{nanos}-{label}"),
+            name: format!("{label}-name"),
+            description: "notice fixture".to_string(),
+            subagent_type: None,
+            model: None,
+            status: "running".to_string(),
+            output_file: output_file.display().to_string(),
+            manifest_file: dir.join("manifest.json").display().to_string(),
+            created_at: "2026-07-16T00:00:00Z".to_string(),
+            started_at: None,
+            completed_at: None,
+            lane_events: Vec::new(),
+            current_blocker: None,
+            derived_state: "working".to_string(),
+            error: None,
+        }
+    }
+
+    /// Reaching a terminal state queues exactly one notice per agent id
+    /// (dedup guards the stop-request/thread-failure double persist), and
+    /// `take_agent_notices` drains the queue.
+    #[test]
+    fn terminal_agent_transitions_queue_notices_once_and_drain() {
+        let completed = notice_manifest_fixture("done");
+        let failed = notice_manifest_fixture("boom");
+        let cancelled = notice_manifest_fixture("halt");
+
+        persist_agent_terminal_state(&completed, "completed", Some("all good"), None)
+            .expect("completed state persists");
+        persist_agent_terminal_state(&failed, "failed", None, Some("exploded".to_string()))
+            .expect("failed state persists");
+        persist_agent_terminal_state(&cancelled, "cancelled", None, Some("stop".to_string()))
+            .expect("cancelled state persists");
+        // Double persistence for an already-terminal agent must not notify twice.
+        persist_agent_terminal_state(&completed, "failed", None, Some("late".to_string()))
+            .expect("re-persist is tolerated");
+
+        let notices = super::take_agent_notices();
+        let expected_completed = format!(
+            "✔ agente {} ({}) → completed",
+            super::short_agent_id(&completed.agent_id),
+            completed.name
+        );
+        let expected_failed = format!(
+            "✘ agente {} ({}) → failed",
+            super::short_agent_id(&failed.agent_id),
+            failed.name
+        );
+        let expected_cancelled = format!(
+            "✘ agente {} ({}) → cancelled",
+            super::short_agent_id(&cancelled.agent_id),
+            cancelled.name
+        );
+        assert!(notices.contains(&expected_completed), "{notices:?}");
+        assert!(notices.contains(&expected_failed), "{notices:?}");
+        assert!(notices.contains(&expected_cancelled), "{notices:?}");
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains(&completed.name))
+                .count(),
+            1,
+            "dedup must keep a single notice per agent id: {notices:?}"
+        );
+
+        // Drained: a second take returns none of the notices above.
+        let drained = super::take_agent_notices();
+        assert!(
+            !drained.contains(&expected_completed)
+                && !drained.contains(&expected_failed)
+                && !drained.contains(&expected_cancelled),
+            "take_agent_notices must drain: {drained:?}"
+        );
+    }
+
+    /// The queue keeps at most 50 notices, discarding the oldest first.
+    /// Assertions are containment-based so concurrently running agent tests
+    /// (which also push notices) cannot make this flaky.
+    #[test]
+    fn agent_notices_cap_discards_oldest_entries() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let marker = format!("cap-{nanos}");
+        for index in 0..55 {
+            super::push_agent_notice(
+                &format!("agent-{marker}-{index}"),
+                &format!("{marker}-{index}"),
+                "completed",
+            );
+        }
+
+        let notices = super::take_agent_notices();
+        assert!(
+            notices.len() <= super::AGENT_NOTICES_CAP,
+            "queue must never exceed the cap: {}",
+            notices.len()
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains(&format!("{marker}-54"))),
+            "newest notice must survive: {notices:?}"
+        );
+        assert!(
+            !notices
+                .iter()
+                .any(|notice| notice.contains(&format!("({marker}-0)"))),
+            "oldest notices past the cap must be discarded: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn short_agent_id_strips_prefix_and_caps_length() {
+        assert_eq!(super::short_agent_id("agent-1234567890123"), "12345678");
+        assert_eq!(super::short_agent_id("agent-42"), "42");
+        assert_eq!(super::short_agent_id("custom"), "custom");
     }
 
     /// Contract: even a direct `Agent` invocation against a sub-agent's tool
@@ -7281,6 +8010,123 @@ mod tests {
     fn agent_job_summaries_of_missing_dir_are_empty() {
         let dir = temp_path("agent-jobs-missing");
         assert!(agent_job_summaries_in(&dir).is_empty());
+    }
+
+    #[test]
+    fn request_agent_stop_rejects_empty_and_unknown_prefixes() {
+        let dir = temp_path("agent-stop-unknown");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-77", "running", "2026-07-15T10:00:00Z", None);
+
+        let empty = request_agent_stop_in(&dir, "  ").expect_err("empty prefix must fail");
+        assert!(empty.contains("must not be empty"));
+
+        let unknown =
+            request_agent_stop_in(&dir, "agent-99").expect_err("unknown prefix must fail");
+        assert!(unknown.contains("no agent job matches"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_rejects_ambiguous_prefixes() {
+        let dir = temp_path("agent-stop-ambiguous");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-51", "running", "2026-07-15T10:00:00Z", None);
+        write_agent_manifest_fixture(&dir, "agent-52", "running", "2026-07-15T10:01:00Z", None);
+
+        let error = request_agent_stop_in(&dir, "agent-5").expect_err("ambiguous prefix fails");
+        assert!(error.contains("ambiguous"), "message: {error}");
+        assert!(error.contains("agent-51") && error.contains("agent-52"));
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_reports_already_terminal_jobs() {
+        let dir = temp_path("agent-stop-terminal");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(&dir, "agent-61", "completed", "2026-07-15T10:00:00Z", None);
+
+        let message =
+            request_agent_stop_in(&dir, "agent-61").expect("terminal job reports its state");
+        assert!(message.contains("already done"), "message: {message}");
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_sets_the_registered_cancellation_flag() {
+        let dir = temp_path("agent-stop-live");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-live-1",
+            "running",
+            "2026-07-15T10:00:00Z",
+            None,
+        );
+        let flag = register_agent_cancel_flag("agent-live-1");
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        let message = request_agent_stop_in(&dir, "agent-live").expect("live job accepts stop");
+        assert!(
+            message.contains("cancellation requested"),
+            "message: {message}"
+        );
+        assert!(message.contains("between steps"), "message: {message}");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the shared flag must be set so the job loop can abort"
+        );
+        // The running thread (not the requester) persists the terminal
+        // state, so the manifest is untouched here.
+        let manifests = super::agent_manifests_in(&dir);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].status, "running");
+
+        unregister_agent_cancel_flag("agent-live-1");
+        assert!(registered_agent_cancel_flag("agent-live-1").is_none());
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn request_agent_stop_marks_stale_running_manifests_cancelled() {
+        let dir = temp_path("agent-stop-stale");
+        fs::create_dir_all(&dir).expect("store dir");
+        write_agent_manifest_fixture(
+            &dir,
+            "agent-stale-1",
+            "running",
+            "2026-07-15T10:00:00Z",
+            None,
+        );
+        // persist_agent_terminal_state appends to the output file; give the
+        // stale job one, as the real spawn path does.
+        fs::write(dir.join("agent-stale-1.md"), "# output\n").expect("output file");
+
+        let message =
+            request_agent_stop_in(&dir, "agent-stale-1").expect("stale job can be cancelled");
+        assert!(message.contains("marked cancelled"), "message: {message}");
+
+        let manifest: AgentOutput = serde_json::from_str(
+            &fs::read_to_string(dir.join("agent-stale-1.json")).expect("manifest readable"),
+        )
+        .expect("manifest parses");
+        assert_eq!(manifest.status, "cancelled");
+        assert!(manifest.completed_at.is_some());
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn cancel_flag_registry_registers_and_unregisters() {
+        assert!(registered_agent_cancel_flag("agent-reg-test").is_none());
+        let flag = register_agent_cancel_flag("agent-reg-test");
+        let same = registered_agent_cancel_flag("agent-reg-test")
+            .expect("flag is registered after registration");
+        assert!(Arc::ptr_eq(&flag, &same), "lookup returns the same flag");
+        // Re-registering returns the existing flag rather than replacing it.
+        let again = register_agent_cancel_flag("agent-reg-test");
+        assert!(Arc::ptr_eq(&flag, &again));
+        unregister_agent_cancel_flag("agent-reg-test");
+        assert!(registered_agent_cancel_flag("agent-reg-test").is_none());
     }
 
     fn run_git(cwd: &Path, args: &[&str]) {
@@ -7528,7 +8374,11 @@ mod tests {
         let claw_dir = worktree.join(".claw");
         fs::create_dir_all(&claw_dir).expect("create .claw dir");
         // Use the actual OS temp dir so the worktree path matches the allowlist
-        let tmp_root = std::env::temp_dir().to_str().expect("utf-8").to_string();
+        // JSON-escape the backslashes Windows temp paths contain.
+        let tmp_root = std::env::temp_dir()
+            .to_str()
+            .expect("utf-8")
+            .replace('\\', "\\\\");
         let settings = format!("{{\"trustedRoots\": [\"{tmp_root}\"]}}");
         fs::write(claw_dir.join("settings.json"), settings).expect("write settings");
 
@@ -8674,6 +9524,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
         assert!(output["prompt"]
             .as_str()
@@ -8693,6 +9544,7 @@ mod tests {
         assert!(dollar_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("/help/SKILL.md"));
 
         if let Some(home) = original_home {
@@ -8732,6 +9584,7 @@ mod tests {
         assert!(skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/skills/plan/SKILL.md"));
 
         let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
@@ -8741,6 +9594,7 @@ mod tests {
         assert!(command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claw/commands/handoff.md"));
 
         std::env::set_current_dir(&original_dir).expect("restore cwd");
@@ -8779,6 +9633,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/skills/trace/SKILL.md"));
         assert_eq!(output["description"], "Project-local trace helper");
 
@@ -8841,11 +9696,13 @@ mod tests {
         assert!(omc_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".omc/skills/hud/SKILL.md"));
         assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
         assert!(agents_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".agents/skills/trace/SKILL.md"));
         assert_eq!(
             agents_output["description"],
@@ -8901,6 +9758,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/omc-learned/learned/SKILL.md"));
         assert_eq!(output["description"], "Learned OMC skill");
 
@@ -8960,6 +9818,7 @@ mod tests {
         assert!(direct_skill_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("skills/statusline/SKILL.md"));
         assert_eq!(direct_skill_output["description"], "Claude config skill");
 
@@ -8970,6 +9829,7 @@ mod tests {
         assert!(legacy_command_output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with("commands/doctor-check.md"));
         assert_eq!(
             legacy_command_output["description"],
@@ -9027,6 +9887,7 @@ mod tests {
         assert!(output["path"]
             .as_str()
             .expect("path")
+            .replace('\\', "/")
             .ends_with(".claude/commands/team.md"));
         assert_eq!(output["description"], "Legacy team workflow");
 
@@ -9239,6 +10100,7 @@ mod tests {
                 name: Some("traced-agent".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |_job| Ok(()),
         )
@@ -9293,6 +10155,7 @@ mod tests {
                 name: Some("ship-audit".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             move |job| {
                 *captured_for_spawn
@@ -9375,6 +10238,7 @@ mod tests {
                 name: Some("complete-task".to_string()),
                 model: Some("claude-sonnet-4-6".to_string()),
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9433,6 +10297,7 @@ mod tests {
                 name: Some("fail-task".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9481,6 +10346,7 @@ mod tests {
                 name: Some("summary-floor".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9527,6 +10393,7 @@ mod tests {
                 name: Some("recovery-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9576,6 +10443,7 @@ mod tests {
                 name: Some("review-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9617,6 +10485,7 @@ mod tests {
                 name: Some("backlog-scan".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9664,6 +10533,7 @@ mod tests {
                 name: Some("artifact-lane".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9735,6 +10605,7 @@ mod tests {
                 name: Some("cron-closeout".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |job| {
                 persist_agent_terminal_state(
@@ -9777,6 +10648,7 @@ mod tests {
                 name: Some("spawn-error".to_string()),
                 model: None,
                 allowed_write_paths: None,
+                images: None,
             },
             |_| Err(String::from("thread creation failed")),
         )
@@ -10477,6 +11349,7 @@ mod tests {
         assert!(globbed_output["filenames"][0]
             .as_str()
             .expect("filename")
+            .replace('\\', "/")
             .ends_with("nested/lib.rs"));
 
         let glob_error = execute_tool("glob_search", &json!({ "pattern": "[" }))
@@ -10917,6 +11790,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn powershell_runs_via_stub_shell() {
         let _guard = env_lock()
             .lock()

@@ -82,8 +82,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "compact",
         aliases: &[],
-        summary: "Compact local session history",
-        argument_hint: None,
+        summary: "Compact local session history (preview shows the effect first)",
+        argument_hint: Some("[preview]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -282,8 +282,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "doctor",
         aliases: &[],
-        summary: "Diagnose setup issues and environment health",
-        argument_hint: Some("[online]"),
+        summary: "Diagnose setup issues and environment health (fix repairs them)",
+        argument_hint: Some("[online|fix]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -521,7 +521,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         name: "design-review",
         aliases: &[],
         summary: "Deterministic design audit: WCAG token contrast + rendered-HTML accessibility (0 tokens)",
-        argument_hint: Some("[fix]"),
+        argument_hint: Some("[fix|changed]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -583,14 +583,14 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "undo",
         aliases: &[],
-        summary: "Undo the last file write or edit",
+        summary: "Reverse the last edit_file change (swaps the edit back)",
         argument_hint: None,
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "stop",
         aliases: &[],
-        summary: "Stop the current generation",
+        summary: "Stop background agents (Ctrl+C stops the current turn)",
         argument_hint: None,
         resume_supported: false,
     },
@@ -702,15 +702,15 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "pin",
         aliases: &[],
-        summary: "Pin a message to persist across compaction",
-        argument_hint: Some("[message-index]"),
+        summary: "Pin a note to the session (survives /compact; defaults to the last prompt)",
+        argument_hint: Some("[texto]"),
         resume_supported: false,
     },
     SlashCommandSpec {
         name: "unpin",
         aliases: &[],
-        summary: "Unpin a previously pinned message",
-        argument_hint: Some("[message-index]"),
+        summary: "Remove a pinned note by index (default: the last one)",
+        argument_hint: Some("[índice]"),
         resume_supported: false,
     },
     SlashCommandSpec {
@@ -1084,7 +1084,22 @@ pub enum SlashCommand {
     Help,
     Status,
     Sandbox,
-    Compact,
+    Compact {
+        preview: bool,
+    },
+    Pin {
+        text: Option<String>,
+    },
+    Unpin {
+        index: Option<String>,
+    },
+    Bookmarks,
+    Focus {
+        paths: Option<String>,
+    },
+    Unfocus,
+    Undo,
+    Stop,
     Bughunter {
         scope: Option<String>,
     },
@@ -1163,6 +1178,7 @@ pub enum SlashCommand {
     },
     Doctor {
         online: bool,
+        fix: bool,
     },
     Setup,
     Login,
@@ -1187,6 +1203,7 @@ pub enum SlashCommand {
     SecurityReview,
     DesignReview {
         fix: bool,
+        changed: bool,
     },
     Keybindings,
     PrivacySettings,
@@ -1288,6 +1305,13 @@ impl SlashCommand {
             Self::Help => "/help",
             Self::Clear { .. } => "/clear",
             Self::Compact { .. } => "/compact",
+            Self::Pin { .. } => "/pin",
+            Self::Unpin { .. } => "/unpin",
+            Self::Bookmarks => "/bookmarks",
+            Self::Focus { .. } => "/focus",
+            Self::Unfocus => "/unfocus",
+            Self::Undo => "/undo",
+            Self::Stop => "/stop",
             Self::Cost => "/cost",
             Self::Doctor { .. } => "/doctor",
             Self::Setup => "/setup",
@@ -1398,9 +1422,33 @@ pub fn validate_slash_command_input(
             validate_no_args(command, &args)?;
             SlashCommand::Sandbox
         }
-        "compact" => {
+        "compact" => match args.as_slice() {
+            [] => SlashCommand::Compact { preview: false },
+            ["preview" | "--preview"] => SlashCommand::Compact { preview: true },
+            _ => {
+                return Err(usage_error(command, "[preview]"));
+            }
+        },
+        "pin" => SlashCommand::Pin { text: remainder },
+        "unpin" => SlashCommand::Unpin {
+            index: optional_single_arg(command, &args, "[índice]")?,
+        },
+        "bookmarks" => {
             validate_no_args(command, &args)?;
-            SlashCommand::Compact
+            SlashCommand::Bookmarks
+        }
+        "focus" => SlashCommand::Focus { paths: remainder },
+        "unfocus" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Unfocus
+        }
+        "undo" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Undo
+        }
+        "stop" => {
+            validate_no_args(command, &args)?;
+            SlashCommand::Stop
         }
         "bughunter" => SlashCommand::Bughunter { scope: remainder },
         "commit" => {
@@ -1466,10 +1514,20 @@ pub fn validate_slash_command_input(
             args: parse_skills_args(remainder.as_deref())?,
         },
         "doctor" | "providers" => match args.as_slice() {
-            [] => SlashCommand::Doctor { online: false },
-            ["online" | "--online"] => SlashCommand::Doctor { online: true },
+            [] => SlashCommand::Doctor {
+                online: false,
+                fix: false,
+            },
+            ["online" | "--online"] => SlashCommand::Doctor {
+                online: true,
+                fix: false,
+            },
+            ["fix" | "--fix"] => SlashCommand::Doctor {
+                online: false,
+                fix: true,
+            },
             _ => {
-                return Err(usage_error(command, "[online]"));
+                return Err(usage_error(command, "[online|fix]"));
             }
         },
         "setup" => {
@@ -1557,10 +1615,20 @@ pub fn validate_slash_command_input(
             SlashCommand::SecurityReview
         }
         "design-review" => match args.as_slice() {
-            [] => SlashCommand::DesignReview { fix: false },
-            ["fix" | "--fix"] => SlashCommand::DesignReview { fix: true },
+            [] => SlashCommand::DesignReview {
+                fix: false,
+                changed: false,
+            },
+            ["fix" | "--fix"] => SlashCommand::DesignReview {
+                fix: true,
+                changed: false,
+            },
+            ["changed" | "--changed"] => SlashCommand::DesignReview {
+                fix: false,
+                changed: true,
+            },
             _ => {
-                return Err(usage_error(command, "[fix]"));
+                return Err(usage_error(command, "[fix|changed]"));
             }
         },
         "keybindings" => {
@@ -2036,7 +2104,28 @@ fn format_slash_command_help_line(spec: &SlashCommandSpec) -> String {
     } else {
         ""
     };
-    format!("  {name:<66} {}{alias_suffix}{resume}", spec.summary)
+    // A spec whose bare form parses to Unknown has no implementation behind
+    // it — say so in the help instead of promising a command that answers
+    // "unknown command" when typed.
+    let experimental = if spec_is_unimplemented(spec.name) {
+        " (experimental)"
+    } else {
+        ""
+    };
+    format!(
+        "  {name:<66} {}{alias_suffix}{resume}{experimental}",
+        spec.summary
+    )
+}
+
+/// True when the command's bare invocation parses to `Unknown`: it is
+/// registered (help, completion) but has no parse arm yet. Commands that
+/// error asking for arguments count as implemented.
+fn spec_is_unimplemented(name: &str) -> bool {
+    matches!(
+        SlashCommand::parse(&format!("/{name}")),
+        Ok(Some(SlashCommand::Unknown(_)))
+    )
 }
 
 fn levenshtein_distance(left: &str, right: &str) -> usize {
@@ -5926,8 +6015,26 @@ pub fn handle_slash_command(
     };
 
     match command {
-        SlashCommand::Compact => {
+        SlashCommand::Compact { preview } => {
             let result = compact_session(session, compaction);
+            if preview {
+                // Dry run: report what compaction would do, keep the session.
+                let message = if result.removed_message_count == 0 {
+                    "Compact preview: nothing to do — session is below the compaction threshold."
+                        .to_string()
+                } else {
+                    format!(
+                        "Compact preview: {} of {} messages would be folded into a system summary ({} would remain). Run /compact to apply.",
+                        result.removed_message_count,
+                        session.messages.len(),
+                        result.compacted_session.messages.len(),
+                    )
+                };
+                return Some(SlashCommandResult {
+                    message,
+                    session: session.clone(),
+                });
+            }
             let message = if result.removed_message_count == 0 {
                 "Compaction skipped: session is below the compaction threshold.".to_string()
             } else {
@@ -6019,6 +6126,13 @@ pub fn handle_slash_command(
         | SlashCommand::History { .. }
         | SlashCommand::Team { .. }
         | SlashCommand::Setup
+        | SlashCommand::Pin { .. }
+        | SlashCommand::Unpin { .. }
+        | SlashCommand::Bookmarks
+        | SlashCommand::Focus { .. }
+        | SlashCommand::Unfocus
+        | SlashCommand::Undo
+        | SlashCommand::Stop
         | SlashCommand::Unknown(_) => None,
     }
 }
@@ -6486,6 +6600,28 @@ mod tests {
             Ok(Some(SlashCommand::Diff { path: None }))
         );
         assert_eq!(
+            SlashCommand::parse("/compact preview"),
+            Ok(Some(SlashCommand::Compact { preview: true }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/pin recordar esto"),
+            Ok(Some(SlashCommand::Pin {
+                text: Some("recordar esto".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/bookmarks"),
+            Ok(Some(SlashCommand::Bookmarks))
+        );
+        assert_eq!(
+            SlashCommand::parse("/focus src/main.rs"),
+            Ok(Some(SlashCommand::Focus {
+                paths: Some("src/main.rs".to_string())
+            }))
+        );
+        assert_eq!(SlashCommand::parse("/undo"), Ok(Some(SlashCommand::Undo)));
+        assert_eq!(SlashCommand::parse("/stop"), Ok(Some(SlashCommand::Stop)));
+        assert_eq!(
             SlashCommand::parse("/diff src/main.rs"),
             Ok(Some(SlashCommand::Diff {
                 path: Some("src/main.rs".to_string())
@@ -6601,16 +6737,45 @@ mod tests {
 
     #[test]
     fn rejects_unexpected_arguments_for_no_arg_commands() {
-        // given
-        let input = "/compact now";
+        // /memory keeps the classic no-arg contract.
+        let error = parse_error_message("/memory now");
+        assert!(error.contains("Unexpected arguments for /memory."));
+        assert!(error.contains("  Usage            /memory"));
 
-        // when
-        let error = parse_error_message(input);
+        // /compact now takes an optional `preview`; anything else is a
+        // usage error that names the accepted form.
+        let compact_error = parse_error_message("/compact now");
+        assert!(compact_error.contains("Usage: /compact [preview]"));
+    }
 
-        // then
-        assert!(error.contains("Unexpected arguments for /compact."));
-        assert!(error.contains("  Usage            /compact"));
-        assert!(error.contains("  Summary          Compact local session history"));
+    #[test]
+    fn help_marks_parse_arm_less_specs_as_experimental() {
+        let help = render_slash_command_help();
+        // /screenshot is registered but parses to Unknown — the help must
+        // not promise it as working.
+        let screenshot_line = help
+            .lines()
+            .find(|line| line.trim_start().starts_with("/screenshot"))
+            .expect("/screenshot listed in help");
+        assert!(
+            screenshot_line.contains("(experimental)"),
+            "line: {screenshot_line}"
+        );
+        // Implemented commands never carry the marker.
+        for name in ["/retry", "/pin", "/undo", "/stop", "/compact"] {
+            let line = help
+                .lines()
+                .find(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with(name)
+                        && trimmed[name.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|next| next == ' ' || next == '[')
+                })
+                .unwrap_or_else(|| panic!("{name} listed in help"));
+            assert!(!line.contains("(experimental)"), "line: {line}");
+        }
     }
 
     #[test]

@@ -1,0 +1,46 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/lint.yml
+      - install.sh
+      - 'scripts/**'
+      - '.githooks/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/lint.yml
+      - install.sh
+      - 'scripts/**'
+      - '.githooks/**'
+  workflow_dispatch:
+
+concurrency:
+  group: lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ubuntu-latest ships shellcheck preinstalled; no setup step needed.
+      - name: shellcheck version
+        run: shellcheck --version
+      - name: Lint shell scripts
+        run: |
+          # install.sh, every scripts/*.sh, and every git hook in .githooks/
+          # (hooks have no .sh extension; shellcheck reads their shebang).
+          files=(install.sh)
+          for f in scripts/*.sh .githooks/*; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          printf 'checking: %s\n' "${files[@]}"
+          # --severity=info keeps the classic quoting checks (SC2086 is
+          # info-level) while skipping purely stylistic findings.
+          shellcheck --severity=info "${files[@]}"
