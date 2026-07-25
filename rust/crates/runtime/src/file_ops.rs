@@ -557,6 +557,7 @@ fn glob_search_impl(
         if let Some(root) = canonical_root.as_deref() {
             let canonical_walk_root = walk_root
                 .canonicalize()
+                .map(simplify_canonical)
                 .unwrap_or_else(|_| walk_root.clone());
             validate_workspace_boundary(&canonical_walk_root, root)?;
         }
@@ -573,7 +574,7 @@ fn glob_search_impl(
                 && seen.insert(candidate.to_path_buf())
             {
                 if let Some(root) = canonical_root.as_deref() {
-                    let canonical_candidate = candidate.canonicalize()?;
+                    let canonical_candidate = simplify_canonical(candidate.canonicalize()?);
                     validate_workspace_boundary(&canonical_candidate, root)?;
                 }
                 matches.push(candidate.to_path_buf());
@@ -648,7 +649,7 @@ fn grep_search_impl(
 
     for file_path in collect_search_files(&base_path)? {
         if let Some(root) = canonical_root.as_deref() {
-            let canonical_file = file_path.canonicalize()?;
+            let canonical_file = simplify_canonical(file_path.canonicalize()?);
             validate_workspace_boundary(&canonical_file, root)?;
         }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
@@ -745,6 +746,7 @@ fn build_grep_content_output(
 fn canonicalize_workspace_root(workspace_root: &Path) -> PathBuf {
     workspace_root
         .canonicalize()
+        .map(simplify_canonical)
         .unwrap_or_else(|_| workspace_root.to_path_buf())
 }
 
@@ -961,13 +963,31 @@ fn make_patch(original: &str, updated: &str) -> Vec<StructuredPatchHunk> {
     }]
 }
 
+/// `canonicalize()` on Windows returns `\\?\C:\…` verbatim paths. The prefix
+/// defeats glob matching (`?` is a glob metacharacter) and any comparison
+/// against non-verbatim paths, so every canonicalized path in this module is
+/// simplified back to a plain drive path.
+#[cfg(windows)]
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn simplify_canonical(path: PathBuf) -> PathBuf {
+    path
+}
+
 fn normalize_path(path: &str) -> io::Result<PathBuf> {
     let candidate = if Path::new(path).is_absolute() {
         PathBuf::from(path)
     } else {
         std::env::current_dir()?.join(path)
     };
-    candidate.canonicalize()
+    candidate.canonicalize().map(simplify_canonical)
 }
 
 fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
@@ -978,12 +998,13 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     };
 
     if let Ok(canonical) = candidate.canonicalize() {
-        return Ok(canonical);
+        return Ok(simplify_canonical(canonical));
     }
 
     if let Some(parent) = candidate.parent() {
         let canonical_parent = parent
             .canonicalize()
+            .map(simplify_canonical)
             .unwrap_or_else(|_| parent.to_path_buf());
         if let Some(name) = candidate.file_name() {
             return Ok(canonical_parent.join(name));
@@ -1061,9 +1082,10 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     if !metadata.is_symlink() {
         return Ok(false);
     }
-    let resolved = path.canonicalize()?;
+    let resolved = simplify_canonical(path.canonicalize()?);
     let canonical_root = workspace_root
         .canonicalize()
+        .map(simplify_canonical)
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     Ok(!resolved.starts_with(&canonical_root))
 }
