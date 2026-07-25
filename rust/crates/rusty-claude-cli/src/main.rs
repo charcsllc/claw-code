@@ -16796,39 +16796,67 @@ mod tests {
         .expect("skill file should write");
     }
 
+    /// Extension for plugin fixture scripts: Windows runs plugin commands via
+    /// `cmd /C`, where a `.sh` file falls back to the shell association
+    /// (git-bash window) and hangs a headless CI session — write native
+    /// scripts per platform instead.
+    fn plugin_script_ext() -> &'static str {
+        if cfg!(windows) {
+            "cmd"
+        } else {
+            "sh"
+        }
+    }
+
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
+        let ext = plugin_script_ext();
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         if include_hooks {
             fs::create_dir_all(root.join("hooks")).expect("hooks dir");
-            fs::write(
-                root.join("hooks").join("pre.sh"),
-                "#!/bin/sh\nprintf 'plugin pre hook'\n",
-            )
-            .expect("write hook");
+            let hook_body = if cfg!(windows) {
+                "@echo off\r\necho plugin pre hook\r\n"
+            } else {
+                "#!/bin/sh\nprintf 'plugin pre hook'\n"
+            };
+            fs::write(root.join("hooks").join(format!("pre.{ext}")), hook_body)
+                .expect("write hook");
         }
         if include_lifecycle {
             fs::create_dir_all(root.join("lifecycle")).expect("lifecycle dir");
+            let (init_body, shutdown_body) = if cfg!(windows) {
+                (
+                    "@echo off\r\n>>lifecycle.log echo init\r\n",
+                    "@echo off\r\n>>lifecycle.log echo shutdown\r\n",
+                )
+            } else {
+                (
+                    "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                    "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+                )
+            };
             fs::write(
-                root.join("lifecycle").join("init.sh"),
-                "#!/bin/sh\nprintf 'init\\n' >> lifecycle.log\n",
+                root.join("lifecycle").join(format!("init.{ext}")),
+                init_body,
             )
             .expect("write init lifecycle");
             fs::write(
-                root.join("lifecycle").join("shutdown.sh"),
-                "#!/bin/sh\nprintf 'shutdown\\n' >> lifecycle.log\n",
+                root.join("lifecycle").join(format!("shutdown.{ext}")),
+                shutdown_body,
             )
             .expect("write shutdown lifecycle");
         }
 
         let hooks = if include_hooks {
-            ",\n  \"hooks\": {\n    \"PreToolUse\": [\"./hooks/pre.sh\"]\n  }"
+            format!(",\n  \"hooks\": {{\n    \"PreToolUse\": [\"./hooks/pre.{ext}\"]\n  }}")
         } else {
-            ""
+            String::new()
         };
         let lifecycle = if include_lifecycle {
-            ",\n  \"lifecycle\": {\n    \"Init\": [\"./lifecycle/init.sh\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.sh\"]\n  }"
+            format!(
+                ",\n  \"lifecycle\": {{\n    \"Init\": [\"./lifecycle/init.{ext}\"],\n    \"Shutdown\": [\"./lifecycle/shutdown.{ext}\"]\n  }}"
+            )
         } else {
-            ""
+            String::new()
         };
         fs::write(
             root.join(".claude-plugin").join("plugin.json"),
@@ -17450,10 +17478,11 @@ mod tests {
     #[test]
     fn parses_system_prompt_options() {
         // given: system-prompt options for cwd and date
+        let temp = std::env::temp_dir();
         let args = vec![
             "system-prompt".to_string(),
             "--cwd".to_string(),
-            "/tmp".to_string(),
+            temp.to_string_lossy().into_owned(),
             "--date".to_string(),
             "2026-04-01".to_string(),
         ];
@@ -17465,7 +17494,7 @@ mod tests {
         assert_eq!(
             action,
             CliAction::PrintSystemPrompt {
-                cwd: PathBuf::from("/tmp"),
+                cwd: temp.clone(),
                 date: "2026-04-01".to_string(),
                 model: DEFAULT_MODEL.to_string(),
                 output_format: CliOutputFormat::Text,
@@ -18102,7 +18131,10 @@ mod tests {
 
         // Phase 1 contract: workspace/git/sandbox fields are still populated
         // (independent of config parse). Sandbox falls back to defaults.
-        assert_eq!(context.cwd, cwd.canonicalize().unwrap_or(cwd.clone()));
+        assert_eq!(
+            context.cwd.canonicalize().unwrap_or(context.cwd.clone()),
+            cwd.canonicalize().unwrap_or(cwd.clone())
+        );
         assert_eq!(
             context.loaded_config_files, 0,
             "loaded_config_files should be 0 when config parse fails"
@@ -20953,6 +20985,10 @@ UU conflicted.rs",
         let workspace_b = temp_workspace("session-mismatch-b");
         std::fs::create_dir_all(&workspace_a).expect("workspace a should create");
         std::fs::create_dir_all(&workspace_b).expect("workspace b should create");
+        // Canonical forms keep the assertion below comparable with the error
+        // message, which renders canonicalized store/session roots.
+        let workspace_a = workspace_a.canonicalize().expect("canonicalize a");
+        let workspace_b = workspace_b.canonicalize().expect("canonicalize b");
         let previous = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&workspace_b).expect("switch cwd");
 
@@ -21612,8 +21648,9 @@ UU conflicted.rs",
             .expect("plugin state should load");
         let pre_hooks = state.feature_config.hooks().pre_tool_use();
         assert_eq!(pre_hooks.len(), 1);
+        let expected_hook_suffix = format!("hooks/pre.{}", plugin_script_ext());
         assert!(
-            pre_hooks[0].ends_with("hooks/pre.sh"),
+            pre_hooks[0].ends_with(&expected_hook_suffix),
             "expected installed plugin hook path, got {pre_hooks:?}"
         );
 
@@ -21646,7 +21683,7 @@ UU conflicted.rs",
                     }}
                   }}
                 }}"#,
-                script_path.to_string_lossy()
+                script_path.to_string_lossy().replace('\\', "/")
             ),
         )
         .expect("write mcp settings");
@@ -21833,7 +21870,9 @@ UU conflicted.rs",
         .expect("runtime should build");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("init log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("init log should exist")
+                .replace("\r\n", "\n"),
             "init\n"
         );
 
@@ -21842,7 +21881,9 @@ UU conflicted.rs",
             .expect("plugin shutdown should succeed");
 
         assert_eq!(
-            fs::read_to_string(&log_path).expect("shutdown log should exist"),
+            fs::read_to_string(&log_path)
+                .expect("shutdown log should exist")
+                .replace("\r\n", "\n"),
             "init\nshutdown\n"
         );
 
