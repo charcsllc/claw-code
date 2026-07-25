@@ -2257,8 +2257,24 @@ fn has_dangerous_paths(command: &str) -> bool {
             return true;
         }
 
-        if !cfg!(windows) && looks_like_windows_absolute_path(token) {
-            return true;
+        if looks_like_windows_absolute_path(token) {
+            // On unix a drive-letter token is out of place — treat it as
+            // outside. On Windows it is an ordinary absolute path: deny only
+            // when it resolves outside the workspace (mirroring the unix
+            // absolute-path branch below).
+            if !cfg!(windows) {
+                return true;
+            }
+            match cwd.as_ref() {
+                Some(cwd) => {
+                    let resolved = canonicalize_allow_missing(Path::new(token));
+                    if !resolved.starts_with(cwd) {
+                        return true;
+                    }
+                }
+                None => return true,
+            }
+            continue;
         }
 
         // Check for absolute paths
@@ -2296,6 +2312,31 @@ fn has_dangerous_paths(command: &str) -> bool {
     }
 
     false
+}
+
+/// Canonicalizes `path`, falling back to canonicalizing the deepest existing
+/// ancestor and rejoining the missing suffix — keeps not-yet-created paths
+/// comparable with canonicalized roots (Windows 8.3 short vs long forms).
+fn canonicalize_allow_missing(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut existing = path;
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = existing.parent() {
+        if let Some(name) = existing.file_name() {
+            suffix.push(name.to_os_string());
+        }
+        if let Ok(canonical) = parent.canonicalize() {
+            let mut resolved = canonical;
+            for part in suffix.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        existing = parent;
+    }
+    path.to_path_buf()
 }
 
 fn looks_like_windows_absolute_path(token: &str) -> bool {
