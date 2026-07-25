@@ -541,14 +541,19 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         .as_str()
         .expect("tool output");
     // read_file reports the canonicalized path without the Windows \\?\
-    // verbatim prefix; compare in that same form.
+    // verbatim prefix; the tool output embeds it inside serialized JSON, so
+    // on Windows the backslashes appear escaped — accept either form.
     let fixture = workspace.root.join("fixture.txt");
     let canonical = fixture.canonicalize().unwrap_or(fixture);
     let mut expected = canonical.display().to_string();
     if let Some(rest) = expected.strip_prefix(r"\\?\") {
         expected = rest.to_string();
     }
-    assert!(output.contains(&expected));
+    let expected_json_escaped = expected.replace('\\', "\\\\");
+    assert!(
+        output.contains(&expected) || output.contains(&expected_json_escaped),
+        "tool output should reference the fixture path: {output}"
+    );
     assert!(output.contains("alpha parity line"));
 }
 
