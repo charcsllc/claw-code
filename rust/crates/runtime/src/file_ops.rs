@@ -1253,8 +1253,11 @@ mod tests {
         let path = temp_path("guard-external-change.txt");
         write_file(path.to_string_lossy().as_ref(), "alpha beta gamma").expect("seed");
         // Simulate "read long ago, file rewritten since": force the recorded
-        // mtime to a value that cannot match the current on-disk mtime.
-        let absolute = std::fs::canonicalize(&path).expect("canonicalize");
+        // mtime to a value that cannot match the current on-disk mtime. The
+        // registry key must be the same path form edit_file resolves
+        // (normalize_path), not a raw canonicalize — on Windows they differ.
+        let absolute =
+            super::normalize_path(path.to_string_lossy().as_ref()).expect("normalize path");
         record_file_mtime_as(&absolute, UNIX_EPOCH);
         let output = edit_file(path.to_string_lossy().as_ref(), "beta", "BETA", false)
             .expect("edit still succeeds despite the warning");
@@ -1657,11 +1660,11 @@ mod tests {
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("src/AGENTS.md")));
+            .any(|path| path.replace('\\', "/").ends_with("src/AGENTS.md")));
         assert!(result
             .filenames
             .iter()
-            .any(|path| path.ends_with("docs/AGENTS.md")));
+            .any(|path| path.replace('\\', "/").ends_with("docs/AGENTS.md")));
         assert!(!result
             .filenames
             .iter()
