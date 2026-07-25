@@ -585,10 +585,13 @@ fn assert_write_file_allowed(workspace: &HarnessWorkspace, run: &ScenarioRun) {
         run.response["tool_uses"][0]["name"],
         Value::String("write_file".to_string())
     );
-    assert!(run.response["message"]
-        .as_str()
-        .expect("message text")
-        .contains("generated/output.txt"));
+    // The mock echoes the path the tool reported, which uses backslashes on
+    // Windows.
+    let message = run.response["message"].as_str().expect("message text");
+    assert!(
+        message.contains("generated/output.txt") || message.contains(r"generated\output.txt"),
+        "message should reference the generated file: {message}"
+    );
     let generated = workspace.root.join("generated").join("output.txt");
     let contents = fs::read_to_string(&generated).expect("generated file should exist");
     assert_eq!(contents, "created by mock service\n");
