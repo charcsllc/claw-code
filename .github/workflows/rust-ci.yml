@@ -259,11 +259,6 @@ jobs:
   test-windows:
     name: cargo test --workspace (windows)
     runs-on: windows-latest
-    # continue-on-error: workspace tests have only ever gated on Linux, so
-    # accumulated path/line-ending assumptions may fail here at first. Let the
-    # first runs report without blocking merges; promote to blocking (delete
-    # this line) once the job passes in green.
-    continue-on-error: true
     env:
       # One-shot CI runs get no benefit from incremental compilation, and the
       # incremental artifacts bloat the Windows cache.
