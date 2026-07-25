@@ -527,7 +527,15 @@ fn assert_read_file_roundtrip(workspace: &HarnessWorkspace, run: &ScenarioRun) {
     let output = run.response["tool_results"][0]["output"]
         .as_str()
         .expect("tool output");
-    assert!(output.contains(&workspace.root.join("fixture.txt").display().to_string()));
+    // read_file reports the canonicalized path without the Windows \\?\
+    // verbatim prefix; compare in that same form.
+    let fixture = workspace.root.join("fixture.txt");
+    let canonical = fixture.canonicalize().unwrap_or(fixture);
+    let mut expected = canonical.display().to_string();
+    if let Some(rest) = expected.strip_prefix(r"\\?\") {
+        expected = rest.to_string();
+    }
+    assert!(output.contains(&expected));
     assert!(output.contains("alpha parity line"));
 }
 

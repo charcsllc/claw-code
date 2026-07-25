@@ -628,22 +628,28 @@ fn global_cwd_flag_routes_status_workspace_and_short_alias_429() {
     fs::create_dir_all(&launcher).expect("launcher dir should exist");
 
     let workspace_str = workspace.to_str().expect("utf8 workspace");
-    let expected_cwd = fs::canonicalize(&workspace)
-        .expect("workspace should canonicalize")
-        .display()
-        .to_string();
+    // Path forms differ between what claw reports and what the test built
+    // (8.3 short names, \\?\ verbatim); canonicalize both before comparing.
+    let canonical_cwd = |value: &serde_json::Value| {
+        fs::canonicalize(value.as_str().expect("cwd should be a string"))
+            .expect("reported cwd should canonicalize")
+    };
+    let expected_cwd = fs::canonicalize(&workspace).expect("workspace should canonicalize");
     let status = assert_json_command(
         &launcher,
         &["--cwd", workspace_str, "--output-format", "json", "status"],
     );
     assert_eq!(status["kind"], "status");
-    assert_eq!(status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(canonical_cwd(&status["workspace"]["cwd"]), expected_cwd);
 
     let short_status = assert_json_command(
         &launcher,
         &["-C", workspace_str, "status", "--output-format", "json"],
     );
-    assert_eq!(short_status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(
+        canonical_cwd(&short_status["workspace"]["cwd"]),
+        expected_cwd
+    );
 
     let directory_status = assert_json_command(
         &launcher,
@@ -654,7 +660,10 @@ fn global_cwd_flag_routes_status_workspace_and_short_alias_429() {
             "status",
         ],
     );
-    assert_eq!(directory_status["workspace"]["cwd"], expected_cwd);
+    assert_eq!(
+        canonical_cwd(&directory_status["workspace"]["cwd"]),
+        expected_cwd
+    );
 }
 
 #[test]
@@ -5365,7 +5374,7 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
     assert_eq!(create_json["status"], "ok");
     assert_eq!(create_json["format"], "toml");
     assert_eq!(
-        reported_agent_path,
+        fs::canonicalize(&reported_agent_path).expect("canonical reported agent path"),
         fs::canonicalize(&agent_path).expect("canonical agent path")
     );
     assert!(agent_path.is_file());
@@ -5382,7 +5391,8 @@ fn agents_create_scaffolds_toml_and_lists_locally_431() {
         .iter()
         .any(|agent| {
             agent["name"] == "my-agent"
-                && *agent["path"].as_str().expect("listed agent path")
+                && fs::canonicalize(agent["path"].as_str().expect("listed agent path"))
+                    .expect("canonical reported agent path")
                     == fs::canonicalize(&agent_path).expect("canonical listed agent path")
         }));
 }
