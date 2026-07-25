@@ -1084,11 +1084,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(unix)]
+    use super::write_file_in_workspace;
     use super::{
         closest_match_diff, component_contains_glob, derive_glob_walk_root, edit_file,
         expand_braces, external_modification_warning, glob_search, grep_search, is_symlink_escape,
         parse_read_file_max_bytes, read_file, read_file_in_workspace, read_file_with_max_bytes,
-        record_file_mtime_as, write_file, write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        record_file_mtime_as, write_file, GrepSearchInput, MAX_WRITE_SIZE,
         READ_FILE_MAX_BYTES_DEFAULT, READ_FILE_MAX_BYTES_MAX, READ_FILE_MAX_BYTES_MIN,
     };
 
@@ -1443,9 +1445,9 @@ mod tests {
         let outside = temp_path("symlink-target.txt");
         std::fs::write(&outside, "target content").expect("target should write");
 
-        let link_path = workspace.join("escape-link.txt");
         #[cfg(unix)]
         {
+            let link_path = workspace.join("escape-link.txt");
             std::os::unix::fs::symlink(&outside, &link_path).expect("symlink should create");
             assert!(is_symlink_escape(&link_path, &workspace).expect("check should succeed"));
         }
