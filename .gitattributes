@@ -1,0 +1,5 @@
+# Golden prompt snapshots are compared byte-for-byte against generated
+# prompts (rust/crates/claw-multiagent/tests/prompt_goldens.rs). Force LF so
+# Windows checkouts (Git for Windows defaults to core.autocrlf=true) do not
+# turn them into CRLF and fail the comparison with an invisible diff.
+rust/crates/claw-multiagent/tests/goldens/*.txt text eol=lf
