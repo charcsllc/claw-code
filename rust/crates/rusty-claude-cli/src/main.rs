@@ -519,7 +519,10 @@ fn classify_error_kind(message: &str) -> &'static str {
         "api_http_error"
     } else if message.contains("mcpServers") {
         "malformed_mcp_config"
-    } else if message.contains(".claw/settings.json") || message.contains(".claw.json") {
+    } else if message.contains(".claw/settings.json")
+        || message.contains(r".claw\settings.json")
+        || message.contains(".claw.json")
+    {
         // #763: config file JSON parse / validation errors (e.g. unterminated string, type mismatch)
         "config_parse_error"
     } else if message.starts_with("empty prompt") {
@@ -5178,7 +5181,14 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
             if output_format == CliOutputFormat::Json {
                 // #77: classify session load errors for downstream consumers
                 let full_message = format!("failed to restore session: {error}");
-                let kind = classify_error_kind(&full_message);
+                // #787 on Windows opening a directory reports "Access is
+                // denied" rather than unix's "Is a directory (os error 21)"
+                // — classify from the filesystem when the path is a dir.
+                let kind = if session_path.is_dir() {
+                    "session_path_is_directory"
+                } else {
+                    classify_error_kind(&full_message)
+                };
                 let (short_reason, inline_hint) = split_error_hint(&full_message);
                 // #787: fall back to kind-derived hint when message has no \n delimiter
                 let hint =

@@ -2323,7 +2323,7 @@ fn config_json_attributes_precedence_and_shadowed_keys_425() {
             file["source"] == "project"
                 && file["path"]
                     .as_str()
-                    .is_some_and(|path| path.ends_with(".claw/settings.json"))
+                    .is_some_and(|path| path.replace('\\', "/").ends_with(".claw/settings.json"))
         })
         .expect("project .claw/settings.json entry");
 
