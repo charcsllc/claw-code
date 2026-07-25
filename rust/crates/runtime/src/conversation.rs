@@ -1698,9 +1698,23 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-conversation-{label}-{nanos}.json"))
     }
 
+    /// Translates the `printf '<text>'[; exit N]` sh snippets these tests
+    /// use into cmd equivalents on Windows (`echo` + `exit /b`); the hook
+    /// runner trims stdout, so echo's trailing CRLF is harmless.
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        let (body, exit_code) = match script.rsplit_once("; exit ") {
+            Some((body, code)) => (body, Some(code)),
+            None => (script, None),
+        };
+        let text = body
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''));
+        match (text, exit_code) {
+            (Some(text), Some(code)) => format!("echo {text}& exit /b {code}"),
+            (Some(text), None) => format!("echo {text}"),
+            _ => script.to_string(),
+        }
     }
 
     #[cfg(not(windows))]

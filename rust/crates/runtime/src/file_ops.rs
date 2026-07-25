@@ -538,6 +538,10 @@ fn glob_search_impl(
     } else {
         base_dir.join(pattern).to_string_lossy().into_owned()
     };
+    // glob::Pattern treats `\` as an escape character, so Windows paths must
+    // be compiled and matched in forward-slash form.
+    #[cfg(windows)]
+    let search_pattern = search_pattern.replace('\\', "/");
 
     // The `glob` crate does not support brace expansion ({a,b,c}).
     // Expand braces into multiple patterns so patterns like
@@ -561,8 +565,11 @@ fn glob_search_impl(
             .filter_entry(|entry| !should_skip_glob_dir(entry));
         for entry in entries.flatten() {
             let candidate = entry.path();
+            let candidate_text = candidate.to_string_lossy();
+            #[cfg(windows)]
+            let candidate_text = candidate_text.replace('\\', "/");
             if entry.file_type().is_file()
-                && compiled.matches_path(candidate)
+                && compiled.matches(&candidate_text)
                 && seen.insert(candidate.to_path_buf())
             {
                 if let Some(root) = canonical_root.as_deref() {
@@ -796,6 +803,10 @@ fn matches_optional_filters(
 ) -> bool {
     if let Some(glob_filter) = glob_filter {
         let path_string = path.to_string_lossy();
+        // glob::Pattern treats `\` as an escape character, so Windows paths
+        // must be matched in forward-slash form.
+        #[cfg(windows)]
+        let path_string = path_string.replace('\\', "/");
         if !glob_filter.matches(&path_string) && !glob_filter.matches_path(path) {
             return false;
         }

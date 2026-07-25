@@ -1139,9 +1139,33 @@ mod tests {
         )));
     }
 
+    /// Translates the sh snippets these tests use into cmd equivalents on
+    /// Windows (`echo` + `exit /b`); the runner trims stdout, so echo's
+    /// trailing CRLF is harmless. Unknown snippets pass through untouched.
     #[cfg(windows)]
     fn shell_snippet(script: &str) -> String {
-        script.replace('\'', "\"")
+        if script == "printf '{not-json\nsecond line'; printf 'stderr warning' >&2; exit 1" {
+            return "(echo {not-json& echo second line)& echo stderr warning 1>&2& exit /b 1"
+                .to_string();
+        }
+        if let Some(json) = script
+            .strip_prefix("printf '%s' '")
+            .and_then(|rest| rest.strip_suffix('\''))
+        {
+            return format!("echo {json}");
+        }
+        let (body, exit_code) = match script.rsplit_once("; exit ") {
+            Some((body, code)) => (body, Some(code)),
+            None => (script, None),
+        };
+        let text = body
+            .strip_prefix("printf '")
+            .and_then(|rest| rest.strip_suffix('\''));
+        match (text, exit_code) {
+            (Some(text), Some(code)) => format!("echo {text}& exit /b {code}"),
+            (Some(text), None) => format!("echo {text}"),
+            _ => script.to_string(),
+        }
     }
 
     #[cfg(not(windows))]
