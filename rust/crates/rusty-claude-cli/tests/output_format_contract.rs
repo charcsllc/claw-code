@@ -9,6 +9,19 @@ use serde_json::{json, Value};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[test]
 fn help_emits_json_when_requested() {
     let root = unique_temp_dir("help-json");
@@ -516,7 +529,7 @@ fn status_json_surfaces_permission_mode_override_for_security_audit() {
         "status JSON should retain workspace context with permission mode"
     );
 
-    fs::remove_dir_all(root).expect("cleanup temp dir");
+    cleanup_dir(&root);
 }
 
 #[test]

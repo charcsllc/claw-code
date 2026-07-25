@@ -16473,6 +16473,19 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 #[cfg(test)]
 mod tests {
+
+    /// Best-effort workspace cleanup: Windows can hold transient locks on
+    /// freshly written files (antivirus, indexer, a just-exited child), so
+    /// retry briefly and give up quietly — the temp dir is disposable.
+    fn cleanup_dir(path: &std::path::Path) {
+        for _ in 0..5 {
+            if std::fs::remove_dir_all(path).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
     use super::{
         acp_status_json, build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         classify_error_kind, classify_session_lifecycle_from_panes, collect_session_prompt_history,
@@ -16912,7 +16925,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         assert_eq!(resolved, PermissionMode::WorkspaceWrite);
     }
@@ -16946,7 +16959,7 @@ mod tests {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
             None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         assert_eq!(resolved, PermissionMode::ReadOnly);
     }
@@ -16987,7 +17000,7 @@ mod tests {
             Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
             None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
         }
-        std::fs::remove_dir_all(config_home).expect("temp config home should clean up");
+        cleanup_dir(&config_home);
 
         assert!(error.to_string().contains("ANTHROPIC_API_KEY"));
     }
@@ -17304,7 +17317,7 @@ mod tests {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
-        std::fs::remove_dir_all(root).expect("temp config root should clean up");
+        cleanup_dir(&root);
 
         // then
         assert_eq!(direct, "anthropic/claude-haiku-4-5-20251213");
@@ -19510,7 +19523,7 @@ mod tests {
             .expect("known bare skill should dispatch");
         assert_eq!(prompt, "$caveman sharpen club");
 
-        fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19525,7 +19538,7 @@ mod tests {
         );
         assert_eq!(try_resolve_bare_skill_prompt(&workspace, "/status"), None);
 
-        fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -19606,7 +19619,7 @@ mod tests {
         assert!(banner.contains("Tab"));
         assert!(banner.contains("workflow completions"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
 
@@ -19655,7 +19668,7 @@ mod tests {
 
         std::env::remove_var("ANTHROPIC_MODEL");
         std::env::remove_var("CLAW_CONFIG_HOME");
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -19674,7 +19687,7 @@ mod tests {
         assert_eq!(resolved, DEFAULT_MODEL);
 
         std::env::remove_var("CLAW_CONFIG_HOME");
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20195,7 +20208,7 @@ mod tests {
         assert!(lifecycle.workspace_dirty);
         assert!(lifecycle.abandoned);
 
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20227,7 +20240,7 @@ mod tests {
         assert!(report.contains("lifecycle=saved only · dirty worktree · abandoned?"));
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20454,7 +20467,7 @@ mod tests {
         assert!(json["required_binaries"]
             .as_array()
             .is_some_and(|items| { items.iter().any(|item| item["name"] == "git") }));
-        fs::remove_dir_all(workspace).expect("cleanup temp dir");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20556,7 +20569,7 @@ mod tests {
         );
         assert_eq!(branch.as_deref(), Some("rcc/cli"));
         assert!(project_root.is_none());
-        fs::remove_dir_all(temp_root).expect("cleanup temp dir");
+        cleanup_dir(&temp_root);
     }
 
     #[test]
@@ -20613,7 +20626,7 @@ UU conflicted.rs",
         let report = render_diff_report_for(&root, None).expect("diff report should render");
         assert!(report.contains("clean working tree"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20638,7 +20651,7 @@ UU conflicted.rs",
         assert!(report.contains("Unstaged changes:"));
         assert!(report.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20663,7 +20676,7 @@ UU conflicted.rs",
         assert!(!report.contains("+++ b/ignored.txt"));
         assert!(!report.contains("+++ b/.omx/state.json"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20694,7 +20707,7 @@ UU conflicted.rs",
         let refused = render_diff_report_for(&root, Some("--cached")).expect("refused report");
         assert!(refused.contains("invalid path"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20723,7 +20736,7 @@ UU conflicted.rs",
         assert!(message.contains("Unstaged changes:"));
         assert!(message.contains("tracked.txt"));
 
-        fs::remove_dir_all(root).expect("cleanup temp dir");
+        cleanup_dir(&root);
     }
 
     #[test]
@@ -20843,7 +20856,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20932,7 +20945,7 @@ UU conflicted.rs",
         assert!(!saved.path.exists(), "saved session should be deleted");
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -20975,7 +20988,7 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        cleanup_dir(&workspace);
     }
 
     #[test]
@@ -21025,8 +21038,8 @@ UU conflicted.rs",
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
-        std::fs::remove_dir_all(workspace_a).expect("workspace a should clean up");
-        std::fs::remove_dir_all(workspace_b).expect("workspace b should clean up");
+        cleanup_dir(&workspace_a);
+        cleanup_dir(&workspace_b);
     }
 
     #[test]

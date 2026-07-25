@@ -12,6 +12,19 @@ use serde_json::Value;
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Best-effort workspace cleanup: Windows can hold transient locks on
+/// freshly written files (antivirus, indexer, a just-exited child), so
+/// retry briefly and give up quietly — the temp dir is disposable.
+fn cleanup_dir(path: &std::path::Path) {
+    for _ in 0..5 {
+        if std::fs::remove_dir_all(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[test]
 fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
     // given a workspace pointed at the mock Anthropic service and a fixture file
@@ -76,7 +89,7 @@ fn compact_flag_prints_only_final_assistant_text_without_tool_call_details() {
         "compact stdout must not include the spinner banner ({stdout:?})"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -126,7 +139,7 @@ fn compact_flag_streaming_text_only_emits_final_message_text() {
         "compact streaming stdout should contain only the final assistant text"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -200,7 +213,7 @@ fn text_prompt_mode_prints_final_assistant_text_after_spinner() {
         "assistant text must appear exactly once, not double-printed ({stdout:?})"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -257,7 +270,7 @@ stderr:
     assert_eq!(parsed["model"], "anthropic/claude-sonnet-4-6");
     assert!(parsed["usage"].is_object());
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -313,7 +326,7 @@ fn prompt_subcommand_reads_prompt_from_stdin_when_no_positional_arg_423() {
         "stdin prompt should reach the provider request: {captured:?}"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -370,7 +383,7 @@ fn prompt_subcommand_stdin_flag_appends_pipe_context_423() {
         "merged prompt should include stdin context: {provider_body:?}"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -424,7 +437,7 @@ fn compact_subcommand_json_fails_fast_when_stdin_closed() {
         "hint should mention /compact or --resume: {hint}"
     );
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 #[test]
@@ -460,7 +473,7 @@ fn compact_subcommand_text_fails_fast_when_stdin_closed() {
     );
     assert!(stderr.contains("claw compact"), "{stderr}");
 
-    fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
+    cleanup_dir(&workspace);
 }
 
 /// `env_clear()` on Windows also drops SystemRoot, without which the child
