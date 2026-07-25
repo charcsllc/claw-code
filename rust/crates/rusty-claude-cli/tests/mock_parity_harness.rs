@@ -307,6 +307,18 @@ struct ScenarioReport {
     final_message: String,
 }
 
+/// `env_clear()` on Windows also drops SystemRoot, without which the child
+/// process cannot initialize Winsock and every loopback request fails.
+fn restore_windows_system_env(command: &mut Command) {
+    if cfg!(windows) {
+        for key in ["SystemRoot", "SystemDrive", "windir", "PATH", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
 fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) -> ScenarioRun {
     let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
     command
@@ -329,6 +341,7 @@ fn run_case(case: ScenarioCase, workspace: &HarnessWorkspace, base_url: &str) ->
     if let Some(allowed_tools) = case.allowed_tools {
         command.args(["--allowedTools", allowed_tools]);
     }
+    restore_windows_system_env(&mut command);
     if let Some((key, value)) = case.extra_env {
         command.env(key, value);
     }
@@ -420,12 +433,21 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
     fs::create_dir_all(&tool_dir).expect("plugin tools dir");
     fs::create_dir_all(&manifest_dir).expect("plugin manifest dir");
 
-    let script_path = tool_dir.join("echo-json.sh");
-    fs::write(
-        &script_path,
-        "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
-    )
-    .expect("plugin script should write");
+    // cmd cannot read piped stdin reliably, so the Windows script takes the
+    // input from CLAWD_TOOL_INPUT (the tool executor provides both).
+    let (script_name, script_body) = if cfg!(windows) {
+        (
+            "echo-json.cmd",
+            "@echo off\r\necho {\"plugin\":\"%CLAWD_PLUGIN_ID%\",\"tool\":\"%CLAWD_TOOL_NAME%\",\"input\":%CLAWD_TOOL_INPUT%}\r\n",
+        )
+    } else {
+        (
+            "echo-json.sh",
+            "#!/bin/sh\nINPUT=$(cat)\nprintf '{\"plugin\":\"%s\",\"tool\":\"%s\",\"input\":%s}\\n' \"$CLAWD_PLUGIN_ID\" \"$CLAWD_TOOL_NAME\" \"$INPUT\"\n",
+        )
+    };
+    let script_path = tool_dir.join(script_name);
+    fs::write(&script_path, script_body).expect("plugin script should write");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -454,11 +476,12 @@ fn prepare_plugin_fixture(workspace: &HarnessWorkspace) {
         "required": ["message"],
         "additionalProperties": false
       },
-      "command": "./tools/echo-json.sh",
+      "command": "./tools/__PLUGIN_SCRIPT__",
       "requiredPermission": "workspace-write"
     }
   ]
-}"#,
+}"#
+        .replace("__PLUGIN_SCRIPT__", script_name),
     )
     .expect("plugin manifest should write");
 

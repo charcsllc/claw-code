@@ -1,3 +1,7 @@
+//! REPL PTY tests are unix-only: they drive claw through python's `pty`
+//! module, which does not exist on Windows.
+#![cfg(unix)]
+
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;

@@ -1065,14 +1065,19 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
     fs::create_dir_all(&workspace).expect("workspace should exist");
     fs::create_dir_all(plugin_root.join(".claude-plugin")).expect("manifest dir should exist");
     fs::create_dir_all(plugin_root.join("lifecycle")).expect("lifecycle dir should exist");
+    // Windows runs lifecycle commands through `cmd /C`, where a `.sh` file
+    // falls back to the shell association and hangs headless CI — write a
+    // native script per platform.
+    let (init_name, shutdown_name, script_body) = if cfg!(windows) {
+        ("init.cmd", "shutdown.cmd", "@echo off\r\nexit /b 0\r\n")
+    } else {
+        ("init.sh", "shutdown.sh", "#!/bin/sh\nexit 0\n")
+    };
+    fs::write(plugin_root.join("lifecycle").join(init_name), script_body)
+        .expect("init lifecycle script should write");
     fs::write(
-        plugin_root.join("lifecycle").join("init.sh"),
-        "#!/bin/sh\nexit 0\n",
-    )
-    .expect("init lifecycle script should write");
-    fs::write(
-        plugin_root.join("lifecycle").join("shutdown.sh"),
-        "#!/bin/sh\nexit 0\n",
+        plugin_root.join("lifecycle").join(shutdown_name),
+        script_body,
     )
     .expect("shutdown lifecycle script should write");
     fs::write(
@@ -1082,10 +1087,12 @@ fn plugins_json_surfaces_lifecycle_contract_when_plugin_is_installed() {
   "version": "1.0.0",
   "description": "lifecycle JSON fixture",
   "lifecycle": {
-    "Init": ["./lifecycle/init.sh"],
-    "Shutdown": ["./lifecycle/shutdown.sh"]
+    "Init": ["./lifecycle/__INIT__"],
+    "Shutdown": ["./lifecycle/__SHUTDOWN__"]
   }
-}"#,
+}"#
+        .replace("__INIT__", init_name)
+        .replace("__SHUTDOWN__", shutdown_name),
     )
     .expect("plugin manifest should write");
 

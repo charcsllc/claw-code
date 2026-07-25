@@ -463,6 +463,20 @@ fn compact_subcommand_text_fails_fast_when_stdin_closed() {
     fs::remove_dir_all(&workspace).expect("workspace cleanup should succeed");
 }
 
+/// `env_clear()` on Windows also drops SystemRoot, without which the child
+/// process cannot initialize Winsock and every loopback request fails.
+/// Restore the system basics after clearing; PATH keeps the unix-style
+/// restriction elsewhere.
+fn restore_windows_system_env(command: &mut Command) {
+    if cfg!(windows) {
+        for key in ["SystemRoot", "SystemDrive", "windir", "PATH", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
 fn run_claw(
     cwd: &std::path::Path,
     config_home: &std::path::Path,
@@ -481,6 +495,7 @@ fn run_claw(
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
         .args(args);
+    restore_windows_system_env(&mut command);
     command.output().expect("claw should launch")
 }
 
@@ -492,7 +507,8 @@ fn run_claw_with_stdin(
     args: &[&str],
     stdin: &str,
 ) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
         .current_dir(cwd)
         .env_clear()
         .env("ANTHROPIC_API_KEY", "test-compact-key")
@@ -504,9 +520,9 @@ fn run_claw_with_stdin(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("claw should launch");
+        .args(args);
+    restore_windows_system_env(&mut command);
+    let mut child = command.spawn().expect("claw should launch");
     child
         .stdin
         .as_mut()
@@ -524,7 +540,8 @@ fn run_claw_closed_stdin_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claw"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_claw"));
+    command
         .current_dir(cwd)
         .env_clear()
         .env("CLAW_CONFIG_HOME", config_home)
@@ -534,9 +551,9 @@ fn run_claw_closed_stdin_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .args(args)
-        .spawn()
-        .expect("claw should launch");
+        .args(args);
+    restore_windows_system_env(&mut command);
+    let mut child = command.spawn().expect("claw should launch");
 
     let start = Instant::now();
     loop {
