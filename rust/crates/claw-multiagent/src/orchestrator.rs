@@ -1898,6 +1898,10 @@ pub fn repo_digest(project_dir: &Path) -> String {
                 .unwrap_or(&path)
                 .display()
                 .to_string();
+            // The digest feeds planner prompts: keep paths in forward-slash
+            // form so prompts are identical across platforms.
+            #[cfg(windows)]
+            let rel = rel.replace('\\', "/");
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if REPO_MANIFEST_FILES.contains(&name.as_str()) && manifests.len() < 12 {
                 if let Ok(content) = std::fs::read_to_string(&path) {
